@@ -17,6 +17,7 @@ from pathlib import Path as _Path
 from typing import (
     Any as _Any,
     Callable as _Callable,
+    Dict as _Dict,
     Optional as _Optional,
     Sequence as _Sequence,
     Tuple as _Tuple,
@@ -754,6 +755,82 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
             )
 
 
+class ParametricDataset(Dataset):
+    """
+    Dataset that also provides a vector of conditioning parameters.
+    """
+
+    def __init__(self, params: _Dict[str, _Union[bool, float, int]], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._keys = tuple(sorted(params.keys()))
+        self._vals = _torch.Tensor([float(params[k]) for k in self._keys])
+
+    @classmethod
+    def init_from_config(cls, config):
+        if "slices" not in config:
+            return super().init_from_config(config)
+        return cls.init_from_config_with_slices(config)
+
+    @classmethod
+    def init_from_config_with_slices(cls, config):
+        config, x, y, slices = cls.parse_config_with_slices(config)
+        datasets = []
+        for s in _tqdm(slices, desc="Slices..."):
+            c = _deepcopy(config)
+            start, stop, params = [s[k] for k in ("start", "stop", "params")]
+            c.update(x=x[start:stop], y=y[start:stop], params=params)
+            if "delay" in s:
+                c["delay"] = s["delay"]
+            datasets.append(ParametricDataset(**c))
+        return ConcatDataset(datasets)
+
+    @classmethod
+    def parse_config(cls, config):
+        assert "slices" not in config
+        params = config["params"]
+        return {
+            "params": params,
+            "id": config.get("id"),
+            "common_params": config.get("common_params"),
+            "param_map": config.get("param_map"),
+            **super().parse_config(config),
+        }
+
+    @classmethod
+    def parse_config_with_slices(cls, config):
+        slices = config["slices"]
+        config = super().parse_config(config)
+        x, y = [config.pop(k) for k in "xy"]
+        return config, x, y, slices
+
+    def __getitem__(self, idx: int) -> _Tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+        """
+        :return:
+            Parameter values (D,)
+            Input (NX+NY-1,)
+            Output (NY,)
+        """
+        x, y = super().__getitem__(idx)
+        return self.vals, x, y
+
+    @property
+    def keys(self) -> _Tuple[str, ...]:
+        return self._keys
+
+    @property
+    def vals(self) -> _torch.Tensor:
+        return self._vals
+
+    def handshake(self, model: "nam.models.base.BaseNet"):  # noqa: F821
+        super().handshake(model)
+        from nam.models.base import ParametricBaseNet
+
+        if not isinstance(model, ParametricBaseNet):
+            raise DatasetModelHandshakeError(
+                f"Model is not a parametric NAM model: {type(model)}"
+            )
+
+
 class ConcatDatasetValidationError(ValueError):
     """
     Error raised when a ConcatDataset fails validation
@@ -779,6 +856,17 @@ class ConcatDataset(AbstractDataset, _InitializableFromConfig):
         How many data sets are in this data set
         """
         return sum(len(d) for d in self._datasets)
+
+    def handshake(self, model: "nam.models.base.BaseNet"):  # noqa: F821
+        from nam.models.base import ParametricBaseNet
+
+        if all(isinstance(d, ParametricDataset) for d in self.datasets):
+            for d in self.datasets:
+                d.handshake(model)
+            if isinstance(model, ParametricBaseNet):
+                model.handshake(self)
+            return
+        super().handshake(model)
 
     @property
     def datasets(self):
@@ -852,6 +940,7 @@ class ConcatDataset(AbstractDataset, _InitializableFromConfig):
         # Ensure that a couple attrs are consistent across the sub-datasets.
         Reference = _namedtuple("Reference", ("index", "val"))
         references = {name: None for name in ("nx", "ny", "sample_rate")}
+        ref_keys = None
         for i, d in enumerate(datasets):
             for name in references.keys():
                 this_val = getattr(d, name)
@@ -863,9 +952,21 @@ class ConcatDataset(AbstractDataset, _InitializableFromConfig):
                         f"Mismatch between {name} of datasets {references[name].index} "
                         f"({references[name].val}) and {i} ({this_val})"
                     )
+            if isinstance(d, ParametricDataset):
+                val = d.keys
+                if ref_keys is None:
+                    ref_keys = Reference(i, val)
+                elif val != ref_keys.val:
+                    raise ConcatDatasetValidationError(
+                        f"Mismatch between keys of datasets {ref_keys.index} "
+                        f"({ref_keys.val}) and {i} ({val})"
+                    )
 
 
-_dataset_init_registry = {"dataset": Dataset.init_from_config}
+_dataset_init_registry = {
+    "dataset": Dataset.init_from_config,
+    "parametric": ParametricDataset.init_from_config,
+}
 
 
 def register_dataset_initializer(

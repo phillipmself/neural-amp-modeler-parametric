@@ -14,3 +14,11 @@ from .conv_net import ConvNet  # noqa F401
 from .linear import Linear  # noqa F401
 from .recurrent import LSTM  # noqa F401
 from .wavenet import WaveNet  # noqa F401
+from .parametric import (  # noqa F401
+    BooleanParam,
+    CatLSTM,
+    CatWaveNet,
+    ContinuousParam,
+    HyperConvNet,
+    Param,
+)

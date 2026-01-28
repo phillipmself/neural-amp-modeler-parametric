@@ -13,6 +13,7 @@ import math as _math
 from typing import (
     Any as _Any,
     Dict as _Dict,
+    Sequence as _Sequence,
     Optional as _Optional,
     Tuple as _Tuple,
     Union as _Union,
@@ -297,3 +298,162 @@ class BaseNet(_Base):
         d["loudness"] = self._metadata_loudness()
         d["gain"] = self._metadata_gain()
         return d
+
+
+class ParametricBaseNet(BaseNet):
+    """
+    Base class for parametric models that take an additional conditioning vector.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._parametric_config: _Optional[_Dict[str, _Any]] = None
+        self._param_names: _Optional[_Tuple[str, ...]] = None
+        self._param_defaults: _Optional[_torch.Tensor] = None
+
+    def forward(
+        self,
+        params: _torch.Tensor,
+        x: _torch.Tensor,
+        pad_start: _Optional[bool] = None,
+        **kwargs,
+    ):
+        pad_start = self.pad_start_default if pad_start is None else pad_start
+        scalar = x.ndim == 1
+        if scalar:
+            x = x[None]
+            params = params[None] if params.ndim == 1 else params
+        if pad_start:
+            x = _torch.cat(
+                (_torch.zeros((len(x), self.receptive_field - 1)).to(x.device), x),
+                dim=1,
+            )
+        if x.shape[1] < self.receptive_field:
+            raise ValueError(
+                f"Input has {x.shape[1]} samples, which is too few for this model with "
+                f"receptive field {self.receptive_field}!"
+            )
+        y = self._forward_parametric_mps_safe(params, x, **kwargs)
+        if scalar:
+            y = y[0]
+        return y
+
+    def handshake(self, dataset: "nam.data.AbstractDataset"):  # noqa: F821
+        super().handshake(dataset)
+        from ..data import ConcatDataset, ParametricDataset
+
+        representative = dataset
+        if isinstance(dataset, ConcatDataset):
+            if not all(isinstance(d, ParametricDataset) for d in dataset.datasets):
+                raise ModelDatasetHandshakeError(
+                    f"Dataset is not a parametric NAM dataset: {type(dataset)}"
+                )
+            representative = dataset.datasets[0]
+        if not isinstance(representative, ParametricDataset):
+            raise ModelDatasetHandshakeError(
+                f"Dataset is not a parametric NAM dataset: {type(dataset)}"
+            )
+        if self._param_names is None and hasattr(representative, "keys"):
+            self._param_names = tuple(representative.keys)
+        if self._param_defaults is None and hasattr(representative, "vals"):
+            self._param_defaults = representative.vals.detach().clone()
+
+    def set_parametric_config(self, param_config: _Dict[str, _Any]):
+        """
+        Store the parametric configuration (dictionary of Param objects).
+        """
+        self._parametric_config = param_config
+        self._param_names = tuple(sorted(param_config.keys()))
+        self._param_defaults = _torch.Tensor(
+            [float(param_config[k].default_value) for k in self._param_names]
+        )
+
+    def set_param_defaults(
+        self, names: _Sequence[str], defaults: _torch.Tensor
+    ):  # pragma: no cover - simple setter
+        self._parametric_config = None
+        self._param_names = tuple(names)
+        self._param_defaults = defaults.detach().clone()
+
+    def _get_param_defaults(self, device: _Optional[_torch.device] = None) -> _torch.Tensor:
+        if self._param_defaults is None:
+            raise RuntimeError(
+                "Parametric defaults are not set. Provide a parametric configuration or "
+                "handshake with a ParametricDataset first."
+            )
+        params = self._param_defaults
+        if device is not None:
+            params = params.to(device)
+        return params
+
+    def _at_nominal_settings(self, x: _torch.Tensor) -> _torch.Tensor:
+        params = self._get_param_defaults(device=x.device)
+        return self(params, x)
+
+    def _export_config(self):
+        config = super()._export_config()
+        parametric = self._export_parametric_config()
+        if parametric is None:
+            return config
+        if not isinstance(config, dict):
+            raise TypeError(
+                f"Parametric models expect base export config to be a dict, got {type(config)}"
+            )
+        if "parametric" in config:
+            raise ValueError(
+                'Parametric export attempted to add key "parametric" but it already exists.'
+            )
+        config["parametric"] = parametric
+        return config
+
+    def _export_input_output_args(self) -> _Tuple[_Any]:
+        return (self._get_param_defaults(device=self.device),)
+
+    def _export_parametric_config(self) -> _Optional[_Dict[str, _Any]]:
+        if self._parametric_config is not None:
+            return {k: v.to_json() for k, v in self._parametric_config.items()}
+        if self._param_names is not None and self._param_defaults is not None:
+            return {
+                k: {
+                    "type": "continuous",
+                    "default_value": float(v.item()),
+                }
+                for k, v in zip(self._param_names, self._param_defaults)
+            }
+        return None
+
+    def _forward_parametric_mps_safe(
+        self, params: _torch.Tensor, x: _torch.Tensor, **kwargs
+    ) -> _torch.Tensor:
+        if not self._mps_65536_fallback:
+            try:
+                return self._forward(params, x, **kwargs)
+            except NotImplementedError as e:
+                if "Output channels > 65536 not supported at the MPS device." in str(e):
+                    msg = (
+                        "Warning: NAM encountered a bug in PyTorch's MPS backend and "
+                        "will switch to a fallback."
+                    )
+                    known_bad_versions = {"2.5.0", "2.5.1"}
+                    torch_version = _get_torch_version()
+                    if torch_version not in known_bad_versions:
+                        msg += (
+                            "\n"
+                            f"Your version of PyTorch is {torch_version}, which "
+                            "wasn't known to have this problem.\n"
+                            "Please open an Issue at:\n"
+                            "https://github.com/sdatkinson/neural-amp-modeler/issues/507"
+                        )
+                    print(msg)
+                    self._mps_65536_fallback = True
+                    return self._forward_parametric_mps_safe(params, x, **kwargs)
+                raise e
+        stride = 65_536 - (self.receptive_field - 1)
+        out_list = []
+        for i in range(0, x.shape[1], stride):
+            j = min(i + 65_536, x.shape[1])
+            xi = x[:, i:j]
+            out_list.append(self._forward(params, xi, **kwargs))
+            if j == x.shape[1]:
+                break
+        return _torch.cat(out_list, dim=1)
