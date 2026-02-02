@@ -343,7 +343,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         x: _torch.Tensor,
         y: _torch.Tensor,
         nx: int,
-        ny: _Optional[int],
+        ny: _Optional[int] = None,
         start: _Optional[int] = None,
         stop: _Optional[int] = None,
         start_samples: _Optional[int] = None,
@@ -359,6 +359,9 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         require_input_pre_silence: _Optional[
             float
         ] = _DEFAULT_REQUIRE_INPUT_PRE_SILENCE,
+        id: _Optional[str] = None,
+        common_params: _Optional[_Dict[str, _Any]] = None,
+        param_map: _Optional[_Dict[str, _Any]] = None,
     ):
         """
         :param x: The input signal. A 1D array.
@@ -426,6 +429,9 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         y = y * y_scale
         self._x_path = x_path
         self._y_path = y_path
+        self._id = id
+        self._common_params = common_params
+        self._param_map = param_map
         self._validate_inputs_after_processing(x, y, nx, ny)
         self._x = x
         self._y = y

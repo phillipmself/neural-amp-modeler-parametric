@@ -69,7 +69,10 @@ def _plot(
         tx = len(ds.x) / 48_000
         print(f"Run (t={tx:.2f})")
         t0 = _time()
-        output = model(ds.x).flatten().cpu().numpy()
+        if hasattr(ds, "vals"):
+            output = model(ds.vals, ds.x).flatten().cpu().numpy()
+        else:
+            output = model(ds.x).flatten().cpu().numpy()
         t1 = _time()
         try:
             rt = f"{tx / (t1 - t0):.2f}"
@@ -121,13 +124,24 @@ def _create_callbacks(learning_config):
         filename="checkpoint_epoch_{epoch:04d}", every_n_epochs=1
     )
     if not validate_inside_epoch:
-        return [checkpoint_best, checkpoint_epoch]
+        callbacks = [checkpoint_best, checkpoint_epoch]
     else:
         # The last validation pass, whether at the end of an epoch or not
         checkpoint_last = _pl.callbacks.model_checkpoint.ModelCheckpoint(
             filename="checkpoint_last_{epoch:04d}_{step}", **kwargs
         )
-        return [checkpoint_best, checkpoint_last, checkpoint_epoch]
+        callbacks = [checkpoint_best, checkpoint_last, checkpoint_epoch]
+
+    threshold_esr = learning_config.get("threshold_esr", None)
+    if threshold_esr is not None:
+        callbacks.append(
+            _pl.callbacks.EarlyStopping(
+                monitor="ESR",
+                stopping_threshold=threshold_esr,
+                patience=_np.inf,
+            )
+        )
+    return callbacks
 
 
 def main(
@@ -197,6 +211,11 @@ def main(
             trainer.checkpoint_callback.best_model_path,
             **_lightning_module.LightningModule.parse_config(model_config),
         )
+        # Re-handshake after loading a fresh model so param defaults are set
+        dataset_train.handshake(model.net)
+        dataset_validation.handshake(model.net)
+        model.net.handshake(dataset_train)
+        model.net.handshake(dataset_validation)
     model.cpu()
     model.eval()
     if make_plots:
