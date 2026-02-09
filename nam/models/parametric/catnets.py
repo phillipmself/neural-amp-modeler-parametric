@@ -22,9 +22,19 @@ class _CatMixin(ParametricBaseNet):
     Parametric nets that concatenate the params with the input at each time point.
     """
 
+    def __init__(self, *args, **kwargs):
+        layers_configs = kwargs.get("layers_configs", args[0] if len(args) > 0 else None)
+        if layers_configs is None or len(layers_configs) == 0:
+            raise ValueError("Expected non-empty WaveNet `layers_configs` for CatWaveNet.")
+        first_input_size = layers_configs[0].get("input_size", None)
+        if first_input_size is None:
+            raise KeyError("Expected `input_size` in first WaveNet layer config.")
+        self._expected_param_dim_cache = int(first_input_size) - 1
+        super().__init__(*args, **kwargs)
+
     @property
     def _expected_param_dim(self) -> int:
-        return self._net._layers[0]._config["input_size"] - 1  # type: ignore[attr-defined]
+        return self._expected_param_dim_cache
 
     @property
     def _single_class(self):
