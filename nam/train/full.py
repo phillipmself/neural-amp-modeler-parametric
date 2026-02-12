@@ -22,10 +22,39 @@ from nam.data import (
     Split as _Split,
     init_dataset as _init_dataset,
 )
+from nam.models.exportable import Exportable as _Exportable
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
 _torch.manual_seed(0)
+
+
+class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
+    _NAM_FILE_EXTENSION = _Exportable.FILE_EXTENSION
+
+    @classmethod
+    def _get_nam_filepath(cls, filepath: str) -> _Path:
+        if not filepath.endswith(cls.FILE_EXTENSION):
+            raise ValueError(
+                f"Checkpoint filepath {filepath} doesn't end in expected extension "
+                f"{cls.FILE_EXTENSION}"
+            )
+        return _Path(filepath[: -len(cls.FILE_EXTENSION)] + cls._NAM_FILE_EXTENSION)
+
+    def _save_checkpoint(self, trainer: _pl.Trainer, filepath: str):
+        super()._save_checkpoint(trainer, filepath)
+        nam_filepath = self._get_nam_filepath(filepath)
+        pl_model = trainer.model
+        nam_model = pl_model.net
+        outdir = nam_filepath.parent
+        basename = nam_filepath.name[: -len(self._NAM_FILE_EXTENSION)]
+        nam_model.export(outdir, basename=basename)
+
+    def _remove_checkpoint(self, trainer: _pl.Trainer, filepath: str) -> None:
+        super()._remove_checkpoint(trainer, filepath)
+        nam_path = self._get_nam_filepath(filepath)
+        if nam_path.exists():
+            nam_path.unlink()
 
 
 def _rms(x: _Union[_np.ndarray, _torch.Tensor]) -> float:
@@ -111,7 +140,7 @@ def _create_callbacks(learning_config):
             )
         }
 
-    checkpoint_best = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_best = _ModelCheckpoint(
         filename="{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}",
         save_top_k=3,
         monitor="val_loss",
@@ -120,14 +149,14 @@ def _create_callbacks(learning_config):
 
     # return [checkpoint_best, checkpoint_last]
     # The last epoch that was finished.
-    checkpoint_epoch = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_epoch = _ModelCheckpoint(
         filename="checkpoint_epoch_{epoch:04d}", every_n_epochs=1
     )
     if not validate_inside_epoch:
         callbacks = [checkpoint_best, checkpoint_epoch]
     else:
         # The last validation pass, whether at the end of an epoch or not
-        checkpoint_last = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+        checkpoint_last = _ModelCheckpoint(
             filename="checkpoint_last_{epoch:04d}_{step}", **kwargs
         )
         callbacks = [checkpoint_best, checkpoint_last, checkpoint_epoch]
