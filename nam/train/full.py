@@ -22,10 +22,39 @@ from nam.data import (
     Split as _Split,
     init_dataset as _init_dataset,
 )
+from nam.models.exportable import Exportable as _Exportable
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
 _torch.manual_seed(0)
+
+
+class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
+    _NAM_FILE_EXTENSION = _Exportable.FILE_EXTENSION
+
+    @classmethod
+    def _get_nam_filepath(cls, filepath: str) -> _Path:
+        if not filepath.endswith(cls.FILE_EXTENSION):
+            raise ValueError(
+                f"Checkpoint filepath {filepath} doesn't end in expected extension "
+                f"{cls.FILE_EXTENSION}"
+            )
+        return _Path(filepath[: -len(cls.FILE_EXTENSION)] + cls._NAM_FILE_EXTENSION)
+
+    def _save_checkpoint(self, trainer: _pl.Trainer, filepath: str):
+        super()._save_checkpoint(trainer, filepath)
+        nam_filepath = self._get_nam_filepath(filepath)
+        pl_model = trainer.model
+        nam_model = pl_model.net
+        outdir = nam_filepath.parent
+        basename = nam_filepath.name[: -len(self._NAM_FILE_EXTENSION)]
+        nam_model.export(outdir, basename=basename)
+
+    def _remove_checkpoint(self, trainer: _pl.Trainer, filepath: str) -> None:
+        super()._remove_checkpoint(trainer, filepath)
+        nam_path = self._get_nam_filepath(filepath)
+        if nam_path.exists():
+            nam_path.unlink()
 
 
 def _rms(x: _Union[_np.ndarray, _torch.Tensor]) -> float:
@@ -69,7 +98,10 @@ def _plot(
         tx = len(ds.x) / 48_000
         print(f"Run (t={tx:.2f})")
         t0 = _time()
-        output = model(ds.x).flatten().cpu().numpy()
+        if hasattr(ds, "vals"):
+            output = model(ds.vals, ds.x).flatten().cpu().numpy()
+        else:
+            output = model(ds.x).flatten().cpu().numpy()
         t1 = _time()
         try:
             rt = f"{tx / (t1 - t0):.2f}"
@@ -108,7 +140,7 @@ def _create_callbacks(learning_config):
             )
         }
 
-    checkpoint_best = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_best = _ModelCheckpoint(
         filename="{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}",
         save_top_k=3,
         monitor="val_loss",
@@ -117,17 +149,28 @@ def _create_callbacks(learning_config):
 
     # return [checkpoint_best, checkpoint_last]
     # The last epoch that was finished.
-    checkpoint_epoch = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_epoch = _ModelCheckpoint(
         filename="checkpoint_epoch_{epoch:04d}", every_n_epochs=1
     )
     if not validate_inside_epoch:
-        return [checkpoint_best, checkpoint_epoch]
+        callbacks = [checkpoint_best, checkpoint_epoch]
     else:
         # The last validation pass, whether at the end of an epoch or not
-        checkpoint_last = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+        checkpoint_last = _ModelCheckpoint(
             filename="checkpoint_last_{epoch:04d}_{step}", **kwargs
         )
-        return [checkpoint_best, checkpoint_last, checkpoint_epoch]
+        callbacks = [checkpoint_best, checkpoint_last, checkpoint_epoch]
+
+    threshold_esr = learning_config.get("threshold_esr", None)
+    if threshold_esr is not None:
+        callbacks.append(
+            _pl.callbacks.EarlyStopping(
+                monitor="ESR",
+                stopping_threshold=threshold_esr,
+                patience=_np.inf,
+            )
+        )
+    return callbacks
 
 
 def main(
@@ -197,6 +240,11 @@ def main(
             trainer.checkpoint_callback.best_model_path,
             **_lightning_module.LightningModule.parse_config(model_config),
         )
+        # Re-handshake after loading a fresh model so param defaults are set
+        dataset_train.handshake(model.net)
+        dataset_validation.handshake(model.net)
+        model.net.handshake(dataset_train)
+        model.net.handshake(dataset_validation)
     model.cpu()
     model.eval()
     if make_plots:

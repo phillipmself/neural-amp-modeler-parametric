@@ -13,6 +13,7 @@ from typing import Sequence as _Sequence
 from .base import BaseNet as _BaseNet
 from .conv_net import ConvNet as _ConvNet
 from .linear import Linear as _Linear
+from .parametric.catnets import CatWaveNet as _CatWaveNet
 from .recurrent import LSTM as _LSTM
 from .wavenet import WaveNet as _WaveNet
 from .sequential import Sequential as _Sequential
@@ -20,6 +21,7 @@ from .sequential import Sequential as _Sequential
 _logger = _logging.getLogger(__name__)
 
 _model_net_init_registry = {
+    "CatWaveNet": _CatWaveNet.init_from_config,
     "ConvNet": _ConvNet.init_from_config,
     "Linear": _Linear.init_from_config,
     "LSTM": _LSTM.init_from_config,
