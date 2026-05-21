@@ -214,9 +214,9 @@ class PackedWaveNet(_BaseNet, _ImportsWeights):
         if len(configured) != self.num_submodels:
             raise ValueError("container_max_values length must match submodels")
         values = [float(v) for v in configured]
-        values[-1] = 1.0
         if values != sorted(values):
             raise ValueError("container_max_values must be sorted")
+        values[-1] = 1.0
         return values
 
     def _normalize_checkpoint_paths(self, paths):
