@@ -220,6 +220,26 @@ def test_packed_container_max_values_rejects_unsorted_before_last_coercion():
         model._container_max_values()
 
 
+def test_packed_container_max_values_rejects_values_outside_unit_interval():
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [50.0, 100.0]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    with _pytest.raises(ValueError, match=r"container_max_values must be in \[0, 1\]"):
+        model._container_max_values()
+
+
+def test_packed_container_max_values_rejects_duplicate_values():
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [0.5, 0.5]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    with _pytest.raises(ValueError, match="container_max_values must not contain duplicates"):
+        model._container_max_values()
+
+
 def test_packed_container_max_values_accepts_sorted_list():
     config = {
         **_packed_config(),

@@ -214,6 +214,10 @@ class PackedWaveNet(_BaseNet, _ImportsWeights):
         if len(configured) != self.num_submodels:
             raise ValueError("container_max_values length must match submodels")
         values = [float(v) for v in configured]
+        if not all(0.0 <= v <= 1.0 for v in values):
+            raise ValueError("container_max_values must be in [0, 1]")
+        if len(values) != len(set(values)):
+            raise ValueError("container_max_values must not contain duplicates")
         if values != sorted(values):
             raise ValueError("container_max_values must be sorted")
         values[-1] = 1.0
