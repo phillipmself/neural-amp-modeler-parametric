@@ -1034,11 +1034,10 @@ def _plot(
             for i in range(output.shape[0])
         ]
         esrs = [_esr(_torch.Tensor(output_i), ds.y) for output_i in output]
-        aggregate_esr = sum(esrs)
+        validation_esr = esrs[-1]
         for label, esr in zip(labels, esrs):
             print(f"Error-signal ratio ({label}) = {esr:.4g}")
-        print(f"Aggregate error-signal ratio = {aggregate_esr:.4g}")
-        print(_esr_comment(aggregate_esr))
+        print(_esr_comment(validation_esr))
 
         _plt.figure(figsize=(16, 5))
         for label, output_i, esr in zip(labels, output, esrs):
@@ -1048,8 +1047,7 @@ def _plot(
             )
         _plt.plot(ds.y[window_start:window_end], linestyle="--", label="Target")
         _plt.title(
-            "Aggregate ESR="
-            f"{aggregate_esr:.4g} ("
+            "ESR ("
             + ", ".join(f"{label}: {esr:.4g}" for label, esr in zip(labels, esrs))
             + ")"
         )
@@ -1058,7 +1056,7 @@ def _plot(
             _plt.savefig(filepath + ".png")
         if not silent:
             _plt.show()
-        return aggregate_esr
+        return validation_esr
 
     output = output.flatten()
     esr = _esr(_torch.Tensor(output), ds.y)

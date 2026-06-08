@@ -207,7 +207,11 @@ def test_packed_lightning_validation_logs_per_submodel_and_aggregate():
     assert "ESR_packed_0" in captured
     assert "MSE_packed_1" in captured
     assert _torch.allclose(
-        val_loss, captured["val_loss_packed_0"] + captured["val_loss_packed_1"]
+        val_loss, (captured["val_loss_packed_0"] + captured["val_loss_packed_1"]) / 2
+    )
+    assert _torch.allclose(captured["val_loss"], val_loss)
+    assert _torch.allclose(
+        captured["MSE"], (captured["MSE_packed_0"] + captured["MSE_packed_1"]) / 2
     )
 
 
@@ -229,7 +233,7 @@ def test_packed_lightning_validation_logs_mrstft_per_submodel(mocker):
     module.validation_step((x, targets), 0)
     assert captured["MRSTFT_packed_0"] == 0.3
     assert captured["MRSTFT_packed_1"] == 0.7
-    assert captured["MRSTFT"] == 1.0
+    assert captured["MRSTFT"] == 0.5
 
 
 def test_packed_best_checkpoint_records_distinct_checkpoints(tmp_path):

@@ -522,9 +522,11 @@ class PackedLightningModule(LightningModule):
                 loss_dict[key].value for loss_dict in loss_dicts if key in loss_dict
             ]
             if values:
-                logs[key] = sum(values)
-        logs["ESR"] = sum(loss_dict["ESR"].value for loss_dict in loss_dicts)
-        logs["val_loss"] = sum(val_losses)
+                logs[key] = sum(values) / len(values)
+        logs["ESR"] = sum(loss_dict["ESR"].value for loss_dict in loss_dicts) / len(
+            loss_dicts
+        )
+        logs["val_loss"] = sum(val_losses) / len(val_losses)
         self.log_dict(logs)
         return logs["val_loss"]
 

@@ -355,6 +355,7 @@ def test_plot_reports_and_plots_each_packed_prediction(mocker, capsys):
     target = torch.tensor([1.0, -1.0, 2.0, -2.0])
     predictions = torch.stack([target, 0.5 * target])
     plot_calls = []
+    titles = []
 
     class FakeDataset:
         x = torch.zeros_like(target)
@@ -376,15 +377,21 @@ def test_plot_reports_and_plots_each_packed_prediction(mocker, capsys):
     mocker.patch.object(core, "_time", lambda: next(times))
     mocker.patch("matplotlib.pyplot.figure")
     mocker.patch("matplotlib.pyplot.plot", capture_plot)
-    mocker.patch("matplotlib.pyplot.title")
+    mocker.patch("matplotlib.pyplot.title", lambda title: titles.append(title))
     mocker.patch("matplotlib.pyplot.legend")
     mocker.patch("matplotlib.pyplot.savefig")
     mocker.patch("matplotlib.pyplot.show")
 
-    core._plot(FakeModel(), FakeDataset, silent=True)
+    validation_esr = core._plot(FakeModel(), FakeDataset, silent=True)
 
     stdout = capsys.readouterr().out
     assert stdout.count("Error-signal ratio") == 2
+    assert "Aggregate error-signal ratio" not in stdout
+    assert validation_esr == 0.25
+    assert len(titles) == 1
+    assert "Aggregate ESR" not in titles[0]
+    assert "small" in titles[0]
+    assert "large" in titles[0]
 
     def as_numpy(value):
         if isinstance(value, torch.Tensor):
