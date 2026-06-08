@@ -211,6 +211,46 @@ def test_packed_extraction_matches_packed_output():
         assert _torch.allclose(extracted(x), y_packed[:, i, :], atol=1.0e-6)
 
 
+def test_packed_container_max_values_rejects_unsorted_before_last_coercion():
+    """Descending max_value lists must fail before values[-1] = 1.0 masks them."""
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [1.0, 0.5]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    with _pytest.raises(ValueError, match="container_max_values must be sorted"):
+        model._container_max_values()
+
+
+def test_packed_container_max_values_rejects_values_outside_unit_interval():
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [50.0, 100.0]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    with _pytest.raises(ValueError, match=r"container_max_values must be in \[0, 1\]"):
+        model._container_max_values()
+
+
+def test_packed_container_max_values_rejects_duplicate_values():
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [0.5, 0.5]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    with _pytest.raises(ValueError, match="container_max_values must not contain duplicates"):
+        model._container_max_values()
+
+
+def test_packed_container_max_values_accepts_sorted_list():
+    config = {
+        **_packed_config(),
+        "export": {"container_max_values": [0.5, 0.75]},
+    }
+    model = _PackedWaveNet.init_from_config(config)
+    assert model._container_max_values() == [0.5, 1.0]
+
+
 def test_packed_export_writes_slimmable_container(tmp_path):
     model = _PackedWaveNet.init_from_config({**_packed_config(), "sample_rate": 48_000})
     container = model.export_container(tmp_path)
