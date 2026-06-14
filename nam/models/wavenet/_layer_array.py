@@ -702,7 +702,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         return _torch.cat(tensors)
 
     def forward(
-        self, x: _torch.Tensor, h: _torch.Tensor, out_length: int
+        self, x: _torch.Tensor, h: _torch.Tensor, out_length: int, adapter=None, p=None
     ) -> _Tuple[_Optional[_torch.Tensor], _torch.Tensor]:
         """
         :param x: (B,C,L1) From last layer
@@ -743,6 +743,10 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
 
         z1len = min(zconv.shape[2], mix_out.shape[2])
         z1 = zconv[:, :, -z1len:] + mix_out[:, :, -z1len:]
+        # Pre-activation is the right hook point: conditioning here reaches features
+        # before the nonlinearity compresses them, giving adapters maximum influence.
+        if adapter is not None:
+            z1 = adapter(z1, p)
         if self._activation_pre_film is not None:
             z1 = self._activation_pre_film(z1, _c(z1.shape[2]))
 
@@ -1050,10 +1054,16 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         x: _torch.Tensor,
         c: _torch.Tensor,
         head_input: _Optional[_torch.Tensor] = None,
+        adapter=None,
+        p=None,
     ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         """
         :param x: (B,Dx,L) layer input
         :param c: (B,Dc,L) condition
+        :param adapter: callable(z, p)->z applied to pre-activation features at each layer;
+            allows parametric conditioning without touching layer architecture. None = ordinary behavior.
+        :param p: parameter tensor forwarded verbatim to adapter (e.g., amp/gear settings
+            encoded by a conditioning network); unused when adapter is None.
 
         Layer array receptive field is R.
 
@@ -1068,7 +1078,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         x = self._rechannel(x)
         for layer in self._layers:
             x, head_term = layer(
-                x, c, out_length_no_head_rechannel
+                x, c, out_length_no_head_rechannel, adapter=adapter, p=p
             )  # Ensures head_term sample length
             head_input = (
                 head_term

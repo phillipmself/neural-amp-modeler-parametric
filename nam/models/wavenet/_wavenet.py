@@ -256,14 +256,18 @@ class WaveNet(_Slimmable, _nn.Module, _InitializableFromConfig):
     def is_slimmable(self) -> bool:
         return self._is_slimmable
 
-    def forward(self, x: _torch.Tensor) -> _torch.Tensor:
+    def forward(self, x: _torch.Tensor, adapter=None, p=None) -> _torch.Tensor:
         """
         :param x: (B,Cx,L)
+        :param adapter: callable(z, p)->z applied to pre-activation features at each layer;
+            allows parametric conditioning without touching layer architecture. None = ordinary behavior.
+        :param p: parameter tensor forwarded verbatim to adapter (e.g., amp/gear settings
+            encoded by a conditioning network); unused when adapter is None.
         :return: (B,Cy,L-R)
         """
         c = x if self._condition_dsp is None else self._condition_dsp(x)
         y, head_input = x, None
         for layer_array in self._layer_arrays:
-            head_input, y = layer_array(y, c, head_input=head_input)
+            head_input, y = layer_array(y, c, head_input=head_input, adapter=adapter, p=p)
         head_input = self._head_scale * head_input
         return head_input if self._head is None else self._head(head_input)
