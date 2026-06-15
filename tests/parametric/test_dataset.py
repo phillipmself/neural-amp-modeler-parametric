@@ -14,6 +14,8 @@ import pytest as _pytest
 import torch as _torch
 from torch.utils.data import DataLoader as _DataLoader
 
+from nam.data import Split as _Split
+from nam.data import init_dataset as _init_dataset
 from nam.data import np_to_wav as _np_to_wav
 from nam.models.parametric import ParametricConcatDataset, ParametricDataset  # import triggers registrations
 
@@ -360,3 +362,122 @@ def test_pa11_concat_empty_list_raises():
     """PA11 (concat): constructing ParametricConcatDataset with empty list raises ValueError."""
     with _pytest.raises(ValueError):
         ParametricConcatDataset([])
+
+
+# ---------------------------------------------------------------------------
+# N3 — config-driven multi-capture construction via init_dataset
+# ---------------------------------------------------------------------------
+
+# Shared keys that belong in "common" for multi-capture configs.
+# nx is injected by full.main; for direct init_dataset tests we must supply it.
+_NX_MULTI = 8
+_NY_MULTI = 16
+
+
+def _multi_capture_config(tmp_path: _Path) -> dict:
+    """Build a list-based parametric config with two captures of param_dim=1."""
+    sub1 = tmp_path / "cap0"
+    sub1.mkdir(exist_ok=True)
+    sub2 = tmp_path / "cap1"
+    sub2.mkdir(exist_ok=True)
+    x1, y1 = _write_wav_pair(sub1, seed=20)
+    x2, y2 = _write_wav_pair(sub2, seed=21)
+    return {
+        "type": "parametric",
+        "common": {
+            "param_names": ["gain"],
+            "delay": None,
+            "require_input_pre_silence": None,
+            "nx": _NX_MULTI,
+            "ny": _NY_MULTI,
+            "sample_rate": _RATE,
+        },
+        "train": [
+            {"x_path": x1, "y_path": y1, "params": [0.5]},
+            {"x_path": x2, "y_path": y2, "params": [0.8]},
+        ],
+        "validation": [
+            {"x_path": x1, "y_path": y1, "params": [0.5]},
+            {"x_path": x2, "y_path": y2, "params": [0.8]},
+        ],
+    }
+
+
+def test_n3_init_dataset_list_builds_parametric_concat_train(tmp_path):
+    """N3: init_dataset with a list-based parametric config returns ParametricConcatDataset (train)."""
+    config = _multi_capture_config(tmp_path)
+    ds = _init_dataset(config, _Split.TRAIN)
+    assert isinstance(ds, ParametricConcatDataset), (
+        f"Expected ParametricConcatDataset, got {type(ds).__name__}"
+    )
+    assert len(ds) > 0
+    assert ds.param_dim == 1
+
+
+def test_n3_init_dataset_list_builds_parametric_concat_validation(tmp_path):
+    """N3: init_dataset with a list-based parametric config returns ParametricConcatDataset (validation)."""
+    config = _multi_capture_config(tmp_path)
+    ds = _init_dataset(config, _Split.VALIDATION)
+    assert isinstance(ds, ParametricConcatDataset), (
+        f"Expected ParametricConcatDataset, got {type(ds).__name__}"
+    )
+    assert len(ds) > 0
+    assert ds.param_dim == 1
+
+
+def test_n3_init_dataset_list_combined_length(tmp_path):
+    """N3: multi-capture concat length equals sum of per-capture lengths."""
+    config = _multi_capture_config(tmp_path)
+    # Build individual datasets to verify expected total length
+    sub1 = tmp_path / "cap0"
+    sub2 = tmp_path / "cap1"
+    # Re-use the paths written by _multi_capture_config
+    x1 = str(sub1 / "x.wav")
+    y1 = str(sub1 / "y.wav")
+    x2 = str(sub2 / "x.wav")
+    y2 = str(sub2 / "y.wav")
+    ds1 = ParametricDataset.init_from_config({
+        "x_path": x1, "y_path": y1, "params": [0.5], "param_names": ["gain"],
+        "nx": _NX_MULTI, "ny": _NY_MULTI, "sample_rate": _RATE,
+        "delay": None, "require_input_pre_silence": None,
+    })
+    ds2 = ParametricDataset.init_from_config({
+        "x_path": x2, "y_path": y2, "params": [0.8], "param_names": ["gain"],
+        "nx": _NX_MULTI, "ny": _NY_MULTI, "sample_rate": _RATE,
+        "delay": None, "require_input_pre_silence": None,
+    })
+    config = _multi_capture_config(tmp_path)
+    ds_concat = _init_dataset(config, _Split.TRAIN)
+    assert isinstance(ds_concat, ParametricConcatDataset)
+    assert len(ds_concat) == len(ds1) + len(ds2)
+
+
+def test_n3_init_dataset_list_param_dim_mismatch_raises(tmp_path):
+    """N3: multi-capture list where captures have mismatched param_dim raises ValueError."""
+    sub1 = tmp_path / "mismatch_cap0"
+    sub1.mkdir()
+    sub2 = tmp_path / "mismatch_cap1"
+    sub2.mkdir()
+    x1, y1 = _write_wav_pair(sub1, seed=22)
+    x2, y2 = _write_wav_pair(sub2, seed=23)
+    config = {
+        "type": "parametric",
+        "common": {
+            "delay": None,
+            "require_input_pre_silence": None,
+            "nx": _NX_MULTI,
+            "ny": _NY_MULTI,
+            "sample_rate": _RATE,
+        },
+        "train": [
+            # P=1
+            {"x_path": x1, "y_path": y1, "params": [0.5], "param_names": ["gain"]},
+            # P=2
+            {"x_path": x2, "y_path": y2, "params": [0.3, 0.7], "param_names": ["gain", "tone"]},
+        ],
+        "validation": [
+            {"x_path": x1, "y_path": y1, "params": [0.5], "param_names": ["gain"]},
+        ],
+    }
+    with _pytest.raises(ValueError, match="param_dim"):
+        _init_dataset(config, _Split.TRAIN)

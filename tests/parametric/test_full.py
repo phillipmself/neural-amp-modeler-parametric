@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from nam.data import np_to_wav as _np_to_wav
+from nam.models.parametric import ParametricConcatDataset  # triggers registrations
 from nam.train import full as _full
 
 
@@ -153,6 +154,63 @@ def test_tf1_full_main_parametric_selects_parametric_lightning_module(tmp_path):
 
     _full.main(
         _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=True,
+        make_plots=False,
+    )
+
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+
+
+def _write_wav_pair_to(tmp_path, subname, seed_offset=0):
+    """Write a WAV pair into a named subdirectory; return (x_path_str, y_path_str)."""
+    sub = tmp_path / subname
+    sub.mkdir()
+    t = np.arange(_NUM_SAMPLES, dtype=np.float64) / _RATE
+    x = 0.10 * np.sin(2.0 * np.pi * 220.0 * t + seed_offset)
+    y = 0.50 * x + 0.02 * np.sin(2.0 * np.pi * 440.0 * t + seed_offset)
+    x_path = sub / "input.wav"
+    y_path = sub / "output.wav"
+    _np_to_wav(x, x_path, rate=_RATE)
+    _np_to_wav(y, y_path, rate=_RATE)
+    return str(x_path), str(y_path)
+
+
+def test_tf3_full_main_multi_capture_parametric(tmp_path):
+    """
+    TF3: full.main() with a list-based multi-capture parametric config builds
+    ParametricConcatDataset (not ConcatDataset) and exports model.nam.
+
+    Two WAV pairs with different param values are provided. The config uses
+    type=="parametric" with list-valued train/validation splits, which must
+    dispatch to ParametricConcatDataset via the concat registry (N3).
+    """
+    x1, y1 = _write_wav_pair_to(tmp_path, "cap0", seed_offset=0)
+    x2, y2 = _write_wav_pair_to(tmp_path, "cap1", seed_offset=1)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    data_config = {
+        "type": "parametric",
+        "common": {
+            "delay": 0,
+            "require_input_pre_silence": None,
+            "param_names": ["gain"],
+        },
+        "train": [
+            {"x_path": x1, "y_path": y1, "params": [0.5], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+            {"x_path": x2, "y_path": y2, "params": [0.8], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+        ],
+        "validation": [
+            {"x_path": x1, "y_path": y1, "params": [0.5], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+            {"x_path": x2, "y_path": y2, "params": [0.8], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+        ],
+    }
+
+    _full.main(
+        data_config,
         _model_config(),
         _learning_config(),
         outdir,

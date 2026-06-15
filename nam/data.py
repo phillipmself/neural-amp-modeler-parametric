@@ -17,6 +17,7 @@ from enum import Enum as _Enum
 from pathlib import Path as _Path
 from typing import Any as _Any
 from typing import Callable as _Callable
+from typing import Dict as _Dict
 from typing import List as _List
 from typing import Optional as _Optional
 from typing import Sequence as _Sequence
@@ -949,6 +950,28 @@ class ConcatDataset(AbstractDataset, _InitializableFromConfig):
 
 _dataset_init_registry = {"dataset": Dataset.init_from_config}
 
+_dataset_concat_init_registry: _Dict[
+    str, _Callable[[_List[_Dict[str, _Any]]], AbstractDataset]
+] = {}
+
+
+def register_concat_dataset_initializer(
+    name: str,
+    constructor: _Callable[[_List[_Dict[str, _Any]]], AbstractDataset],
+    overwrite: bool = False,
+) -> None:
+    """Register a factory for list-based (multi-capture) configs of the given type.
+
+    Called automatically by subpackages on import (e.g. nam.models.parametric).
+    When a config's split value is a list and the type name has a registered concat
+    constructor, init_dataset dispatches to that constructor instead of ConcatDataset.
+    """
+    if name in _dataset_concat_init_registry and not overwrite:
+        raise KeyError(
+            f"A concat constructor for dataset name '{name}' is already registered!"
+        )
+    _dataset_concat_init_registry[name] = constructor
+
 
 def register_dataset_initializer(
     name: str, constructor: _Callable[[_Any], AbstractDataset], overwrite=False
@@ -981,10 +1004,13 @@ def init_dataset(config, split: Split) -> AbstractDataset:
         init = _dataset_init_registry[name]
         return init({**common, **base_config})
     elif isinstance(base_config, list):
+        merged_configs = [{**common, **c} for c in base_config]
+        if name in _dataset_concat_init_registry:
+            return _dataset_concat_init_registry[name](merged_configs)
         return ConcatDataset.init_from_config(
             {
                 "type": name,
-                "dataset_configs": [{**common, **c} for c in base_config],
+                "dataset_configs": merged_configs,
             }
         )
 

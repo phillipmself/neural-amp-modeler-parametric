@@ -275,3 +275,15 @@ class ParametricConcatDataset(_AbstractDataset):
     @property
     def sample_rate(self) -> _Optional[float]:
         return self._datasets[0].sample_rate
+
+
+def _build_parametric_concat(
+    configs: _List[_Dict[str, _Any]],
+) -> "ParametricConcatDataset":
+    """Factory for list-based parametric configs; called by register_concat_dataset_initializer.
+
+    Each dict in configs is a fully-merged per-capture config (common keys already merged
+    by init_dataset before this function is called).
+    """
+    datasets = [ParametricDataset.init_from_config(c) for c in configs]
+    return ParametricConcatDataset(datasets)
