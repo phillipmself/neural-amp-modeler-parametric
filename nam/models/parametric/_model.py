@@ -98,7 +98,7 @@ def _collect_channel_sizes(inner_net: _InnerWaveNet) -> _Set[int]:
     """
     sizes: _Set[int] = set()
     for layer_array in inner_net._layer_arrays:
-        for layer in layer_array._layers:
+        for layer in layer_array._layers:  # type: ignore[union-attr]
             # conv is a LayerConv; .out_channels is the number of output features
             sizes.add(layer.conv.out_channels)
     return sizes
@@ -121,6 +121,7 @@ class ParametricWaveNet(_BaseNet):
         net: _InnerWaveNet,
         param_names: _List[str],
         param_dim: int,
+        nominal_params: _List[float],
         sample_rate: _Optional[float] = None,
     ):
         super().__init__(sample_rate=sample_rate)
@@ -128,9 +129,20 @@ class ParametricWaveNet(_BaseNet):
             raise ValueError(
                 f"param_dim={param_dim} does not match len(param_names)={len(param_names)}"
             )
+        # nominal_params is a required config field (AD-5): it defines the parameter
+        # setting used for export snapshots and loudness normalization. Requiring it at
+        # construction prevents silent zeros that may not reflect the intended baseline.
+        if len(nominal_params) != param_dim:
+            raise ValueError(
+                f"nominal_params has length {len(nominal_params)} but param_dim={param_dim}. "
+                f"nominal_params must have exactly one value per parameter name in param_names."
+            )
         self._net = net
         self._param_names = list(param_names)
         self._param_dim = param_dim
+        self._nominal_params = _torch.tensor(
+            [float(v) for v in nominal_params], dtype=_torch.float32
+        )
         channel_sizes = _collect_channel_sizes(net)
         self._adapter = ResidualAffineAdapter(param_dim, channel_sizes)
 
@@ -140,12 +152,21 @@ class ParametricWaveNet(_BaseNet):
         sample_rate = config.pop("sample_rate", None)
         param_names = config.pop("param_names")
         param_dim = config.pop("param_dim")
+        # nominal_params is required (AD-5): fail early with a clear message so the
+        # user knows exactly which field is missing rather than getting a cryptic KeyError.
+        if "nominal_params" not in config:
+            raise ValueError(
+                "nominal_params is required in ParametricWaveNet config but was not found. "
+                "Provide a list of floats with one value per parameter name."
+            )
+        nominal_params = config.pop("nominal_params")
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
             "net": net,
             "param_names": param_names,
             "param_dim": param_dim,
+            "nominal_params": nominal_params,
             "sample_rate": sample_rate,
         }
 
@@ -161,11 +182,12 @@ class ParametricWaveNet(_BaseNet):
     def receptive_field(self) -> int:
         return self._net.receptive_field
 
-    def _forward(self, x: _torch.Tensor, params: _torch.Tensor) -> _torch.Tensor:
+    def _forward(self, x: _torch.Tensor, **kwargs) -> _torch.Tensor:
         """
-        Core forward. x: (B, L), params: (B, P) or (P,).
+        Core forward. x: (B, L), kwargs must contain 'params': (B, P) or (P,).
         Returns (B, L') where L' = L - receptive_field + 1.
         """
+        params: _torch.Tensor = kwargs["params"]
         if x.ndim == 2:
             x = x[:, None, :]  # (B, 1, L)
         # Validate parameter dim
@@ -192,7 +214,7 @@ class ParametricWaveNet(_BaseNet):
         assert y.shape[1] == 1
         return y[:, 0, :]
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         x: _torch.Tensor,
         params: _torch.Tensor,
@@ -221,7 +243,7 @@ class ParametricWaveNet(_BaseNet):
                 f"Input has {x.shape[1]} samples, which is too few for this model with "
                 f"receptive field {self.receptive_field}!"
             )
-        y = self._forward(x, params)
+        y = self._forward(x, params=params)
         if scalar:
             y = y[0]
         return y
@@ -234,6 +256,9 @@ class ParametricWaveNet(_BaseNet):
         cfg = self._net.export_config(sample_rate=self.sample_rate)
         cfg["param_names"] = self._param_names
         cfg["param_dim"] = self._param_dim
+        # nominal_params serialized as a JSON-friendly list of Python floats so
+        # downstream loaders can reconstruct the tensor without numpy dependency.
+        cfg["nominal_params"] = self._nominal_params.tolist()
         return cfg
 
     def _export_weights(self) -> _np.ndarray:
@@ -250,20 +275,12 @@ class ParametricWaveNet(_BaseNet):
         ).numpy()
         return _np.concatenate([inner_weights, adapter_weights])
 
-    def _export_input_output_args(self):
+    def _export_input_output_args(self):  # type: ignore[override]
         """
-        Provide a zero parameter vector so _Base._export_input_output can call
-        self(*args, x, pad_start=True) without binding params→x.
-
-        Note: _Base._export_input_output does:
-            self(*args, x, pad_start=True)
-        which expands to self(zeros_p, x, pad_start=True) = forward(zeros_p, x, ...),
-        but our signature is forward(x, params, ...) so positional order would
-        bind the first extra arg as x and the audio x as params — WRONG.
-
-        We fully override _export_input_output instead to be safe.
+        Not used: _export_input_output is fully overridden below.
+        Returns empty tuple to satisfy base return type.
         """
-        pass  # overridden below; this method is not used
+        return ()  # type: ignore[return-value]
 
     def _export_input_output(self):
         import math as _math
@@ -273,17 +290,18 @@ class ParametricWaveNet(_BaseNet):
             raise RuntimeError(
                 "Cannot export model's input and output without a sample rate."
             )
+        n = int(rate)
         x = _torch.cat(
             [
-                _torch.zeros((rate,)),
+                _torch.zeros((n,)),
                 0.5
                 * _torch.sin(
                     2.0
                     * _math.pi
                     * 220.0
-                    * _torch.linspace(0.0, 1.0, rate + 1)[:-1]
+                    * _torch.linspace(0.0, 1.0, n + 1)[:-1]
                 ),
-                _torch.zeros((rate,)),
+                _torch.zeros((n,)),
             ]
         )
         # Use zero params for the snapshot (nominal embedding = no adaptation)
@@ -294,6 +312,12 @@ class ParametricWaveNet(_BaseNet):
         )
 
     def _at_nominal_settings(self, x: _torch.Tensor) -> _torch.Tensor:
-        """Run at zero params (no parametric offset from the A2 embedding)."""
-        p = _torch.zeros(self._param_dim, device=x.device)
+        """Run at the configured nominal params rather than zeros.
+
+        The base BaseNet._at_nominal_settings calls self(x) with no params arg,
+        which would fail for ParametricWaveNet's required `params` argument. This
+        override injects self._nominal_params so export-time loudness normalization
+        and snapshot generation use the user-specified baseline parameter setting.
+        """
+        p = self._nominal_params.to(x.device)
         return self(x, p)

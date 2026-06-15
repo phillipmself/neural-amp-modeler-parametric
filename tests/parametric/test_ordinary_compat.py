@@ -178,11 +178,11 @@ def test_rg5_shared_step_scalar_loss():
     assert isinstance(preds, _torch.Tensor)
     assert isinstance(targets, _torch.Tensor)
     # Compute the scalar loss the same way training_step does.
-    loss = sum(
-        v.weight * v.value
-        for v in loss_dict.values()
-        if v.weight is not None and v.weight > 0.0
-    )
+    # Use a loop with explicit None guards so pyright can narrow both weight and value.
+    loss: _torch.Tensor = _torch.zeros(())
+    for v in loss_dict.values():
+        if v.weight is not None and v.weight > 0.0 and v.value is not None:
+            loss = loss + v.weight * v.value
     assert isinstance(loss, _torch.Tensor)
     assert loss.ndim == 0, "Loss must be a scalar (0-dim tensor)"
 

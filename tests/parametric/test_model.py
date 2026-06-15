@@ -5,10 +5,13 @@ PA1c is the MERGE GATE: zero-init adapter must give bit-exact parity with an
 ordinary WaveNet whose weights were imported into the inner net.
 """
 
+from typing import cast
+
 import pytest
 import torch
 
 from nam.models.parametric import ParametricWaveNet
+from nam.models.parametric._model import _ChannelAdapter
 from nam.models.wavenet._wavenet import WaveNet as _InnerWaveNet
 
 # ---------------------------------------------------------------------------
@@ -31,6 +34,8 @@ _SINGLE_C_CONFIG = {
     "head_scale": 1.0,
     "param_names": ["gain"],
     "param_dim": 1,
+    # nominal_params is required since C1.2 (AD-5)
+    "nominal_params": [0.5],
 }
 
 # Multi-channel-size config: two layer arrays with DIFFERENT channel counts (8 and 4).
@@ -61,6 +66,8 @@ _MULTI_C_CONFIG = {
     "head_scale": 0.02,
     "param_names": ["gain", "treble"],
     "param_dim": 2,
+    # nominal_params is required since C1.2 (AD-5)
+    "nominal_params": [0.5, 0.3],
 }
 
 
@@ -138,8 +145,9 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
 
     # Adapter must still be zero-init (we haven't trained or set any adapter weights)
     for key, sub_adapter in parametric._adapter._adapters.items():
-        gamma_out = sub_adapter.gamma_map(torch.ones(1, config["param_dim"]))
-        beta_out = sub_adapter.beta_map(torch.ones(1, config["param_dim"]))
+        sa = cast(_ChannelAdapter, sub_adapter)
+        gamma_out = sa.gamma_map(torch.ones(1, config["param_dim"]))
+        beta_out = sa.beta_map(torch.ones(1, config["param_dim"]))
         assert torch.all(gamma_out == 0), f"gamma_map not zero at C={key}"
         assert torch.all(beta_out == 0), f"beta_map not zero at C={key}"
 
@@ -199,10 +207,11 @@ def test_pa1d_zero_init_all_channel_sizes():
     ]
 
     for key, sub_adapter in model._adapter._adapters.items():
+        sa = cast(_ChannelAdapter, sub_adapter)
         for p in test_ps:
             with torch.no_grad():
-                gamma_out = sub_adapter.gamma_map(p)
-                beta_out = sub_adapter.beta_map(p)
+                gamma_out = sa.gamma_map(p)
+                beta_out = sa.beta_map(p)
             assert torch.all(gamma_out == 0), (
                 f"PA1d FAILED: gamma_map not zero for C={key}, p={p}"
             )
