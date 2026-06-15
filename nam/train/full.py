@@ -207,12 +207,19 @@ def main(
         with open(_Path(outdir, f"config_{basename}.json"), "w") as fp:
             _json.dump(config, fp, indent=4)
 
-    is_packed = model_config["net"]["name"] == "PackedWaveNet"
-    lightning_cls = (
-        _lightning_module.PackedLightningModule
-        if is_packed
-        else _lightning_module.LightningModule
-    )
+    _net_name = model_config["net"]["name"]
+    is_packed = _net_name == "PackedWaveNet"
+    is_parametric = _net_name == "ParametricWaveNet"
+    if is_packed:
+        lightning_cls = _lightning_module.PackedLightningModule
+    elif is_parametric:
+        import nam.models.parametric  # noqa: F401 — registers model + dataset
+        from nam.train.parametric import (
+            ParametricLightningModule as _ParametricLightningModule,
+        )
+        lightning_cls = _ParametricLightningModule
+    else:
+        lightning_cls = _lightning_module.LightningModule
     model = lightning_cls.init_from_config(model_config)
     # Add receptive field to data config:
     data_config["common"] = data_config.get("common", {})
