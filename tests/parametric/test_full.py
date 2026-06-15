@@ -116,6 +116,28 @@ def _learning_config():
     }
 
 
+def test_tf2_full_main_parametric_make_plots_true(tmp_path):
+    """
+    TF2: full.main() with make_plots=True completes without AttributeError;
+    comparison.png is created.
+    """
+    x_path, y_path = _write_wav_pair(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    _full.main(
+        _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=True,
+        make_plots=True,
+    )
+
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+    assert (outdir / "comparison.png").exists(), "comparison.png was not created"
+
+
 def test_tf1_full_main_parametric_selects_parametric_lightning_module(tmp_path):
     """
     TF1: full.main() with ParametricWaveNet config completes training without the

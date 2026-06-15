@@ -73,6 +73,49 @@ def _plot(
                 window_end=window_end,
             )
         return
+
+    try:
+        from nam.models.parametric._dataset import (
+            ParametricDataset as _ParametricDataset,
+            ParametricConcatDataset as _ParametricConcatDataset,
+        )
+    except ImportError:  # pragma: no cover
+        _ParametricDataset = None  # type: ignore[assignment, misc]
+        _ParametricConcatDataset = None  # type: ignore[assignment, misc]
+
+    if _ParametricConcatDataset is not None and isinstance(ds, _ParametricConcatDataset):
+        import warnings as _warnings_mod
+        _warnings_mod.warn(
+            "Plotting is not supported for ParametricConcatDataset; skipping.",
+            stacklevel=2,
+        )
+        return
+
+    if _ParametricDataset is not None and isinstance(ds, _ParametricDataset):
+        _net = model.net
+        with _torch.no_grad():
+            inner = ds._inner
+            x = inner.x
+            tx = len(x) / 48_000
+            print(f"Run [nominal params] (t={tx:.2f})")
+            t0 = _time()
+            output = _net._at_nominal_settings(x).cpu().numpy()
+            t1 = _time()
+            try:
+                rt = f"{tx / (t1 - t0):.2f}"
+            except ZeroDivisionError:
+                rt = "???"
+            print(f"Took {t1 - t0:.2f} ({rt}x)")
+        _plot_arrays(
+            output.flatten(),
+            inner.y,
+            savefig=savefig,
+            show=show,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return
+
     with _torch.no_grad():
         tx = len(ds.x) / 48_000
         print(f"Run (t={tx:.2f})")
