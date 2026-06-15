@@ -176,3 +176,95 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
             "params": params,
             "param_dim": param_dim,
         }
+
+
+class ParametricConcatDataset(_AbstractDataset):
+    """
+    Concatenates N per-capture ParametricDataset instances for joint training.
+
+    Each subdataset represents one amplifier setting (one capture).  All subdatasets
+    must share the same param_dim, nx, ny, and sample_rate — the concat would be
+    meaningless otherwise and is likely a config mistake.
+
+    __getitem__ routes to the correct subdataset using a precomputed dict lookup
+    (same pattern as ConcatDataset._make_lookup in nam/data.py:905).
+
+    This class intentionally does NOT implement parse_config; building the concat from
+    config is deferred to the trainer layer which controls the list of captures.
+    """
+
+    def __init__(self, datasets: _List[ParametricDataset]) -> None:
+        if len(datasets) == 0:
+            raise ValueError(
+                "ParametricConcatDataset requires at least one ParametricDataset; "
+                "received an empty list."
+            )
+        self._datasets = list(datasets)
+        self._validate_datasets()
+        self._lookup = self._make_lookup()
+
+    def _validate_datasets(self) -> None:
+        """Validate param_dim, nx, ny, and sample_rate consistency across subdatasets."""
+        ref_param_dim = self._datasets[0].param_dim
+        ref_nx = self._datasets[0].nx
+        ref_ny = self._datasets[0].ny
+        ref_sr = self._datasets[0].sample_rate
+
+        for i, ds in enumerate(self._datasets[1:], start=1):
+            if ds.param_dim != ref_param_dim:
+                raise ValueError(
+                    f"param_dim mismatch: dataset 0 has param_dim={ref_param_dim} "
+                    f"but dataset {i} has param_dim={ds.param_dim}. "
+                    "All subdatasets must share the same param_dim."
+                )
+            if ds.nx != ref_nx:
+                raise ValueError(
+                    f"nx mismatch: dataset 0 has nx={ref_nx} "
+                    f"but dataset {i} has nx={ds.nx}."
+                )
+            if ds.ny != ref_ny:
+                raise ValueError(
+                    f"ny mismatch: dataset 0 has ny={ref_ny} "
+                    f"but dataset {i} has ny={ds.ny}."
+                )
+            if ds.sample_rate != ref_sr:
+                raise ValueError(
+                    f"sample_rate mismatch: dataset 0 has sample_rate={ref_sr} "
+                    f"but dataset {i} has sample_rate={ds.sample_rate}."
+                )
+
+    def _make_lookup(self) -> _Dict[int, _Tuple[int, int]]:
+        """Map global index → (dataset_index, local_index)."""
+        lookup: _Dict[int, _Tuple[int, int]] = {}
+        offset = 0
+        j = 0
+        for i in range(len(self)):
+            if offset == len(self._datasets[j]):
+                offset -= len(self._datasets[j])  # resets offset to 0
+                j += 1
+            lookup[i] = (j, offset)
+            offset += 1
+        return lookup
+
+    def __len__(self) -> int:
+        return sum(len(ds) for ds in self._datasets)
+
+    def __getitem__(self, idx: int):  # type: ignore[override]
+        ds_idx, local_idx = self._lookup[idx]
+        return self._datasets[ds_idx][local_idx]
+
+    @property
+    def param_dim(self) -> int:
+        return self._datasets[0].param_dim
+
+    @property
+    def nx(self) -> int:
+        return self._datasets[0].nx
+
+    @property
+    def ny(self) -> int:
+        return self._datasets[0].ny
+
+    @property
+    def sample_rate(self) -> _Optional[float]:
+        return self._datasets[0].sample_rate

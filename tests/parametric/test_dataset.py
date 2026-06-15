@@ -15,7 +15,7 @@ import torch as _torch
 from torch.utils.data import DataLoader as _DataLoader
 
 from nam.data import np_to_wav as _np_to_wav
-from nam.models.parametric import ParametricDataset  # import triggers registrations
+from nam.models.parametric import ParametricConcatDataset, ParametricDataset  # import triggers registrations
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -234,3 +234,110 @@ def test_pa12_missing_y_wav(tmp_path):
         "OSError",
         "Error",
     ), f"Expected a clear file-not-found error, got {exc_info.type}: {err_text}"
+
+
+# ---------------------------------------------------------------------------
+# EC8 — ParametricConcatDataset with matching param_dim succeeds
+# ---------------------------------------------------------------------------
+
+
+def _make_parametric_dataset(tmp_path: _Path, seed: int, params, param_names=None):
+    """Helper: build one ParametricDataset from a WAV pair written to a seed subdir."""
+    sub = tmp_path / str(seed)
+    sub.mkdir(exist_ok=True)
+    x_path, y_path = _write_wav_pair(sub, seed=seed)
+    if param_names is None:
+        param_names = [f"p{i}" for i in range(len(params))]
+    cfg = _parametric_config(x_path, y_path, param_names, params)
+    return ParametricDataset.init_from_config(cfg)
+
+
+def test_ec8_concat_two_datasets_same_param_dim(tmp_path):
+    """EC8: concatenating two datasets with the same P produces correct length and shapes."""
+    P = 2
+    ds1 = _make_parametric_dataset(tmp_path, seed=10, params=[0.1, 0.2])
+    ds2 = _make_parametric_dataset(tmp_path, seed=11, params=[0.5, 0.6])
+
+    concat = ParametricConcatDataset([ds1, ds2])
+
+    assert len(concat) == len(ds1) + len(ds2), (
+        f"Expected {len(ds1) + len(ds2)}, got {len(concat)}"
+    )
+    assert concat.param_dim == P
+
+    params, x, y = concat[0]
+    assert isinstance(params, _torch.Tensor)
+    assert params.shape == (P,)
+    assert x.shape == (_NX + _NY - 1,)
+    assert y.shape == (_NY,)
+
+
+def test_ec8_concat_item_routing_across_boundary(tmp_path):
+    """EC8 (boundary): item at ds1 boundary comes from ds1; next item comes from ds2."""
+    ds1 = _make_parametric_dataset(tmp_path, seed=12, params=[0.1, 0.2], param_names=["a", "b"])
+    ds2 = _make_parametric_dataset(tmp_path, seed=13, params=[0.9, 0.8], param_names=["a", "b"])
+
+    concat = ParametricConcatDataset([ds1, ds2])
+
+    # Last item of ds1
+    params_last_ds1, _, _ = concat[len(ds1) - 1]
+    assert _torch.allclose(params_last_ds1, _torch.tensor([0.1, 0.2], dtype=_torch.float32)), (
+        "Last item before boundary should have ds1 params"
+    )
+
+    # First item of ds2
+    params_first_ds2, _, _ = concat[len(ds1)]
+    assert _torch.allclose(params_first_ds2, _torch.tensor([0.9, 0.8], dtype=_torch.float32)), (
+        "First item after boundary should have ds2 params"
+    )
+
+
+# ---------------------------------------------------------------------------
+# EC9 — ParametricConcatDataset with mismatched param_dim raises ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_ec9_concat_mismatched_param_dim_raises(tmp_path):
+    """EC9: mixing datasets with different param_dim must raise ValueError mentioning param_dim."""
+    ds1 = _make_parametric_dataset(tmp_path, seed=14, params=[0.5])         # P=1
+    ds2 = _make_parametric_dataset(tmp_path, seed=15, params=[0.3, 0.7])    # P=2
+
+    with _pytest.raises(ValueError, match="param_dim"):
+        ParametricConcatDataset([ds1, ds2])
+
+
+# ---------------------------------------------------------------------------
+# IT2 — DataLoader collation of ParametricConcatDataset
+# ---------------------------------------------------------------------------
+
+
+def test_it2_dataloader_collation_from_concat(tmp_path):
+    """IT2: DataLoader over ParametricConcatDataset produces (B,P), (B,NX+NY-1), (B,NY)."""
+    P = 3
+    ds1 = _make_parametric_dataset(tmp_path, seed=16, params=[0.1, 0.2, 0.3])
+    ds2 = _make_parametric_dataset(tmp_path, seed=17, params=[0.4, 0.5, 0.6])
+    concat = ParametricConcatDataset([ds1, ds2])
+
+    B = min(4, len(concat))
+    loader = _DataLoader(concat, batch_size=B, shuffle=False)
+    batch = next(iter(loader))
+
+    assert isinstance(batch, (list, tuple))
+    assert len(batch) == 3
+    b_params, b_x, b_y = batch
+
+    assert b_params.shape == (B, P), f"Expected ({B},{P}), got {b_params.shape}"
+    assert b_x.shape == (B, _NX + _NY - 1), f"Expected ({B},{_NX + _NY - 1}), got {b_x.shape}"
+    assert b_y.shape == (B, _NY), f"Expected ({B},{_NY}), got {b_y.shape}"
+    assert b_params.dtype == _torch.float32
+
+
+# ---------------------------------------------------------------------------
+# PA11 extension — empty dataset list raises ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_pa11_concat_empty_list_raises():
+    """PA11 (concat): constructing ParametricConcatDataset with empty list raises ValueError."""
+    with _pytest.raises(ValueError):
+        ParametricConcatDataset([])
