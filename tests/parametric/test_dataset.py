@@ -306,6 +306,25 @@ def test_ec9_concat_mismatched_param_dim_raises(tmp_path):
         ParametricConcatDataset([ds1, ds2])
 
 
+def test_ec9_concat_mismatched_param_names_order_raises(tmp_path):
+    """EC9: same P but different param_names order must raise ValueError mentioning param_names."""
+    ds1 = _make_parametric_dataset(
+        tmp_path,
+        seed=18,
+        params=[0.1, 0.2],
+        param_names=["gain", "treble"],
+    )
+    ds2 = _make_parametric_dataset(
+        tmp_path,
+        seed=19,
+        params=[0.3, 0.4],
+        param_names=["treble", "gain"],
+    )
+
+    with _pytest.raises(ValueError, match="param_names"):
+        ParametricConcatDataset([ds1, ds2])
+
+
 # ---------------------------------------------------------------------------
 # IT2 — DataLoader collation of ParametricConcatDataset
 # ---------------------------------------------------------------------------
