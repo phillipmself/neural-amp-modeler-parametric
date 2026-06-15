@@ -304,8 +304,7 @@ class ParametricWaveNet(_BaseNet):
                 _torch.zeros((n,)),
             ]
         )
-        # Use zero params for the snapshot (nominal embedding = no adaptation)
-        p = _torch.zeros(self._param_dim)
+        p = self._nominal_params
         return (
             x.detach().cpu().numpy(),
             self(x, p, pad_start=True).detach().cpu().numpy(),

@@ -328,6 +328,66 @@ def test_ec10_forward_identical_after_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# X1 — _export_input_output snapshot is computed at nominal_params, not zeros
+# ---------------------------------------------------------------------------
+
+
+def test_x1_export_snapshot_uses_nominal_params():
+    """X1: _export_input_output() snapshot must match the nominal-params forward pass.
+
+    Uses non-zero adapter weights so that zero params and nominal params give
+    observably different outputs. Would fail on the old zeros implementation.
+    """
+    import math
+    import numpy as np
+
+    # Low sample rate keeps the 3-second sweep small (300 samples total).
+    config = {**_SINGLE_C_CONFIG, "nominal_params": [1.0], "sample_rate": 100.0}
+    model = _build(config)
+    model.eval()
+
+    # Give the adapter non-trivial weights so nominal p != zero p has a real effect.
+    with torch.no_grad():
+        for sub in model._adapter._adapters.values():
+            cast(_ChannelAdapter, sub)
+            torch.nn.init.constant_(sub.gamma_map.weight, 0.1)  # type: ignore[attr-defined]
+
+    x_np, y_snap_np = model._export_input_output()
+
+    # Reconstruct the same input signal the method uses internally.
+    rate = model.sample_rate
+    assert rate is not None
+    n = int(rate)
+    x = torch.cat(
+        [
+            torch.zeros(n),
+            0.5 * torch.sin(
+                2.0 * math.pi * 220.0 * torch.linspace(0.0, 1.0, n + 1)[:-1]
+            ),
+            torch.zeros(n),
+        ]
+    )
+
+    p_nominal = model._nominal_params
+    p_zeros = torch.zeros(model._param_dim)
+
+    with torch.no_grad():
+        y_nominal = model(x, p_nominal, pad_start=True).numpy()
+        y_zeros = model(x, p_zeros, pad_start=True).numpy()
+
+    np.testing.assert_allclose(
+        y_snap_np,
+        y_nominal,
+        rtol=1e-5,
+        err_msg="_export_input_output snapshot must match nominal_params run",
+    )
+    assert not np.allclose(y_snap_np, y_zeros), (
+        "_export_input_output snapshot matched zero-params run; "
+        "nominal_params may not be applied"
+    )
+
+
+# ---------------------------------------------------------------------------
 # EC12 — unknown architecture raises a clear ValueError
 # ---------------------------------------------------------------------------
 
