@@ -42,6 +42,10 @@ test = [
     "requests",
 ]
 
+dev = [
+    "pyright",
+]
+
 [project.urls]
 homepage = "https://github.com/sdatkinson/"
 

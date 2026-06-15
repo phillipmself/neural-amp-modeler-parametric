@@ -1,0 +1,25 @@
+{
+  "include": [
+    "nam",
+    "tests"
+  ],
+  "exclude": [
+    ".git",
+    ".venv",
+    ".pytest_cache",
+    ".claude/worktrees",
+    "**/__pycache__"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportIncompatibleMethodOverride": "error",
+  "reportIncompatibleVariableOverride": "error",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "venv": ".venv"
+    }
+  ]
+}
