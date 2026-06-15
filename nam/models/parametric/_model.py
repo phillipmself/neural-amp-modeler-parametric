@@ -311,6 +311,38 @@ class ParametricWaveNet(_BaseNet):
             self(x, p, pad_start=True).detach().cpu().numpy(),
         )
 
+    def import_weights(  # type: ignore[override]
+        self,
+        weights: _torch.Tensor,
+        i: int = 0,
+    ) -> int:
+        """
+        Load the flat weight vector produced by _export_weights().
+
+        The blob is laid out as: [inner WaveNet weights] ++ [adapter weights].
+        Delegating to self._net.import_weights returns the index where the inner
+        net stopped, then we overwrite the adapter parameters in the same order
+        they were flattened during export (adapter.parameters() iteration order).
+
+        The type: ignore[override] suppresses the Sequence[float] vs Tensor mismatch
+        with Exportable.import_weights — callers pass a Tensor (matching _from_nam.py
+        usage) and internal wavenet methods also accept Tensor. Keeping Tensor here
+        avoids an unnecessary re-conversion on every call.
+        """
+        weights_t = (
+            weights
+            if isinstance(weights, _torch.Tensor)
+            else _torch.tensor(weights, dtype=_torch.float32)
+        )
+        i = self._net.import_weights(weights_t, i)
+        # Load adapter weights in the same order as _export_weights: iterate
+        # self._adapter.parameters() and fill each parameter from the flat blob.
+        for param in self._adapter.parameters():
+            n = param.numel()
+            param.data.copy_(weights_t[i : i + n].reshape(param.shape))
+            i += n
+        return i
+
     def _at_nominal_settings(self, x: _torch.Tensor) -> _torch.Tensor:
         """Run at the configured nominal params rather than zeros.
 

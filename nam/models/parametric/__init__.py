@@ -9,6 +9,7 @@ Both registrations happen on package import with no edits to factory.py or data.
 """
 
 from ._dataset import ParametricConcatDataset, ParametricDataset
+from ._loader import load_parametric_nam
 from ._model import ParametricWaveNet, ResidualAffineAdapter
 from ..factory import register as _register
 from nam.data import register_dataset_initializer as _register_dataset
@@ -19,4 +20,10 @@ _register("ParametricWaveNet", ParametricWaveNet.init_from_config)
 # Register the parametric dataset type — no data.py edit needed.
 _register_dataset("parametric", ParametricDataset.init_from_config)
 
-__all__ = ["ParametricWaveNet", "ResidualAffineAdapter", "ParametricDataset", "ParametricConcatDataset"]
+__all__ = [
+    "ParametricWaveNet",
+    "ResidualAffineAdapter",
+    "ParametricDataset",
+    "ParametricConcatDataset",
+    "load_parametric_nam",
+]

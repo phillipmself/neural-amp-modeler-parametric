@@ -1,5 +1,5 @@
 """
-PA3, PA4, PA4b, PA6 — ParametricWaveNet export config tests.
+PA3, PA4, PA4b, PA6, PA5, PA5b, EC10, EC12 — ParametricWaveNet export/load tests.
 
 These tests verify that:
 - PA3: exported .nam has architecture == "ParametricWaveNet"
@@ -7,6 +7,10 @@ These tests verify that:
 - PA4b: missing or mismatched nominal_params raises a clear error at construction
 - PA6: _at_nominal_settings injects nominal_params so export completes without
        a missing-params-arg error
+- PA5: load_parametric_nam() reconstructs a ParametricWaveNet from an exported dict
+- PA5b: load_parametric_nam() delegates "WaveNet" files to init_from_nam (no exception)
+- EC10: forward pass before and after export/reload round-trip gives identical output
+- EC12: load_parametric_nam() given an unknown architecture raises a clear ValueError
 """
 
 import json as _json
@@ -16,8 +20,9 @@ from typing import cast
 import pytest
 import torch
 
-from nam.models.parametric import ParametricWaveNet
+from nam.models.parametric import ParametricWaveNet, load_parametric_nam
 from nam.models.parametric._model import _ChannelAdapter
+from nam.models.wavenet import WaveNet as _WaveNet
 
 # ---------------------------------------------------------------------------
 # Tiny single-channel config with nominal_params (C1.2 requirement)
@@ -218,3 +223,122 @@ def test_pa6_nominal_params_differ_from_zero():
     assert not torch.equal(y_nominal, y_zeros), (
         "_at_nominal_settings must use nominal_params, not zeros"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tiny plain-WaveNet config for PA5b (needs to export as "WaveNet" architecture)
+# ---------------------------------------------------------------------------
+
+_TINY_WAVENET_CONFIG = {
+    "layers_configs": [
+        {
+            "input_size": 1,
+            "condition_size": 1,
+            "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
+            "channels": 4,
+            "kernel_size": 2,
+            "dilations": [1, 2],
+            "activation": "Tanh",
+        }
+    ],
+    "head_scale": 1.0,
+}
+
+
+# ---------------------------------------------------------------------------
+# PA5 — load_parametric_nam() round-trip reconstructs ParametricWaveNet
+# ---------------------------------------------------------------------------
+
+
+def test_pa5_load_parametric_nam_roundtrip(tmp_path):
+    """PA5: export a ParametricWaveNet to a dict, reload via load_parametric_nam,
+    assert the result is a ParametricWaveNet with the original config."""
+    model = _build(_SINGLE_C_CONFIG)
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    loaded = load_parametric_nam(nam)
+
+    assert isinstance(loaded, ParametricWaveNet), (
+        f"Expected ParametricWaveNet, got {type(loaded).__name__}"
+    )
+    assert loaded._param_names == model._param_names
+    assert loaded._param_dim == model._param_dim
+    torch.testing.assert_close(loaded._nominal_params, model._nominal_params)
+
+
+# ---------------------------------------------------------------------------
+# PA5b — load_parametric_nam() delegates "WaveNet" to init_from_nam
+# ---------------------------------------------------------------------------
+
+
+def test_pa5b_load_parametric_nam_delegates_wavenet(tmp_path):
+    """PA5b: load_parametric_nam() on a "WaveNet" .nam file returns a non-parametric
+    model (whatever init_from_nam returns) without raising an exception."""
+    wavenet = _WaveNet.init_from_config(_TINY_WAVENET_CONFIG)
+    wavenet.export(tmp_path, basename="plain")
+    with open(tmp_path / "plain.nam") as fp:
+        nam = _json.load(fp)
+
+    assert nam["architecture"] == "WaveNet", (
+        f"Expected 'WaveNet', got '{nam['architecture']}'"
+    )
+
+    # Must not raise; must return something that is NOT a ParametricWaveNet
+    loaded = load_parametric_nam(nam)
+    assert not isinstance(loaded, ParametricWaveNet), (
+        "load_parametric_nam must not return a ParametricWaveNet for a 'WaveNet' file"
+    )
+
+
+# ---------------------------------------------------------------------------
+# EC10 — forward pass identical before and after export/reload
+# ---------------------------------------------------------------------------
+
+
+def test_ec10_forward_identical_after_roundtrip(tmp_path):
+    """EC10: export a ParametricWaveNet, reload it, run forward with the same inputs —
+    outputs must be bit-for-bit identical (float32 round-trip via JSON list)."""
+    model = _build(_SINGLE_C_CONFIG)
+    model.eval()
+
+    rf = model.receptive_field
+    x = torch.randn(1, rf + 64)
+    p = torch.tensor([0.7])
+
+    with torch.no_grad():
+        y_before = model(x, p, pad_start=False)
+
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    loaded = load_parametric_nam(nam)
+    loaded.eval()
+
+    with torch.no_grad():
+        y_after = loaded(x, p, pad_start=False)
+
+    torch.testing.assert_close(
+        y_after,
+        y_before,
+        msg="Forward pass changed after export/reload round-trip",
+    )
+
+
+# ---------------------------------------------------------------------------
+# EC12 — unknown architecture raises a clear ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_ec12_unknown_architecture_raises():
+    """EC12: load_parametric_nam() given an unknown architecture raises ValueError
+    with the unknown architecture name in the error message."""
+    dummy_nam = {
+        "architecture": "UnknownArch",
+        "config": {},
+        "weights": [],
+    }
+    with pytest.raises(ValueError, match="UnknownArch"):
+        load_parametric_nam(dummy_nam)
