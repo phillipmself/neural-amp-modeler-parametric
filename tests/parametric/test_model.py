@@ -15,7 +15,7 @@ from nam.models.parametric._model import _ChannelAdapter
 from nam.models.wavenet._wavenet import WaveNet as _InnerWaveNet
 
 # ---------------------------------------------------------------------------
-# Configs
+# Configs — use the new self-describing params array schema
 # ---------------------------------------------------------------------------
 
 # Single-channel-size config (channels=4, Tanh activation).
@@ -32,10 +32,7 @@ _SINGLE_C_CONFIG = {
         }
     ],
     "head_scale": 1.0,
-    "param_names": ["gain"],
-    "param_dim": 1,
-    # nominal_params is required since C1.2 (AD-5)
-    "nominal_params": [0.5],
+    "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}],
 }
 
 # Multi-channel-size config: two layer arrays with DIFFERENT channel counts (8 and 4).
@@ -64,11 +61,15 @@ _MULTI_C_CONFIG = {
         },
     ],
     "head_scale": 0.02,
-    "param_names": ["gain", "treble"],
-    "param_dim": 2,
-    # nominal_params is required since C1.2 (AD-5)
-    "nominal_params": [0.5, 0.3],
+    "params": [
+        {"name": "gain",   "min": 0.0, "max": 1.0, "default": 0.5},
+        {"name": "treble", "min": 0.0, "max": 1.0, "default": 0.3},
+    ],
 }
+
+# Helpers for tests that need param_dim as an integer
+_SINGLE_C_PARAM_DIM = 1
+_MULTI_C_PARAM_DIM = 2
 
 
 def _build_parametric(config):
@@ -125,12 +126,8 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
     """
     config = _MULTI_C_CONFIG
 
-    # Build ordinary inner WaveNet with fixed random weights
-    inner_cfg = {
-        k: v
-        for k, v in config.items()
-        if k not in ("param_names", "param_dim")
-    }
+    # Build ordinary inner WaveNet with fixed random weights (strip parametric keys)
+    inner_cfg = {k: v for k, v in config.items() if k != "params"}
     ordinary = _InnerWaveNet.init_from_config(inner_cfg)
     ordinary.eval()
 
@@ -143,11 +140,13 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
     weights = ordinary.export_weights()
     parametric._net.import_weights(torch.tensor(weights))
 
+    P = parametric._param_dim
+
     # Adapter must still be zero-init (we haven't trained or set any adapter weights)
     for key, sub_adapter in parametric._adapter._adapters.items():
         sa = cast(_ChannelAdapter, sub_adapter)
-        gamma_out = sa.gamma_map(torch.ones(1, config["param_dim"]))
-        beta_out = sa.beta_map(torch.ones(1, config["param_dim"]))
+        gamma_out = sa.gamma_map(torch.ones(1, P))
+        beta_out = sa.beta_map(torch.ones(1, P))
         assert torch.all(gamma_out == 0), f"gamma_map not zero at C={key}"
         assert torch.all(beta_out == 0), f"beta_map not zero at C={key}"
 
@@ -157,11 +156,11 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
     # Multiple inputs, multiple param vectors (including 1-D constant-param case)
     test_cases = [
         # (x shape, params)
-        (torch.randn(1, rf + 128), torch.zeros(1, config["param_dim"])),
-        (torch.randn(2, rf + 64), torch.randn(2, config["param_dim"])),
-        (torch.randn(3, rf + 48), torch.ones(3, config["param_dim"])),
+        (torch.randn(1, rf + 128), torch.zeros(1, P)),
+        (torch.randn(2, rf + 64), torch.randn(2, P)),
+        (torch.randn(3, rf + 48), torch.ones(3, P)),
         # 1-D constant-param case: same p broadcast to all batch items
-        (torch.randn(2, rf + 32), torch.zeros(config["param_dim"])),
+        (torch.randn(2, rf + 32), torch.zeros(P)),
     ]
 
     for x, p in test_cases:
@@ -196,7 +195,7 @@ def test_pa1d_zero_init_all_channel_sizes():
     """
     model = _build_parametric(_MULTI_C_CONFIG)
     model.eval()
-    P = _MULTI_C_CONFIG["param_dim"]
+    P = model._param_dim
 
     # Try several arbitrary p vectors
     test_ps = [
@@ -229,7 +228,7 @@ def test_pa2_params_dim_mismatch_raises():
     """PA2: passing params with wrong dim raises ValueError with a clear message."""
     model = _build_parametric(_SINGLE_C_CONFIG)
     model.eval()
-    P_configured = _SINGLE_C_CONFIG["param_dim"]  # 1
+    P_configured = _SINGLE_C_PARAM_DIM  # 1
     B = 2
     seq_len = model.receptive_field + 32
 

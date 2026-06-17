@@ -26,6 +26,7 @@ from nam.models._from_nam import _init_wavenet as _init_wavenet
 from nam.models._from_nam import init_from_nam as _init_from_nam
 
 from ._model import ParametricWaveNet
+from ._spec import ParamSpec as _ParamSpec
 
 
 def load_parametric_nam(nam_dict: dict) -> Any:
@@ -57,15 +58,12 @@ def load_parametric_nam(nam_dict: dict) -> Any:
     if architecture == "ParametricWaveNet":
         config = _deepcopy(nam_dict["config"])
         sample_rate = config.pop("sample_rate", None)
-        param_names = config.pop("param_names")
-        param_dim = config.pop("param_dim")
-        nominal_params = config.pop("nominal_params")
+        raw_specs = config.pop("params")
+        param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
 
         # The remaining config is the inner WaveNet in .nam export format.
         # _init_wavenet normalizes "layers" keys and activation dict format
         # to the construction format WaveNet.parse_config expects.
-        # We pass a synthetic nam dict so _init_wavenet can extract the top-level
-        # keys it needs ("config" with "layers", "head", "head_scale").
         inner_net = _init_wavenet(
             config=config,
             sample_rate=sample_rate,
@@ -73,9 +71,7 @@ def load_parametric_nam(nam_dict: dict) -> Any:
 
         model = ParametricWaveNet(
             net=inner_net._net,  # unwrap the WaveNet wrapper to get the inner _WaveNet
-            param_names=param_names,
-            param_dim=param_dim,
-            nominal_params=nominal_params,
+            param_specs=param_specs,
             sample_rate=sample_rate,
         )
 

@@ -31,9 +31,10 @@ _PARAM_CONFIG = {
         }
     ],
     "head_scale": 1.0,
-    "param_names": ["gain", "treble"],
-    "param_dim": 2,
-    "nominal_params": [0.5, 0.3],
+    "params": [
+        {"name": "gain",   "min": 0.0, "max": 1.0, "default": 0.5},
+        {"name": "treble", "min": 0.0, "max": 1.0, "default": 0.3},
+    ],
 }
 
 _LOSS_CONFIG = LossConfig(mse_weight=1.0, mrstft_weight=None)

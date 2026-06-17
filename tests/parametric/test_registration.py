@@ -33,10 +33,8 @@ _CONFIG = {
         }
     ],
     "head_scale": 1.0,
-    "param_names": ["gain"],
-    "param_dim": 1,
-    # nominal_params is required since C1.2 (AD-5)
-    "nominal_params": [0.5],
+    # Self-describing params array (replaces param_names/param_dim/nominal_params).
+    "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}],
 }
 
 

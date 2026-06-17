@@ -3,14 +3,16 @@ PA3, PA4, PA4b, PA6, PA5, PA5b, EC10, EC12 — ParametricWaveNet export/load tes
 
 These tests verify that:
 - PA3: exported .nam has architecture == "ParametricWaveNet"
-- PA4: exported config dict contains param_names, param_dim, and nominal_params
-- PA4b: missing or mismatched nominal_params raises a clear error at construction
+- PA4: exported config dict contains a self-describing "params" array
+       (name/min/max/default per entry); old flat keys are absent
+- PA4b: missing "params" key raises a clear error at construction
 - PA6: _at_nominal_settings injects nominal_params so export completes without
        a missing-params-arg error
 - PA5: load_parametric_nam() reconstructs a ParametricWaveNet from an exported dict
 - PA5b: load_parametric_nam() delegates "WaveNet" files to init_from_nam (no exception)
 - EC10: forward pass before and after export/reload round-trip gives identical output
 - EC12: load_parametric_nam() given an unknown architecture raises a clear ValueError
+- ParamSpec: validation (min<=default<=max, finiteness) and serialization round-trip
 """
 
 import json as _json
@@ -22,10 +24,11 @@ import torch
 
 from nam.models.parametric import ParametricWaveNet, load_parametric_nam
 from nam.models.parametric._model import _ChannelAdapter
+from nam.models.parametric._spec import ParamSpec
 from nam.models.wavenet import WaveNet as _WaveNet
 
 # ---------------------------------------------------------------------------
-# Tiny single-channel config with nominal_params (C1.2 requirement)
+# Tiny single-channel config using the self-describing params array schema
 # ---------------------------------------------------------------------------
 
 _SINGLE_C_CONFIG = {
@@ -41,9 +44,7 @@ _SINGLE_C_CONFIG = {
         }
     ],
     "head_scale": 1.0,
-    "param_names": ["gain"],
-    "param_dim": 1,
-    "nominal_params": [0.5],
+    "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}],
     "sample_rate": 44100.0,
 }
 
@@ -69,9 +70,10 @@ _MULTI_C_CONFIG = {
         },
     ],
     "head_scale": 0.02,
-    "param_names": ["gain", "treble"],
-    "param_dim": 2,
-    "nominal_params": [0.5, 0.3],
+    "params": [
+        {"name": "gain",   "min": 0.0, "max": 1.0, "default": 0.5},
+        {"name": "treble", "min": 0.0, "max": 1.0, "default": 0.3},
+    ],
     "sample_rate": 44100.0,
 }
 
@@ -97,62 +99,81 @@ def test_pa3_export_architecture_string(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PA4 — exported config contains param_names, param_dim, nominal_params
+# PA4 — exported config contains self-describing params array; old keys absent
 # ---------------------------------------------------------------------------
 
 
-def test_pa4_export_config_contains_required_keys(tmp_path):
-    """PA4: exported config dict has param_names, param_dim, and nominal_params."""
+def test_pa4_export_config_contains_params_array(tmp_path):
+    """PA4: exported config has a 'params' array with name/min/max/default per entry."""
     model = _build(_SINGLE_C_CONFIG)
     model.export(tmp_path, basename="model")
     with open(tmp_path / "model.nam") as fp:
         nam = _json.load(fp)
     cfg = nam["config"]
-    assert "param_names" in cfg, "param_names missing from exported config"
-    assert "param_dim" in cfg, "param_dim missing from exported config"
-    assert "nominal_params" in cfg, "nominal_params missing from exported config"
-    # Check values are correct
-    assert cfg["param_names"] == ["gain"]
-    assert cfg["param_dim"] == 1
-    assert cfg["nominal_params"] == [0.5]
+    assert "params" in cfg, "'params' array missing from exported config"
+    # Old flat keys must be absent (no legacy fallback — parametric is unreleased)
+    assert "param_names" not in cfg, "Old 'param_names' key must be absent from export"
+    assert "param_dim" not in cfg, "Old 'param_dim' key must be absent from export"
+    assert "nominal_params" not in cfg, "Old 'nominal_params' key must be absent from export"
+    # Verify array structure and values
+    params = cfg["params"]
+    assert isinstance(params, list) and len(params) == 1
+    entry = params[0]
+    assert entry["name"] == "gain"
+    assert entry["min"] == pytest.approx(0.0)
+    assert entry["max"] == pytest.approx(1.0)
+    assert entry["default"] == pytest.approx(0.5, rel=1e-5)
 
 
-def test_pa4_nominal_params_is_json_serializable(tmp_path):
-    """PA4: nominal_params in exported config is a plain list of Python floats."""
+def test_pa4_params_array_is_json_serializable(tmp_path):
+    """PA4: params array in exported config contains only JSON-native types."""
     model = _build(_MULTI_C_CONFIG)
     model.export(tmp_path, basename="model")
     with open(tmp_path / "model.nam") as fp:
         nam = _json.load(fp)
-    np_field = nam["config"]["nominal_params"]
-    assert isinstance(np_field, list), "nominal_params must be a JSON list"
-    for v in np_field:
-        assert isinstance(v, float), f"Each nominal_params element must be float, got {type(v)}"
-    # Use approx because float32 round-trip (tensor.tolist()) may differ from
-    # the original Python float at float64 precision (e.g. 0.3 → 0.30000001...).
-    assert np_field == pytest.approx([0.5, 0.3], rel=1e-5)
+    params = nam["config"]["params"]
+    assert isinstance(params, list) and len(params) == 2
+    for entry in params:
+        assert isinstance(entry["name"], str)
+        assert isinstance(entry["min"], float)
+        assert isinstance(entry["max"], float)
+        assert isinstance(entry["default"], float)
+    # Use approx because float32 round-trip may differ at float64 precision
+    assert params[0]["default"] == pytest.approx(0.5, rel=1e-5)
+    assert params[1]["default"] == pytest.approx(0.3, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
-# PA4b — missing or mismatched nominal_params raises a clear error
+# PA4b — missing or invalid params raises a clear error
 # ---------------------------------------------------------------------------
 
 
-def test_pa4b_missing_nominal_params_raises():
-    """PA4b: constructing ParametricWaveNet without nominal_params raises a ValueError
-    that mentions 'nominal_params' in the message."""
-    config_no_nominal = {k: v for k, v in _SINGLE_C_CONFIG.items()
-                         if k != "nominal_params"}
-    with pytest.raises(ValueError, match="nominal_params"):
-        _build(config_no_nominal)
+def test_pa4b_missing_params_raises():
+    """PA4b: constructing ParametricWaveNet without 'params' key raises a ValueError
+    that mentions 'params' in the message."""
+    config_no_params = {k: v for k, v in _SINGLE_C_CONFIG.items()
+                        if k != "params"}
+    with pytest.raises(ValueError, match="params"):
+        _build(config_no_params)
 
 
-def test_pa4b_nominal_params_length_mismatch_raises():
-    """PA4b: nominal_params length != param_dim raises a clear ValueError."""
-    bad_config = dict(_SINGLE_C_CONFIG)
-    # param_dim=1 but nominal_params has 3 values
-    bad_config = {**_SINGLE_C_CONFIG, "nominal_params": [0.1, 0.2, 0.3]}
-    with pytest.raises(ValueError, match="nominal_params"):
-        _build(bad_config)
+def test_pa4b_param_spec_min_gt_default_raises():
+    """PA4b: ParamSpec with min > default raises ValueError at construction."""
+    with pytest.raises(ValueError, match="min <= default <= max"):
+        ParamSpec(name="gain", min=0.8, max=1.0, default=0.5)
+
+
+def test_pa4b_param_spec_default_gt_max_raises():
+    """PA4b: ParamSpec with default > max raises ValueError at construction."""
+    with pytest.raises(ValueError, match="min <= default <= max"):
+        ParamSpec(name="gain", min=0.0, max=0.4, default=0.5)
+
+
+def test_pa4b_param_spec_infinite_raises():
+    """PA4b: ParamSpec with non-finite values raises ValueError."""
+    import math
+    with pytest.raises(ValueError, match="finite"):
+        ParamSpec(name="gain", min=float("-inf"), max=1.0, default=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +220,11 @@ def test_pa6_nominal_params_differ_from_zero():
     naive implementation that always passes zeros would still pass PA6 if
     nominal_params=[0.0, ...].
     """
-    # Use a nonzero nominal setting
-    config = {**_SINGLE_C_CONFIG, "nominal_params": [1.0]}
+    # Use a nonzero nominal setting so zero and nominal give different outputs
+    config = {
+        **_SINGLE_C_CONFIG,
+        "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 1.0}],
+    }
     model = _build(config)
     model.eval()
 
@@ -342,7 +366,12 @@ def test_x1_export_snapshot_uses_nominal_params():
     import numpy as np
 
     # Low sample rate keeps the 3-second sweep small (300 samples total).
-    config = {**_SINGLE_C_CONFIG, "nominal_params": [1.0], "sample_rate": 100.0}
+    # Override default to 1.0 so nominal != zero and the snapshot regression is detectable.
+    config = {
+        **_SINGLE_C_CONFIG,
+        "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 1.0}],
+        "sample_rate": 100.0,
+    }
     model = _build(config)
     model.eval()
 
@@ -402,3 +431,60 @@ def test_ec12_unknown_architecture_raises():
     }
     with pytest.raises(ValueError, match="UnknownArch"):
         load_parametric_nam(dummy_nam)
+
+
+# ---------------------------------------------------------------------------
+# ParamSpec unit tests — validation and serialization round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_paramspec_valid_construction():
+    """ParamSpec: valid min <= default <= max constructs without error."""
+    spec = ParamSpec(name="gain", min=0.0, max=10.0, default=5.0)
+    assert spec.name == "gain"
+    assert spec.min == 0.0
+    assert spec.max == 10.0
+    assert spec.default == 5.0
+
+
+def test_paramspec_boundary_default_equals_min():
+    """ParamSpec: default == min is valid (boundary case)."""
+    spec = ParamSpec(name="x", min=0.0, max=1.0, default=0.0)
+    assert spec.default == 0.0
+
+
+def test_paramspec_boundary_default_equals_max():
+    """ParamSpec: default == max is valid (boundary case)."""
+    spec = ParamSpec(name="x", min=0.0, max=1.0, default=1.0)
+    assert spec.default == 1.0
+
+
+def test_paramspec_to_dict_from_dict_roundtrip():
+    """ParamSpec: to_dict / from_dict round-trip preserves all fields."""
+    original = ParamSpec(name="bright", min=0.0, max=1.0, default=0.5)
+    restored = ParamSpec.from_dict(original.to_dict())
+    assert restored.name == original.name
+    assert restored.min == pytest.approx(original.min)
+    assert restored.max == pytest.approx(original.max)
+    assert restored.default == pytest.approx(original.default)
+
+
+def test_paramspec_build_from_config_roundtrip(tmp_path):
+    """ParamSpec: params array exported to .nam and reloaded preserves specs."""
+    model = _build(_MULTI_C_CONFIG)
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    loaded = load_parametric_nam(nam)
+    assert isinstance(loaded, ParametricWaveNet)
+
+    # Specs must round-trip by name and default
+    orig_specs = model._param_specs
+    loaded_specs = loaded._param_specs
+    assert len(orig_specs) == len(loaded_specs)
+    for orig, reloaded in zip(orig_specs, loaded_specs):
+        assert reloaded.name == orig.name
+        assert reloaded.min == pytest.approx(orig.min)
+        assert reloaded.max == pytest.approx(orig.max)
+        assert reloaded.default == pytest.approx(orig.default, rel=1e-5)

@@ -11,6 +11,7 @@ Both registrations happen on package import with no edits to factory.py or data.
 from ._dataset import ParametricConcatDataset, ParametricDataset, _build_parametric_concat
 from ._loader import load_parametric_nam
 from ._model import ParametricWaveNet, ResidualAffineAdapter
+from ._spec import ParamSpec
 from ..factory import register as _register
 from nam.data import register_dataset_initializer as _register_dataset
 from nam.data import register_concat_dataset_initializer as _register_concat
@@ -27,6 +28,7 @@ _register_dataset("parametric", ParametricDataset.init_from_config)
 _register_concat("parametric", _build_parametric_concat)
 
 __all__ = [
+    "ParamSpec",
     "ParametricWaveNet",
     "ResidualAffineAdapter",
     "ParametricDataset",

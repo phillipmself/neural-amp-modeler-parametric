@@ -72,9 +72,7 @@ def _net_config():
             }
         ],
         "head_scale": 1.0,
-        "param_names": ["gain"],
-        "param_dim": 1,
-        "nominal_params": [0.5],
+        "params": [{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}],
     }
 
 

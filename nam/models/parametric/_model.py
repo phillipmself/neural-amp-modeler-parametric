@@ -22,6 +22,7 @@ import torch.nn as _nn
 from ..base import BaseNet as _BaseNet
 from ..wavenet._wavenet import WaveNet as _InnerWaveNet
 from ..wavenet._wavenet_wrapper import WaveNet as _WaveNetWrapper
+from ._spec import ParamSpec as _ParamSpec
 
 # Re-export the core symbol used by the package __init__
 __all__ = ["ResidualAffineAdapter", "ParametricWaveNet"]
@@ -112,61 +113,61 @@ class ParametricWaveNet(_BaseNet):
     is kept on the wrapper (NOT inside the inner net) so that A2 weights import
     unchanged and adapter weights are appended in a separate block.
 
-    param_names: ordered list of parameter names (e.g. ["gain", "treble"])
-    param_dim:   length of the parameter vector P (must match len(param_names))
+    param_specs: ordered list of ParamSpec objects (name/min/max/default per param).
+                 List order is significant — it determines positional index in the
+                 params tensor fed to the net.
     """
 
     def __init__(
         self,
         net: _InnerWaveNet,
-        param_names: _List[str],
-        param_dim: int,
-        nominal_params: _List[float],
+        param_specs: _List[_ParamSpec],
         sample_rate: _Optional[float] = None,
     ):
         super().__init__(sample_rate=sample_rate)
-        if param_dim != len(param_names):
-            raise ValueError(
-                f"param_dim={param_dim} does not match len(param_names)={len(param_names)}"
-            )
-        # nominal_params is a required config field (AD-5): it defines the parameter
-        # setting used for export snapshots and loudness normalization. Requiring it at
-        # construction prevents silent zeros that may not reflect the intended baseline.
-        if len(nominal_params) != param_dim:
-            raise ValueError(
-                f"nominal_params has length {len(nominal_params)} but param_dim={param_dim}. "
-                f"nominal_params must have exactly one value per parameter name in param_names."
-            )
+        if len(param_specs) == 0:
+            raise ValueError("param_specs must contain at least one ParamSpec.")
         self._net = net
-        self._param_names = list(param_names)
-        self._param_dim = param_dim
+        self._param_specs = list(param_specs)
+        # Derive internal state from specs so the forward pass is unchanged: the net
+        # still receives default values positionally, exactly as nominal_params did.
         self._nominal_params = _torch.tensor(
-            [float(v) for v in nominal_params], dtype=_torch.float32
+            [s.default for s in param_specs], dtype=_torch.float32
         )
         channel_sizes = _collect_channel_sizes(net)
-        self._adapter = ResidualAffineAdapter(param_dim, channel_sizes)
+        self._adapter = ResidualAffineAdapter(len(param_specs), channel_sizes)
+
+    # ------------------------------------------------------------------
+    # Derived read-only properties (backward-compat for callers that read
+    # the old flat attributes; no storage duplication)
+    # ------------------------------------------------------------------
+
+    @property
+    def _param_names(self) -> _List[str]:
+        return [s.name for s in self._param_specs]
+
+    @property
+    def _param_dim(self) -> int:
+        return len(self._param_specs)
 
     @classmethod
     def parse_config(cls, config: _Dict) -> _Dict:
         config = dict(config)
         sample_rate = config.pop("sample_rate", None)
-        param_names = config.pop("param_names")
-        param_dim = config.pop("param_dim")
-        # nominal_params is required (AD-5): fail early with a clear message so the
-        # user knows exactly which field is missing rather than getting a cryptic KeyError.
-        if "nominal_params" not in config:
+        # Parse the self-describing params array (new schema).
+        # Each entry is {"name": ..., "min": ..., "max": ..., "default": ...}.
+        if "params" not in config:
             raise ValueError(
-                "nominal_params is required in ParametricWaveNet config but was not found. "
-                "Provide a list of floats with one value per parameter name."
+                "'params' is required in ParametricWaveNet config but was not found. "
+                "Provide a list of {name, min, max, default} objects, one per parameter."
             )
-        nominal_params = config.pop("nominal_params")
+        raw_specs = config.pop("params")
+        param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
             "net": net,
-            "param_names": param_names,
-            "param_dim": param_dim,
-            "nominal_params": nominal_params,
+            "param_specs": param_specs,
             "sample_rate": sample_rate,
         }
 
@@ -254,11 +255,9 @@ class ParametricWaveNet(_BaseNet):
 
     def _export_config(self) -> dict:
         cfg = self._net.export_config(sample_rate=self.sample_rate)
-        cfg["param_names"] = self._param_names
-        cfg["param_dim"] = self._param_dim
-        # nominal_params serialized as a JSON-friendly list of Python floats so
-        # downstream loaders can reconstruct the tensor without numpy dependency.
-        cfg["nominal_params"] = self._nominal_params.tolist()
+        # Self-describing params array: order is significant (positional net input).
+        # min/max are metadata for plugin/UI clamping; they do not affect the forward pass.
+        cfg["params"] = [s.to_dict() for s in self._param_specs]
         return cfg
 
     def _export_weights(self) -> _np.ndarray:

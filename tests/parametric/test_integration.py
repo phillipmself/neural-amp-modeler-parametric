@@ -86,7 +86,11 @@ def _make_parametric_dataset(
 
 
 def _make_model(param_names: _List[str], nominal_params: _List[float]) -> ParametricWaveNet:
-    """Build the smallest valid ParametricWaveNet for the given param schema."""
+    """Build the smallest valid ParametricWaveNet for the given param schema.
+
+    Uses symmetric [0, 1] min/max ranges and the supplied nominal as default.
+    min/max are metadata-only; they don't affect the forward pass or test math.
+    """
     config = {
         "layers_configs": [
             {
@@ -100,9 +104,10 @@ def _make_model(param_names: _List[str], nominal_params: _List[float]) -> Parame
             }
         ],
         "head_scale": 1.0,
-        "param_names": param_names,
-        "param_dim": len(param_names),
-        "nominal_params": nominal_params,
+        "params": [
+            {"name": n, "min": 0.0, "max": 1.0, "default": float(v)}
+            for n, v in zip(param_names, nominal_params)
+        ],
         "sample_rate": float(_RATE),
     }
     return ParametricWaveNet.init_from_config(config)
