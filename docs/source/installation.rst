@@ -46,6 +46,34 @@ appropriate for the platform you're developing on. The
 that you're testing your developments in the same way that contributions will be
 automatically tested (via GitHub Actions).
 
+For Apple Silicon and other CPU-only development machines:
+
+.. code-block:: console
+
+   $ conda env create -f environments/environment_cpu_apple.yml
+   $ conda activate nam
+
+For Windows/Linux development machines with an NVIDIA GPU:
+
+.. code-block:: console
+
+   $ conda env create -f environments/environment_gpu.yml
+   $ conda activate nam
+
+After activating the Conda environment, install the repo in editable mode with
+the local development extras:
+
+.. code-block:: console
+
+   $ python -m pip install -e ".[test,dev]"
+
+From then on, prefer running tools through the active environment, for example:
+
+.. code-block:: console
+
+   $ python -m pytest tests/ -o addopts=""
+   $ python -m pyright nam tests
+
 
 Trouble using the GPU?
 ^^^^^^^^^^^^^^^^^^^^^^
