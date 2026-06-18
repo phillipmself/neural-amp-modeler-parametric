@@ -16,6 +16,7 @@ from nam import __version__
 from nam.train import core as _core
 from nam.train import full as _full
 from nam.train.gui import AdvancedOptions as _AdvancedOptions
+from nam.train.gui import _open_latest_input_file_download
 from nam.train.gui import _parametric as _helpers
 from nam.train.gui._resources import settings as _settings
 from nam.util import timestamp as _timestamp
@@ -186,12 +187,33 @@ class GUI(object):
             path_key=_settings.PathKey.INPUT_FILE,
             row=0,
         )
+        self._download_input_button = _tk.Button(
+            self._frame_paths,
+            text="Download Input File",
+            width=_BUTTON_WIDTH,
+            command=_open_latest_input_file_download,
+        )
+        self._download_input_button.grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=4,
+        )
+        self._download_input_label = _tk.Label(
+            self._frame_paths,
+            width=_PATH_LABEL_WIDTH,
+            anchor="w",
+            justify="left",
+            text="Download the latest official training input",
+        )
+        self._download_input_label.grid(row=1, column=1, sticky="w", pady=4)
         self._destination_label = self._make_path_row(
             self._frame_paths,
             button_text="Train Destination",
             path_type="directory",
             path_key=_settings.PathKey.TRAINING_DESTINATION,
-            row=1,
+            row=2,
         )
 
         self._frame_params = _tk.LabelFrame(self._root, text="Parameters")

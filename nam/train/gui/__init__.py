@@ -263,25 +263,29 @@ class _InputPathButton(_PathButton):
 
     @classmethod
     def _download_input_file(cls):
-        file_urls = {
-            "input.wav": "https://drive.google.com/file/d/1KbaS4oXXNEuh2aCPLwKrPdf5KFOjda8G/view?usp=drive_link",
-            "v3_0_0.wav": "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view?usp=drive_link",
-            "v2_0_0.wav": "https://drive.google.com/file/d/1xnyJP_IZ7NuyDSTJfn-Jmc5lw0IE7nfu/view?usp=drive_link",
-            "v1_1_1.wav": "",
-            "v1.wav": "",
-        }
-        # Pick the most recent file.
-        for input_basename in _INPUT_BASENAMES:
-            name = input_basename.name
-            url = file_urls.get(name)
-            if url:
-                if name != _LATEST_VERSION.name:
-                    print(
-                        f"WARNING: File {name} is out of date. "
-                        "This needs to be updated!"
-                    )
-                _webbrowser.open(url)
-                return
+        _open_latest_input_file_download()
+
+
+def _open_latest_input_file_download():
+    file_urls = {
+        "input.wav": "https://drive.google.com/file/d/1KbaS4oXXNEuh2aCPLwKrPdf5KFOjda8G/view?usp=drive_link",
+        "v3_0_0.wav": "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view?usp=drive_link",
+        "v2_0_0.wav": "https://drive.google.com/file/d/1xnyJP_IZ7NuyDSTJfn-Jmc5lw0IE7nfu/view?usp=drive_link",
+        "v1_1_1.wav": "",
+        "v1.wav": "",
+    }
+    # Pick the most recent file.
+    for input_basename in _INPUT_BASENAMES:
+        name = input_basename.name
+        url = file_urls.get(name)
+        if url:
+            if name != _LATEST_VERSION.name:
+                print(
+                    f"WARNING: File {name} is out of date. "
+                    "This needs to be updated!"
+                )
+            _webbrowser.open(url)
+            return
 
 
 class _CheckboxKeys(_Enum):
