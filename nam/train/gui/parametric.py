@@ -15,12 +15,139 @@ from typing import List as _List
 from nam import __version__
 from nam.train import core as _core
 from nam.train import full as _full
+from nam.train.gui import AdvancedOptions as _AdvancedOptions
 from nam.train.gui import _parametric as _helpers
 from nam.train.gui._resources import settings as _settings
 from nam.util import timestamp as _timestamp
 
 _BUTTON_WIDTH = 18
 _PATH_LABEL_WIDTH = 80
+
+
+def _non_negative_int_or_default(val: str, default: int) -> int:
+    try:
+        parsed = int(val.strip())
+    except ValueError:
+        return default
+    return max(parsed, 0)
+
+
+def _optional_int_or_default(val: str, default: int | None) -> int | None:
+    stripped = val.strip()
+    if stripped == "":
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return default
+
+
+def _optional_float_or_default(val: str, default: float | None) -> float | None:
+    stripped = val.strip()
+    if stripped == "":
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return default
+
+
+class _AdvancedOptionsWindow(object):
+    def __init__(self, resume_main, parent: "GUI"):
+        self._parent = parent
+        self._resume_main = resume_main
+        self._closed = False
+        self._root = _tk.Toplevel(parent._root)
+        self._root.title("Advanced Options")
+        self._root.transient(parent._root)
+        self._root.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._num_epochs = _tk.StringVar(
+            value=str(self._parent.advanced_options.num_epochs)
+        )
+        self._latency = _tk.StringVar(
+            value=""
+            if self._parent.advanced_options.latency is None
+            else str(self._parent.advanced_options.latency)
+        )
+        self._threshold_esr = _tk.StringVar(
+            value=""
+            if self._parent.advanced_options.threshold_esr is None
+            else str(self._parent.advanced_options.threshold_esr)
+        )
+
+        self._build_layout()
+        self._root.grab_set()
+
+    def _build_layout(self):
+        frame = _tk.Frame(self._root)
+        frame.pack(padx=12, pady=12)
+
+        self._make_row(frame, row=0, label="Epochs", variable=self._num_epochs)
+        self._make_row(frame, row=1, label="Reamp latency", variable=self._latency)
+        self._make_row(
+            frame,
+            row=2,
+            label="Threshold ESR",
+            variable=self._threshold_esr,
+        )
+
+        button_frame = _tk.Frame(self._root)
+        button_frame.pack(anchor="e", padx=12, pady=(0, 12))
+        _tk.Button(
+            button_frame,
+            text="Ok",
+            width=_BUTTON_WIDTH,
+            command=self._apply_and_close,
+        ).pack(side=_tk.LEFT)
+
+    def _make_row(
+        self,
+        frame: _tk.Frame,
+        *,
+        row: int,
+        label: str,
+        variable: _tk.StringVar,
+    ):
+        _tk.Label(frame, text=label, anchor="w", width=16).grid(
+            row=row,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=4,
+        )
+        _tk.Entry(frame, textvariable=variable, width=16).grid(
+            row=row,
+            column=1,
+            sticky="ew",
+            pady=4,
+        )
+
+    def _apply_and_close(self):
+        self._parent.advanced_options.num_epochs = _non_negative_int_or_default(
+            self._num_epochs.get(),
+            self._parent.advanced_options.num_epochs,
+        )
+        self._parent.advanced_options.latency = _optional_int_or_default(
+            self._latency.get(),
+            self._parent.advanced_options.latency,
+        )
+        self._parent.advanced_options.threshold_esr = _optional_float_or_default(
+            self._threshold_esr.get(),
+            self._parent.advanced_options.threshold_esr,
+        )
+        self._close()
+
+    def _close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._root.grab_release()
+        except _tk.TclError:
+            pass
+        self._root.destroy()
+        self._resume_main()
 
 
 class GUI(object):
@@ -32,6 +159,12 @@ class GUI(object):
         self._training_destination: str | None = None
         self._param_rows: _List[_Dict[str, _tk.StringVar]] = []
         self._capture_rows: _List[_Dict[str, _Any]] = []
+        self.advanced_options = _AdvancedOptions(
+            num_epochs=_helpers.default_num_epochs(),
+            latency=None,
+            ignore_checks=False,
+            threshold_esr=None,
+        )
 
         self._build_layout()
         self._add_param_row()
@@ -85,13 +218,22 @@ class GUI(object):
         self._captures_grid = _tk.Frame(self._frame_captures)
         self._captures_grid.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self._frame_actions = _tk.Frame(self._root)
+        self._frame_actions.pack(anchor="e", padx=12, pady=(0, 12))
+        self._advanced_options_button = _tk.Button(
+            self._frame_actions,
+            text="Advanced options...",
+            width=_BUTTON_WIDTH,
+            command=self._open_advanced_options,
+        )
+        self._advanced_options_button.pack(side=_tk.LEFT, padx=(0, 8))
         self._train_button = _tk.Button(
-            self._root,
+            self._frame_actions,
             text="Train",
             width=_BUTTON_WIDTH,
             command=self._train,
         )
-        self._train_button.pack(anchor="e", padx=12, pady=(0, 12))
+        self._train_button.pack(side=_tk.LEFT)
 
     def _make_path_row(
         self,
@@ -300,6 +442,31 @@ class GUI(object):
                 ready = False
         self._train_button["state"] = _tk.NORMAL if ready else _tk.DISABLED
 
+    def _set_all_widget_states_to(self, state):
+        def set_state(widget: _Any):
+            try:
+                widget.configure(state=state)
+            except (_tk.TclError, TypeError):
+                pass
+            for child in widget.winfo_children():
+                set_state(child)
+
+        set_state(self._root)
+
+    def _disable(self):
+        self._set_all_widget_states_to(_tk.DISABLED)
+
+    def _resume(self):
+        self._set_all_widget_states_to(_tk.NORMAL)
+        self._update_train_button_state()
+
+    def _wait_while_func(self, func, *args, **kwargs):
+        self._disable()
+        func(self._resume, *args, **kwargs)
+
+    def _open_advanced_options(self):
+        self._wait_while_func(lambda resume: _AdvancedOptionsWindow(resume, self))
+
     def _build_failed_validation_message(self, validations: _Dict[str, _core.DataValidationOutput]) -> str:
         def make_message(output_path: str, validation: _core.DataValidationOutput) -> str:
             msg = f"{_Path(output_path).name}:\n"
@@ -350,11 +517,16 @@ class GUI(object):
 
         param_specs = _helpers.build_param_specs(self._raw_param_rows())
         capture_rows = self._raw_capture_rows()
+        user_latency = self.advanced_options.latency
         validation_outputs: _Dict[str, _core.DataValidationOutput] = {}
         validated_rows: _List[tuple[_Dict[str, _Any], _Path, _core.DataValidationOutput]] = []
         for row in capture_rows:
             output_path = _Path(row["output_path"])
-            validation = _core.validate_data(input_path, output_path, user_latency=None)
+            validation = _core.validate_data(
+                input_path,
+                output_path,
+                user_latency=user_latency,
+            )
             validation_outputs[str(output_path)] = validation
             validated_rows.append((row, output_path, validation))
 
@@ -414,8 +586,9 @@ class GUI(object):
             )
             model_config = _helpers.build_parametric_model_config(param_specs)
             learning_config = _helpers.build_learning_config(
-                num_epochs=_helpers.default_num_epochs(),
+                num_epochs=self.advanced_options.num_epochs,
                 batch_size=_helpers.default_batch_size(),
+                threshold_esr=self.advanced_options.threshold_esr,
             )
 
             self._train_button["state"] = _tk.DISABLED

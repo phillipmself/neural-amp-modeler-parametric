@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from nam.data import np_to_wav as _np_to_wav
+from nam.train import core as _core
 from nam.models.parametric import ParametricConcatDataset  # triggers registrations
 from nam.train import full as _full
 
@@ -217,3 +218,12 @@ def test_tf3_full_main_multi_capture_parametric(tmp_path):
     )
 
     assert (outdir / "model.nam").exists(), "model.nam was not exported"
+
+
+def test_create_callbacks_includes_validation_stopping_when_threshold_esr_set():
+    callbacks = _full._create_callbacks(
+        _learning_config(),
+        threshold_esr=0.01,
+    )
+
+    assert any(isinstance(cb, _core._ValidationStopping) for cb in callbacks)

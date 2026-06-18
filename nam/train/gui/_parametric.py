@@ -202,14 +202,18 @@ def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[s
     }
 
 
-def build_learning_config(num_epochs: int, batch_size: int) -> _Dict[str, _Any]:
+def build_learning_config(
+    num_epochs: int,
+    batch_size: int,
+    threshold_esr: float | None = None,
+) -> _Dict[str, _Any]:
     if _torch.cuda.is_available():
         device_config = {"accelerator": "gpu", "devices": 1}
     elif _torch.backends.mps.is_available():
         device_config = {"accelerator": "mps", "devices": 1}
     else:
         device_config = {}
-    return {
+    config = {
         "train_dataloader": {
             "batch_size": batch_size,
             "shuffle": True,
@@ -220,6 +224,9 @@ def build_learning_config(num_epochs: int, batch_size: int) -> _Dict[str, _Any]:
         "val_dataloader": {},
         "trainer": {"max_epochs": num_epochs, **device_config},
     }
+    if threshold_esr is not None:
+        config["threshold_esr"] = threshold_esr
+    return config
 
 
 def default_num_epochs() -> int:

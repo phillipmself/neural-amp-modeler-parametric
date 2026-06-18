@@ -1711,7 +1711,7 @@ def validate_data(
         input_path,
         output_path,
         input_version,
-        latency_analysis.calibration.recommended,
+        final_latency,
         silent=True,
     )
     passed = passed and data_checks.passed

@@ -10,6 +10,7 @@ from importlib import resources
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -525,6 +526,96 @@ def test_get_callbacks():
     assert any(
         isinstance(cb, core._ValidationStopping) for cb in extended_callbacks
     ), "_ValidationStopping should still be present after adding a custom callback."
+
+
+def test_validate_data_uses_final_latency_for_checks(monkeypatch):
+    class DummyDataset:
+        sample_rate = 48_000
+
+        def teardown(self):
+            pass
+
+    latency_analysis = _metadata.Latency(
+        manual=321,
+        calibration=_metadata.LatencyCalibration(
+            algorithm_version=1,
+            delays=[123],
+            safety_factor=0,
+            recommended=123,
+            warnings=_metadata.LatencyCalibrationWarnings(
+                matches_lookahead=False,
+                disagreement_too_high=False,
+                not_detected=False,
+            ),
+        ),
+    )
+    check_data_calls = []
+    data_config_calls = []
+
+    monkeypatch.setattr(
+        core,
+        "_check_audio_sample_rates",
+        lambda *_args, **_kwargs: core._SampleRateValidation(
+            passed=True,
+            input=48_000,
+            output=48_000,
+        ),
+    )
+    monkeypatch.setattr(
+        core,
+        "_check_audio_lengths",
+        lambda *_args, **_kwargs: core._LengthValidation(
+            passed=True,
+            delta_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        core,
+        "_detect_input_version",
+        lambda *_args, **_kwargs: (Version(3, 0, 0), True),
+    )
+    monkeypatch.setattr(
+        core,
+        "_analyze_latency",
+        lambda *_args, **_kwargs: latency_analysis,
+    )
+    monkeypatch.setattr(
+        core,
+        "_check_data",
+        lambda input_path, output_path, input_version, latency, silent: (
+            check_data_calls.append(latency)
+            or _metadata.DataChecks(version=3, passed=True)
+        ),
+    )
+    monkeypatch.setattr(
+        core,
+        "_get_data_config",
+        lambda input_version, input_path, output_path, ny, latency: (
+            data_config_calls.append(latency)
+            or {"common": {}}
+        ),
+    )
+    monkeypatch.setattr(core, "_get_packed_model_config", lambda: {})
+    monkeypatch.setattr(
+        core,
+        "_get_lightning_module_cls",
+        lambda _config: SimpleNamespace(
+            init_from_config=lambda _inner_config: SimpleNamespace(
+                net=SimpleNamespace(receptive_field=32)
+            )
+        ),
+    )
+    monkeypatch.setattr(core, "_init_dataset", lambda *_args, **_kwargs: DummyDataset())
+
+    output = core.validate_data(
+        Path("input.wav"),
+        Path("output.wav"),
+        user_latency=321,
+    )
+
+    assert output.passed is True
+    assert check_data_calls == [321]
+    assert data_config_calls == [321]
 
 
 class TestAnalyzeLatency:

@@ -181,7 +181,11 @@ def _plot_arrays(
         _plt.show()
 
 
-def _create_callbacks(learning_config, packed: bool = False):
+def _create_callbacks(
+    learning_config,
+    packed: bool = False,
+    threshold_esr: _Optional[float] = None,
+):
     """
     Checkpointing, essentially
     """
@@ -218,6 +222,12 @@ def _create_callbacks(learning_config, packed: bool = False):
                 _lightning_module.PackedBestCheckpoint(),
                 _lightning_module.PackedMaskCallback(),
             ]
+        )
+    if threshold_esr is not None:
+        from nam.train.core import _ValidationStopping
+
+        callbacks.append(
+            _ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
         )
     if not validate_inside_epoch:
         callbacks.append(checkpoint_epoch)
@@ -289,7 +299,11 @@ def main(
         dataset_validation, **learning_config["val_dataloader"]
     )
 
-    callbacks = _create_callbacks(learning_config, packed=is_packed)
+    callbacks = _create_callbacks(
+        learning_config,
+        packed=is_packed,
+        threshold_esr=learning_config.get("threshold_esr"),
+    )
     packed_best_callback = next(
         (c for c in callbacks if isinstance(c, _lightning_module.PackedBestCheckpoint)),
         None,
