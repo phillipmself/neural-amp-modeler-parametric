@@ -444,8 +444,9 @@ def test_validate_for_training_uses_manual_latency(monkeypatch):
     monkeypatch.setattr(
         _gui._core,
         "validate_data",
-        lambda input_path, output_path, user_latency: (
-            validate_calls.append((input_path, output_path, user_latency)) or validation
+        lambda input_path, output_path, user_latency, silent=True: (
+            validate_calls.append((input_path, output_path, user_latency, silent))
+            or validation
         ),
     )
     monkeypatch.setattr(_gui._core, "get_final_latency", lambda _latency: 321)
@@ -454,7 +455,7 @@ def test_validate_for_training_uses_manual_latency(monkeypatch):
 
     param_specs, captures = gui._validate_for_training()
 
-    assert validate_calls == [(Path("input.wav"), Path("capture.wav"), 321)]
+    assert validate_calls == [(Path("input.wav"), Path("capture.wav"), 321, False)]
     assert [spec.name for spec in param_specs] == ["gain"]
     assert captures == [
         _helpers.CaptureValidation(
@@ -463,6 +464,67 @@ def test_validate_for_training_uses_manual_latency(monkeypatch):
             delay=321,
         )
     ]
+
+
+def test_validate_for_training_passes_silent_toggle_to_validation(monkeypatch):
+    gui = _gui.GUI.__new__(_gui.GUI)
+    gui._input_path = "input.wav"
+    gui._silent_training_var = SimpleNamespace(get=lambda: False)
+    gui.advanced_options = _AdvancedOptions(
+        num_epochs=25,
+        latency=None,
+        ignore_checks=False,
+        threshold_esr=None,
+    )
+    gui._raw_param_rows = lambda: [
+        {"name": "gain", "min": "0.0", "max": "1.0", "default": "0.5"}
+    ]
+    gui._raw_capture_rows = lambda: [{"output_path": "capture.wav", "values": ["0.5"]}]
+
+    validation = SimpleNamespace(
+        passed=True,
+        passed_critical=True,
+        sample_rate=SimpleNamespace(passed=True, input=48_000, output=48_000),
+        length=SimpleNamespace(passed=True, delta_seconds=0.0),
+        latency=SimpleNamespace(
+            manual=None,
+            calibration=SimpleNamespace(
+                warnings=SimpleNamespace(
+                    matches_lookahead=False,
+                    disagreement_too_high=False,
+                    not_detected=False,
+                )
+            ),
+        ),
+        checks=SimpleNamespace(passed=True),
+        pytorch=SimpleNamespace(
+            passed=True,
+            train=SimpleNamespace(passed=True, msg=None),
+            validation=SimpleNamespace(passed=True, msg=None),
+        ),
+    )
+
+    validate_calls = []
+    monkeypatch.setattr(
+        _gui._core,
+        "validate_input",
+        lambda _path: SimpleNamespace(passed=True),
+    )
+    monkeypatch.setattr(
+        _gui._core,
+        "validate_data",
+        lambda input_path, output_path, user_latency, silent=True: (
+            validate_calls.append((input_path, output_path, user_latency, silent))
+            or validation
+        ),
+    )
+    monkeypatch.setattr(_gui._core, "get_final_latency", lambda _latency: 123)
+    monkeypatch.setattr(_gui._messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(_gui._messagebox, "showerror", lambda *args, **kwargs: None)
+
+    gui._validate_for_training()
+
+    assert validate_calls == [(Path("input.wav"), Path("capture.wav"), None, False)]
 
 
 def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch):
@@ -486,6 +548,8 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
         ],
     )
     gui._train_button = {}
+    gui._silent_training_var = SimpleNamespace(get=lambda: False)
+    gui._save_plot_var = SimpleNamespace(get=lambda: True)
     gui._root = SimpleNamespace(update_idletasks=lambda: None)
     gui._update_train_button_state = lambda: None
 
@@ -525,7 +589,7 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
     monkeypatch.setattr(
         _gui._full,
         "main",
-        lambda data_config, model_config, learning_config, outdir, no_show, make_plots: (
+        lambda data_config, model_config, learning_config, outdir, no_show, make_plots, save_plot=None: (
             full_main_calls.append(
                 (
                     data_config,
@@ -534,6 +598,7 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
                     outdir,
                     no_show,
                     make_plots,
+                    save_plot,
                 )
             )
         ),
@@ -558,10 +623,74 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
         "threshold_esr": 0.004,
     }
     assert full_main_calls[0][3] == tmp_path / "runstamp"
-    assert full_main_calls[0][4:] == (True, False)
+    assert full_main_calls[0][4:] == (False, True, True)
     assert showinfo_calls == [
         (
             "Training Complete",
             f"Parametric model exported to:\n{tmp_path / 'runstamp' / 'model.nam'}",
         )
     ]
+
+
+def test_train_respects_plot_checkbox_combinations(tmp_path, monkeypatch):
+    gui = _gui.GUI.__new__(_gui.GUI)
+    gui._input_path = "input.wav"
+    gui._training_destination = str(tmp_path)
+    gui.advanced_options = _AdvancedOptions(
+        num_epochs=10,
+        latency=123,
+        ignore_checks=False,
+        threshold_esr=None,
+    )
+    gui._validate_for_training = lambda: (
+        [_helpers.build_param_specs([{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}])[0]],
+        [
+            _helpers.CaptureValidation(
+                output_path="capture.wav",
+                params=[0.5],
+                delay=123,
+            )
+        ],
+    )
+    gui._train_button = {}
+    gui._silent_training_var = SimpleNamespace(get=lambda: True)
+    gui._save_plot_var = SimpleNamespace(get=lambda: False)
+    gui._root = SimpleNamespace(update_idletasks=lambda: None)
+    gui._update_train_button_state = lambda: None
+
+    full_main_calls = []
+    monkeypatch.setattr(_gui, "_timestamp", lambda: "runstamp")
+    monkeypatch.setattr(_gui._Path, "mkdir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        _gui._helpers,
+        "build_parametric_data_config",
+        lambda *args, **kwargs: {"data": "config"},
+    )
+    monkeypatch.setattr(
+        _gui._helpers,
+        "build_parametric_model_config",
+        lambda *args, **kwargs: {"model": "config"},
+    )
+    monkeypatch.setattr(_gui._helpers, "default_batch_size", lambda: 9)
+    monkeypatch.setattr(
+        _gui._helpers,
+        "build_learning_config",
+        lambda *args, **kwargs: {"trainer": {"max_epochs": 10}},
+    )
+    monkeypatch.setattr(
+        _gui._full,
+        "main",
+        lambda data_config, model_config, learning_config, outdir, no_show, make_plots, save_plot=None: (
+            full_main_calls.append((no_show, make_plots, save_plot))
+        ),
+    )
+    monkeypatch.setattr(_gui._messagebox, "showinfo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        _gui._messagebox,
+        "showerror",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Unexpected error")),
+    )
+
+    gui._train()
+
+    assert full_main_calls == [(True, False, False)]

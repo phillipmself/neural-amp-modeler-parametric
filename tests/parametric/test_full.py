@@ -138,6 +138,70 @@ def test_tf2_full_main_parametric_make_plots_true(tmp_path):
     assert (outdir / "comparison.png").exists(), "comparison.png was not created"
 
 
+def test_tf2b_full_main_parametric_can_show_without_saving(tmp_path, monkeypatch):
+    x_path, y_path = _write_wav_pair(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    monkeypatch.setattr(_full._plt, "show", lambda: None)
+
+    _full.main(
+        _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=False,
+        make_plots=True,
+        save_plot=False,
+    )
+
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+    assert not (outdir / "comparison.png").exists(), "comparison.png should not be created"
+
+
+def test_tf2c_full_main_parametric_uses_one_plot_call_when_showing(tmp_path, monkeypatch):
+    x_path, y_path = _write_wav_pair(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    plot_calls = []
+
+    monkeypatch.setattr(
+        _full,
+        "_plot",
+        lambda model, ds, savefig=None, show=True, window_start=None, window_end=None: (
+            plot_calls.append(
+                {
+                    "savefig": savefig,
+                    "show": show,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                }
+            )
+        ),
+    )
+
+    _full.main(
+        _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=False,
+        make_plots=True,
+        save_plot=False,
+    )
+
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+    assert plot_calls == [
+        {
+            "savefig": None,
+            "show": True,
+            "window_start": 100_000,
+            "window_end": 110_000,
+        }
+    ]
+
+
 def test_tf1_full_main_parametric_selects_parametric_lightning_module(tmp_path):
     """
     TF1: full.main() with ParametricWaveNet config completes training without the
@@ -218,6 +282,46 @@ def test_tf3_full_main_multi_capture_parametric(tmp_path):
     )
 
     assert (outdir / "model.nam").exists(), "model.nam was not exported"
+
+
+def test_tf3b_full_main_multi_capture_parametric_saves_plots(tmp_path, monkeypatch):
+    x1, y1 = _write_wav_pair_to(tmp_path, "cap0", seed_offset=0)
+    x2, y2 = _write_wav_pair_to(tmp_path, "cap1", seed_offset=1)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    data_config = {
+        "type": "parametric",
+        "common": {
+            "delay": 0,
+            "require_input_pre_silence": None,
+            "param_names": ["gain"],
+        },
+        "train": [
+            {"x_path": x1, "y_path": y1, "params": [0.5], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+            {"x_path": x2, "y_path": y2, "params": [0.8], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+        ],
+        "validation": [
+            {"x_path": x1, "y_path": y1, "params": [0.5], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+            {"x_path": x2, "y_path": y2, "params": [0.8], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+        ],
+    }
+
+    monkeypatch.setattr(_full._plt, "show", lambda: None)
+
+    _full.main(
+        data_config,
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=True,
+        make_plots=True,
+        save_plot=True,
+    )
+
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+    assert (outdir / "comparison_0.png").exists(), "comparison_0.png was not created"
+    assert (outdir / "comparison_1.png").exists(), "comparison_1.png was not created"
 
 
 def test_create_callbacks_includes_validation_stopping_when_threshold_esr_set():

@@ -53,7 +53,19 @@ def _plot(
     window_start: _Optional[int] = None,
     window_end: _Optional[int] = None,
 ):
-    if isinstance(ds, _ConcatDataset):
+    try:
+        from nam.models.parametric._dataset import (
+            ParametricDataset as _ParametricDataset,
+            ParametricConcatDataset as _ParametricConcatDataset,
+        )
+    except ImportError:  # pragma: no cover
+        _ParametricDataset = None  # type: ignore[assignment, misc]
+        _ParametricConcatDataset = None  # type: ignore[assignment, misc]
+
+    if isinstance(ds, _ConcatDataset) or (
+        _ParametricConcatDataset is not None
+        and isinstance(ds, _ParametricConcatDataset)
+    ):
 
         def extend_savefig(i, savefig):
             if savefig is None:
@@ -72,23 +84,6 @@ def _plot(
                 window_start=window_start,
                 window_end=window_end,
             )
-        return
-
-    try:
-        from nam.models.parametric._dataset import (
-            ParametricDataset as _ParametricDataset,
-            ParametricConcatDataset as _ParametricConcatDataset,
-        )
-    except ImportError:  # pragma: no cover
-        _ParametricDataset = None  # type: ignore[assignment, misc]
-        _ParametricConcatDataset = None  # type: ignore[assignment, misc]
-
-    if _ParametricConcatDataset is not None and isinstance(ds, _ParametricConcatDataset):
-        import warnings as _warnings_mod
-        _warnings_mod.warn(
-            "Plotting is not supported for ParametricConcatDataset; skipping.",
-            stacklevel=2,
-        )
         return
 
     if _ParametricDataset is not None and isinstance(ds, _ParametricDataset):
@@ -179,6 +174,7 @@ def _plot_arrays(
         _plt.savefig(savefig)
     if show:
         _plt.show()
+    _plt.close()
 
 
 def _create_callbacks(
@@ -248,6 +244,7 @@ def main(
     outdir: _Path,
     no_show: bool = False,
     make_plots=True,
+    save_plot: _Optional[bool] = None,
 ):
     if not outdir.exists():
         raise RuntimeError(f"No output location found at {outdir}")
@@ -337,16 +334,16 @@ def main(
         model.eval()
         model.net.sample_rate = dataset_train.sample_rate
         _handshake_datasets(model, dataset_train, dataset_validation)
-        if make_plots:
+        should_save_plot = make_plots if save_plot is None else save_plot
+        if make_plots or should_save_plot:
             _plot(
                 model,
                 dataset_validation,
-                savefig=_Path(outdir, "comparison.png"),
+                savefig=_Path(outdir, "comparison.png") if should_save_plot else None,
                 window_start=100_000,
                 window_end=110_000,
-                show=False,
+                show=make_plots and not no_show,
             )
-            _plot(model, dataset_validation, show=not no_show)
         # Export!
         if is_packed:
             checkpoint_paths = (

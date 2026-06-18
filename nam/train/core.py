@@ -1673,6 +1673,7 @@ def validate_data(
     output_path: _Path,
     user_latency: _Optional[int],
     num_output_samples_per_datum: int = _NY_DEFAULT,
+    silent: bool = True,
 ):
     """
     Just do the checks to make sure that the data are ok.
@@ -1698,7 +1699,7 @@ def validate_data(
 
     # Latency analysis
     latency_analysis = _analyze_latency(
-        user_latency, input_version, input_path, output_path, silent=True
+        user_latency, input_version, input_path, output_path, silent=silent
     )
     if latency_analysis.manual is None and any(
         val for val in latency_analysis.calibration.warnings.model_dump().values()
@@ -1712,7 +1713,7 @@ def validate_data(
         output_path,
         input_version,
         final_latency,
-        silent=True,
+        silent=silent,
     )
     passed = passed and data_checks.passed
 

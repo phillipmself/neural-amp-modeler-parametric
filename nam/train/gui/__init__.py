@@ -830,11 +830,13 @@ class GUI(object):
             return False
 
         user_latency = self.advanced_options.latency
+        silent = self._checkboxes[_CheckboxKeys.SILENT_TRAINING].variable.get()
         file_validation_outputs = {
             output_path: _core.validate_data(
                 input_path,
                 output_path,
                 user_latency,
+                silent=silent,
             )
             for output_path in output_paths
         }

@@ -218,6 +218,21 @@ class GUI(object):
         self._captures_grid = _tk.Frame(self._frame_captures)
         self._captures_grid.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self._frame_options = _tk.Frame(self._root)
+        self._frame_options.pack(anchor="w", padx=12, pady=(0, 8))
+        self._silent_training_var = _tk.BooleanVar(value=False)
+        self._save_plot_var = _tk.BooleanVar(value=True)
+        _tk.Checkbutton(
+            self._frame_options,
+            text="Silent run",
+            variable=self._silent_training_var,
+        ).pack(anchor="w")
+        _tk.Checkbutton(
+            self._frame_options,
+            text="Save ESR plot automatically",
+            variable=self._save_plot_var,
+        ).pack(anchor="w")
+
         self._frame_actions = _tk.Frame(self._root)
         self._frame_actions.pack(anchor="e", padx=12, pady=(0, 12))
         self._advanced_options_button = _tk.Button(
@@ -262,6 +277,14 @@ class GUI(object):
 
     def _default_capture_values(self) -> _List[str]:
         return [row["default"].get() for row in self._param_rows]
+
+    def _silent_training(self) -> bool:
+        variable = getattr(self, "_silent_training_var", None)
+        return False if variable is None else bool(variable.get())
+
+    def _save_plot(self) -> bool:
+        variable = getattr(self, "_save_plot_var", None)
+        return True if variable is None else bool(variable.get())
 
     def _raw_param_rows(self) -> _List[_Dict[str, str]]:
         return [
@@ -526,6 +549,7 @@ class GUI(object):
                 input_path,
                 output_path,
                 user_latency=user_latency,
+                silent=self._silent_training(),
             )
             validation_outputs[str(output_path)] = validation
             validated_rows.append((row, output_path, validation))
@@ -590,6 +614,8 @@ class GUI(object):
                 batch_size=_helpers.default_batch_size(),
                 threshold_esr=self.advanced_options.threshold_esr,
             )
+            silent = self._silent_training()
+            save_plot = self._save_plot()
 
             self._train_button["state"] = _tk.DISABLED
             self._root.update_idletasks()
@@ -598,8 +624,9 @@ class GUI(object):
                 model_config,
                 learning_config,
                 outdir,
-                no_show=True,
-                make_plots=False,
+                no_show=silent,
+                make_plots=not silent,
+                save_plot=save_plot,
             )
             _messagebox.showinfo(
                 "Training Complete",
