@@ -12,14 +12,20 @@ from typing import Any as _Any
 from typing import Dict as _Dict
 from typing import List as _List
 
-from nam import __version__
-from nam.train import core as _core
-from nam.train import full as _full
 from nam.train.gui import AdvancedOptions as _AdvancedOptions
 from nam.train.gui import _open_latest_input_file_download
-from nam.train.gui import _parametric as _helpers
 from nam.train.gui._resources import settings as _settings
-from nam.util import timestamp as _timestamp
+
+try:
+    from nam import __version__
+    from nam.train import core as _core
+    from nam.train import full as _full
+    from nam.train.gui import _parametric as _helpers
+    from nam.util import timestamp as _timestamp
+
+    _install_is_valid = True
+except ImportError:
+    _install_is_valid = False
 
 _BUTTON_WIDTH = 18
 _PATH_LABEL_WIDTH = 80
@@ -661,8 +667,26 @@ class GUI(object):
 
 
 def run():
-    gui = GUI()
-    gui.mainloop()
+    if _install_is_valid:
+        gui = GUI()
+        gui.mainloop()
+    else:
+        _install_error()
+
+
+def _install_error():
+    window = _tk.Tk()
+    window.title("ERROR")
+    label = _tk.Label(
+        window,
+        width=45,
+        height=2,
+        text="The NAM training software has not been installed correctly.",
+    )
+    label.pack()
+    button = _tk.Button(window, width=10, height=2, text="Quit", command=window.destroy)
+    button.pack()
+    window.mainloop()
 
 
 if __name__ == "__main__":
