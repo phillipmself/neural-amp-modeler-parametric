@@ -24,6 +24,7 @@ from nam.data import Split as _Split
 from nam.data import apply_joint_dataset_hooks as _apply_joint_dataset_hooks
 from nam.data import get_joint_dataset_hooks as _get_joint_dataset_hooks
 from nam.data import init_dataset as _init_dataset
+from nam.train import core as _core
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
@@ -199,7 +200,7 @@ def _create_callbacks(
             )
         }
 
-    checkpoint_best = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_best = _core._ModelCheckpoint(
         filename="{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}",
         save_top_k=3,
         monitor="val_loss",
@@ -208,7 +209,7 @@ def _create_callbacks(
 
     # return [checkpoint_best, checkpoint_last]
     # The last epoch that was finished.
-    checkpoint_epoch = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+    checkpoint_epoch = _core._ModelCheckpoint(
         filename="checkpoint_epoch_{epoch:04d}", every_n_epochs=1
     )
     callbacks = [checkpoint_best]
@@ -220,17 +221,15 @@ def _create_callbacks(
             ]
         )
     if threshold_esr is not None:
-        from nam.train.core import _ValidationStopping
-
         callbacks.append(
-            _ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
+            _core._ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
         )
     if not validate_inside_epoch:
         callbacks.append(checkpoint_epoch)
         return callbacks
     else:
         # The last validation pass, whether at the end of an epoch or not
-        checkpoint_last = _pl.callbacks.model_checkpoint.ModelCheckpoint(
+        checkpoint_last = _core._ModelCheckpoint(
             filename="checkpoint_last_{epoch:04d}_{step}", **kwargs
         )
         callbacks.extend([checkpoint_last, checkpoint_epoch])

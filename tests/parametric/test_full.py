@@ -324,6 +324,29 @@ def test_tf3b_full_main_multi_capture_parametric_saves_plots(tmp_path, monkeypat
     assert (outdir / "comparison_1.png").exists(), "comparison_1.png was not created"
 
 
+def test_full_main_exports_checkpoint_snapshots_as_nam(tmp_path):
+    x_path, y_path = _write_wav_pair(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    _full.main(
+        _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=True,
+        make_plots=False,
+    )
+
+    checkpoint_dir = outdir / "checkpoints"
+    checkpoint_paths = list(checkpoint_dir.glob("*.ckpt"))
+    assert checkpoint_paths, "Expected checkpoint files to be created during training"
+    for checkpoint_path in checkpoint_paths:
+        assert checkpoint_path.with_suffix(".nam").exists(), (
+            f"Missing .nam snapshot for checkpoint {checkpoint_path.name}"
+        )
+
+
 def test_create_callbacks_includes_validation_stopping_when_threshold_esr_set():
     callbacks = _full._create_callbacks(
         _learning_config(),
