@@ -1,0 +1,21 @@
+{
+    "_notes": [
+        "Learning config shaped like the regular UI trainer defaults.",
+        "The GUI defaults are 100 epochs, batch size 16, and device selection based on local hardware.",
+        "If your machine is CPU-only or you want Apple Metal, change accelerator/devices accordingly."
+    ],
+    "train_dataloader": {
+        "batch_size": 16,
+        "shuffle": true,
+        "pin_memory": true,
+        "drop_last": true,
+        "num_workers": 0
+    },
+    "val_dataloader": {},
+    "trainer": {
+        "accelerator": "gpu",
+        "devices": 1,
+        "max_epochs": 100
+    },
+    "trainer_fit_kwargs": {}
+}

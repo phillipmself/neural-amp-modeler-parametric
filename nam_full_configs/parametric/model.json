@@ -1,0 +1,96 @@
+{
+    "_notes": [
+        "ParametricWaveNet example for this branch.",
+        "The stock GUI trainer currently builds a PackedWaveNet container for regular A2 training.",
+        "Packed parametric training is not supported on this branch, so this example keeps a single ParametricWaveNet wrapper while matching the PackedWaveNet channels_8 inner WaveNet config and training hyperparameters.",
+        "params is an ordered array of {name, min, max, default} objects. Order is significant (positional net input). default is the export-time/reference operating point."
+    ],
+    "net": {
+        "name": "ParametricWaveNet",
+        "config": {
+            "layers_configs": [
+                {
+                    "condition_size": 1,
+                    "input_size": 1,
+                    "channels": 8,
+                    "head": {
+                        "out_channels": 1,
+                        "kernel_size": 16,
+                        "bias": true
+                    },
+                    "kernel_sizes": [
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        15,
+                        15,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6
+                    ],
+                    "dilations": [
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239,
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239,
+                        1,
+                        13,
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239
+                    ],
+                    "activation": "LeakyReLU",
+                    "gated": false
+                }
+            ],
+            "head_scale": 0.01,
+            "params": [
+                {"name": "gain",   "min": 0.0, "max": 10.0, "default": 5.0},
+                {"name": "bright", "min": 0.0, "max": 1.0,  "default": 0.5}
+            ]
+        }
+    },
+    "loss": {
+        "val_loss": "esr",
+        "mrstft_weight": 0.0005
+    },
+    "optimizer": {
+        "lr": 0.004,
+        "weight_decay": 3.17e-07
+    },
+    "lr_scheduler": {
+        "class": "ExponentialLR",
+        "kwargs": {
+            "gamma": 0.994
+        }
+    }
+}

@@ -1,0 +1,92 @@
+{
+    "_notes": [
+        "Parametric multi-capture example for this branch.",
+        "This mirrors the regular UI trainer data config style where possible:",
+        "- allow_unequal_lengths=true",
+        "- joint output normalization to -18 dBFS",
+        "- 8192-sample training targets",
+        "- final 9 seconds reserved for validation",
+        "Replace the example WAV paths with your real captures."
+    ],
+    "type": "parametric",
+    "common": {
+        "delay": 0,
+        "allow_unequal_lengths": true,
+        "param_names": [
+            "gain",
+            "bright"
+        ]
+    },
+    "train": [
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_2_bright_0_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
+            "params": [
+                0.2,
+                0.0
+            ],
+            "stop_seconds": -9.0,
+            "ny": 8192
+        },
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_5_bright_5_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
+            "params": [
+                0.5,
+                0.5
+            ],
+            "stop_seconds": -9.0,
+            "ny": 8192
+        },
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_8_bright_10_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
+            "params": [
+                0.8,
+                1.0
+            ],
+            "stop_seconds": -9.0,
+            "ny": 8192
+        }
+    ],
+    "validation": [
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_2_bright_0_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
+            "params": [
+                0.2,
+                0.0
+            ],
+            "start_seconds": -9.0,
+            "ny": null
+        },
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_5_bright_5_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
+            "params": [
+                0.5,
+                0.5
+            ],
+            "start_seconds": -9.0,
+            "ny": null
+        },
+        {
+            "x_path": "C:\\path\\to\\captures\\gain_8_bright_10_input.wav",
+            "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
+            "params": [
+                0.8,
+                1.0
+            ],
+            "start_seconds": -9.0,
+            "ny": null
+        }
+    ],
+    "joint": [
+        {
+            "name": "nam.data.normalize_joint_dataset_output",
+            "kwargs": {
+                "level_rms_dbfs": -18.0
+            }
+        }
+    ]
+}
