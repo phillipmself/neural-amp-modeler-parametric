@@ -1097,9 +1097,11 @@ def normalize_joint_dataset_output(*args, **kwargs) -> NormalizeJointDatasetOutp
 
 
 def _iter_base_datasets(dataset: AbstractDataset, label: str):
-    if isinstance(dataset, Dataset):
+    if isinstance(dataset, Dataset) or (
+        hasattr(dataset, "y") and callable(getattr(dataset, "scale_output", None))
+    ):
         yield dataset
-    elif isinstance(dataset, ConcatDataset):
+    elif isinstance(dataset, ConcatDataset) or hasattr(dataset, "datasets"):
         for child in dataset.datasets:
             yield from _iter_base_datasets(child, label=label)
     else:

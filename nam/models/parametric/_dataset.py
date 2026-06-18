@@ -115,12 +115,22 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
         return self._inner.sample_rate
 
     @property
+    def y(self) -> _torch.Tensor:
+        return self._inner.y
+
+    @property
     def param_names(self) -> _List[str]:
         return list(self._param_names)
 
     @property
     def param_dim(self) -> int:
         return len(self._param_names)
+
+    def scale_output(self, gain: float):
+        self._inner.scale_output(gain)
+
+    def teardown(self):
+        self._inner.teardown()
 
     # ------------------------------------------------------------------
     # InitializableFromConfig
@@ -275,6 +285,10 @@ class ParametricConcatDataset(_AbstractDataset):
     @property
     def sample_rate(self) -> _Optional[float]:
         return self._datasets[0].sample_rate
+
+    @property
+    def datasets(self) -> _List[ParametricDataset]:
+        return list(self._datasets)
 
 
 def _build_parametric_concat(

@@ -83,6 +83,7 @@ from pathlib import Path as _Path
 
 from nam.train.full import main as _nam_full
 from nam.train.gui import run as nam_gui  # noqa F401 Used as an entry point
+from nam.train.gui.parametric import run as nam_parametric_gui  # noqa F401 Used as an entry point
 from nam.util import timestamp as _timestamp
 
 

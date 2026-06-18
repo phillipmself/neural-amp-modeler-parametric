@@ -880,12 +880,55 @@ def _get_data_config(
     return data_config
 
 
+def detect_input_version(input_path: _Path) -> _Version:
+    """
+    Public helper for consumers that need the standardized-input version without
+    depending on the private tuple-returning implementation.
+    """
+    return _detect_input_version(input_path)[0]
+
+
+def get_final_latency(latency_analysis: _metadata.Latency) -> int:
+    """
+    Public helper used by other trainer frontends to resolve manual vs. calibrated
+    latency exactly the same way as the simplified trainer.
+    """
+    return _get_final_latency(latency_analysis)
+
+
+def build_standardized_data_config(
+    input_version: _Version,
+    input_path: _Path,
+    output_path: _Path,
+    ny: int,
+    latency: int,
+) -> dict:
+    """
+    Public wrapper around the shared standardized-input split and normalization
+    config used by the simplified trainer.
+    """
+    return _get_data_config(
+        input_version=input_version,
+        input_path=input_path,
+        output_path=output_path,
+        ny=ny,
+        latency=latency,
+    )
+
+
 def _get_packed_model_config() -> dict:
     resource = _resources.files("nam.train._resources").joinpath(
         "config_model_packed.json"
     )
     with resource.open() as fp:
         return _deepcopy(_json.load(fp))
+
+
+def get_packed_model_config() -> dict:
+    """
+    Public helper returning the packaged default A2 packed-model config.
+    """
+    return _get_packed_model_config()
 
 
 def _get_lightning_module_cls(model_config: _Dict):

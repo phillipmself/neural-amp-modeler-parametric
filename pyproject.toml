@@ -51,6 +51,7 @@ homepage = "https://github.com/sdatkinson/"
 
 [project.scripts]
 nam = "nam.cli:nam_gui"
+nam-parametric = "nam.cli:nam_parametric_gui"
 nam-full = "nam.cli:nam_full"
 nam-hello-world = "nam.cli:nam_hello_world"
 
@@ -70,6 +71,7 @@ packages = [
     "nam.train.gui",
     "nam.train.gui._resources",
     "nam.models",
+    "nam.models.parametric",
     "nam.models._resources",
     "nam.models.wavenet",
 ]
