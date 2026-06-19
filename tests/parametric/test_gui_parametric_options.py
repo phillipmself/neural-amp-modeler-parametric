@@ -550,7 +550,11 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
     gui._train_button = {}
     gui._silent_training_var = SimpleNamespace(get=lambda: False)
     gui._save_plot_var = SimpleNamespace(get=lambda: True)
-    gui._root = SimpleNamespace(update_idletasks=lambda: None)
+    scheduled = []
+    gui._root = SimpleNamespace(
+        after_idle=lambda func, *args: scheduled.append((func, args)),
+        update_idletasks=lambda: None,
+    )
     gui._update_train_button_state = lambda: None
 
     data_config_calls = []
@@ -615,6 +619,8 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
     )
 
     gui._train()
+    assert len(scheduled) == 1
+    scheduled[0][0](*scheduled[0][1])
 
     assert learning_config_calls == [(77, 9, 0.004)]
     assert len(full_main_calls) == 1
@@ -655,7 +661,11 @@ def test_train_respects_plot_checkbox_combinations(tmp_path, monkeypatch):
     gui._train_button = {}
     gui._silent_training_var = SimpleNamespace(get=lambda: True)
     gui._save_plot_var = SimpleNamespace(get=lambda: False)
-    gui._root = SimpleNamespace(update_idletasks=lambda: None)
+    scheduled = []
+    gui._root = SimpleNamespace(
+        after_idle=lambda func, *args: scheduled.append((func, args)),
+        update_idletasks=lambda: None,
+    )
     gui._update_train_button_state = lambda: None
 
     full_main_calls = []
@@ -692,5 +702,52 @@ def test_train_respects_plot_checkbox_combinations(tmp_path, monkeypatch):
     )
 
     gui._train()
+    assert len(scheduled) == 1
+    scheduled[0][0](*scheduled[0][1])
 
     assert full_main_calls == [(True, False, False)]
+
+
+def test_train_defers_blocking_work_until_after_idle(monkeypatch):
+    gui = _gui.GUI.__new__(_gui.GUI)
+    gui._input_path = "input.wav"
+    gui._training_destination = "outdir"
+    gui.advanced_options = _AdvancedOptions(
+        num_epochs=10,
+        latency=None,
+        ignore_checks=False,
+        threshold_esr=None,
+    )
+    param_specs = _helpers.build_param_specs(
+        [{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}]
+    )
+    captures = [
+        _helpers.CaptureValidation(
+            output_path="capture.wav",
+            params=[0.5],
+            delay=123,
+        )
+    ]
+    gui._validate_for_training = lambda: (param_specs, captures)
+    gui._train_button = {}
+    scheduled = []
+    gui._root = SimpleNamespace(
+        after_idle=lambda func, *args: scheduled.append((func, args)),
+        update_idletasks=lambda: None,
+    )
+    gui._update_train_button_state = lambda: None
+
+    run_training_calls = []
+    monkeypatch.setattr(
+        gui,
+        "_run_training",
+        lambda scheduled_specs, scheduled_captures: run_training_calls.append(
+            (scheduled_specs, scheduled_captures)
+        ),
+    )
+
+    gui._train()
+
+    assert gui._train_button["state"] == _gui._tk.DISABLED
+    assert run_training_calls == []
+    assert scheduled == [(gui._run_training, (param_specs, captures))]

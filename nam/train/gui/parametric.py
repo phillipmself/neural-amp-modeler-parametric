@@ -628,6 +628,14 @@ class GUI(object):
             if validated is None:
                 return
             param_specs, captures = validated
+            self._train_button["state"] = _tk.DISABLED
+            self._root.after_idle(self._run_training, param_specs, captures)
+        except Exception as e:
+            _messagebox.showerror("Training Failed", str(e))
+            self._update_train_button_state()
+
+    def _run_training(self, param_specs, captures):
+        try:
             assert self._input_path is not None
             assert self._training_destination is not None
             outdir = _Path(self._training_destination, _timestamp())
@@ -645,7 +653,6 @@ class GUI(object):
             silent = self._silent_training()
             save_plot = self._save_plot()
 
-            self._train_button["state"] = _tk.DISABLED
             self._root.update_idletasks()
             _full.main(
                 data_config,

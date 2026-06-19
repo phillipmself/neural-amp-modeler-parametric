@@ -417,6 +417,26 @@ def test_plot_reports_and_plots_each_packed_prediction(mocker, capsys):
         np.testing.assert_allclose(plotted_target, target.numpy())
 
 
+def test_plot_latency_closes_latency_figure(mocker, monkeypatch):
+    fig = object()
+    close_calls = []
+    num_samples = core._V3_DATA_INFO.first_blips_start + core._V3_DATA_INFO.t_blips
+    waveform = np.zeros(num_samples)
+    waveform[core._V3_DATA_INFO.first_blips_start + 10] = 1.0
+
+    monkeypatch.setattr(core, "_wav_to_np", lambda _path: waveform.copy())
+    mocker.patch("matplotlib.pyplot.figure", lambda: fig)
+    mocker.patch("matplotlib.pyplot.plot")
+    mocker.patch("matplotlib.pyplot.axvline")
+    mocker.patch("matplotlib.pyplot.legend")
+    mocker.patch("matplotlib.pyplot.show")
+    mocker.patch("matplotlib.pyplot.close", lambda maybe_fig: close_calls.append(maybe_fig))
+
+    core._plot_latency_v3(latency=0, input_path="input.wav", output_path="output.wav")
+
+    assert close_calls == [fig]
+
+
 @requires_v3_0_0
 def test_end_to_end():
     """

@@ -447,28 +447,31 @@ def _calibrate_latency_v_all(
         if (show_plots or not manual_available) and not _override_suppress_plots:
             print(msg)
             print("SHARE THIS PLOT IF YOU ASK FOR HELP")
-            _plt.figure()
-            _plt.plot(
-                _np.arange(-lookahead, lookback),
-                y_scan_average,
-                color="C0",
-                label="Signal average",
-            )
-            for y_scan in y_scans:
+            fig = _plt.figure()
+            try:
                 _plt.plot(
-                    _np.arange(-lookahead, lookback), y_scan, color="C0", alpha=0.2
+                    _np.arange(-lookahead, lookback),
+                    y_scan_average,
+                    color="C0",
+                    label="Signal average",
                 )
-            _plt.axvline(x=0, color="C1", linestyle="--", label="Trigger")
-            _plt.axhline(
-                y=-trigger_threshold, color="k", linestyle="--", label="Threshold"
-            )
-            _plt.axhline(y=trigger_threshold, color="k", linestyle="--")
-            _plt.xlim((-lookahead, lookback))
-            _plt.xlabel("Samples")
-            _plt.ylabel("Response")
-            _plt.legend()
-            _plt.title("SHARE THIS PLOT IF YOU ASK FOR HELP")
-            _plt.show()
+                for y_scan in y_scans:
+                    _plt.plot(
+                        _np.arange(-lookahead, lookback), y_scan, color="C0", alpha=0.2
+                    )
+                _plt.axvline(x=0, color="C1", linestyle="--", label="Trigger")
+                _plt.axhline(
+                    y=-trigger_threshold, color="k", linestyle="--", label="Threshold"
+                )
+                _plt.axhline(y=trigger_threshold, color="k", linestyle="--")
+                _plt.xlim((-lookahead, lookback))
+                _plt.xlabel("Samples")
+                _plt.ylabel("Response")
+                _plt.legend()
+                _plt.title("SHARE THIS PLOT IF YOU ASK FOR HELP")
+                _plt.show()
+            finally:
+                _plt.close(fig)
         delays = []
         recommended = None
 
@@ -522,28 +525,34 @@ def _plot_latency_v_all(
         )
         expected_spikes = data_info.blip_locations[0]  # For v1 specifically
         fig, axs = _plt.subplots(len((x, y)), 1)
-        for ax, curve in zip(axs, (x, y)):
-            ax.plot(t, curve)
-            [ax.axvline(x=es, color="C1", linestyle="--") for es in expected_spikes]
-        _plt.show()
+        try:
+            for ax, curve in zip(axs, (x, y)):
+                ax.plot(t, curve)
+                [ax.axvline(x=es, color="C1", linestyle="--") for es in expected_spikes]
+            _plt.show()
+        finally:
+            _plt.close(fig)
         if _nofail:
             raise RuntimeError("Failed to plot delay")
     else:
-        _plt.figure()
-        di = 20
-        # V1's got not a spike but a longer plateau; take the front of it.
-        if data_info.major_version == 1:
-            i = [i[0]]
-        for e, ii in enumerate(i, 1):
-            _plt.plot(
-                _np.arange(-di, di),
-                y[ii - di + latency : ii + di + latency],
-                ".-",
-                label=f"Output {e}",
-            )
-        _plt.axvline(x=0, linestyle="--", color="k")
-        _plt.legend()
-        _plt.show()  # This doesn't freeze the notebook
+        fig = _plt.figure()
+        try:
+            di = 20
+            # V1's got not a spike but a longer plateau; take the front of it.
+            if data_info.major_version == 1:
+                i = [i[0]]
+            for e, ii in enumerate(i, 1):
+                _plt.plot(
+                    _np.arange(-di, di),
+                    y[ii - di + latency : ii + di + latency],
+                    ".-",
+                    label=f"Output {e}",
+                )
+            _plt.axvline(x=0, linestyle="--", color="k")
+            _plt.legend()
+            _plt.show()  # This doesn't freeze the notebook
+        finally:
+            _plt.close(fig)
 
 
 _plot_latency_v1 = _partial(_plot_latency_v_all, _V1_DATA_INFO)
