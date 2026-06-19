@@ -577,6 +577,33 @@ def test_apply_joint_dataset_hooks_normalizes_outputs_from_training_rms():
     assert _rms(dataset_validation.y) == pytest.approx(target_rms * 0.5)
 
 
+def test_apply_joint_dataset_hooks_calls_legacy_hook_once_for_many_validations():
+    class _ScaleTrainOnceHook(data.JointDatasetHook):
+        def __init__(self):
+            self.calls = 0
+            self.validation_length = None
+
+        def apply(self, dataset_train, dataset_validation):
+            self.calls += 1
+            self.validation_length = len(dataset_validation)
+            dataset_train.scale_output(2.0)
+
+    dataset_train = _dataset_with_constant_y(0.25, n=4)
+    validation_a = _dataset_with_constant_y(0.125, n=4)
+    validation_b = _dataset_with_constant_y(0.5, n=4)
+    hook = _ScaleTrainOnceHook()
+
+    data.apply_joint_dataset_hooks(
+        dataset_train=dataset_train,
+        dataset_validation=[validation_a, validation_b],
+        hooks=[hook],
+    )
+
+    assert hook.calls == 1
+    assert hook.validation_length == len(validation_a) + len(validation_b)
+    assert torch.allclose(dataset_train.y, torch.full((4,), 0.5))
+
+
 def test_normalize_joint_dataset_output_uses_concat_training_rms():
     target_dbfs = -6.0
     target_rms = 10 ** (target_dbfs / 20.0)

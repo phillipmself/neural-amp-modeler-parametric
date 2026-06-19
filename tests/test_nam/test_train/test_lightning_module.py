@@ -215,6 +215,58 @@ def test_packed_lightning_validation_logs_per_submodel_and_aggregate():
     )
 
 
+def test_lightning_validation_logs_named_loader_metrics():
+    module = _lightning_module.LightningModule(
+        _MockBaseNet(1.0),
+        loss_config=_lightning_module.LossConfig(
+            val_loss=_lightning_module.ValidationLoss.MSE
+        ),
+    )
+    module.set_validation_loader_names(
+        ["unseen_audio_seen_param", "seen_audio_unseen_param"]
+    )
+    captured = {}
+    module.log_dict = lambda logs: captured.update(logs)
+    x = _torch.randn(3, 8)
+    targets = _torch.randn(3, 8)
+
+    val_loss = module.validation_step((x, targets), 0, dataloader_idx=1)
+
+    assert "val_loss" not in captured
+    assert "ESR" not in captured
+    assert "val_loss_seen_audio_unseen_param" in captured
+    assert "MSE_seen_audio_unseen_param" in captured
+    assert "ESR_seen_audio_unseen_param" in captured
+    assert _torch.allclose(captured["val_loss_seen_audio_unseen_param"], val_loss)
+
+
+def test_packed_lightning_validation_logs_named_loader_metrics():
+    net = _packed_wavenet()
+    module = _lightning_module.PackedLightningModule(
+        net,
+        loss_config=_lightning_module.LossConfig(
+            val_loss=_lightning_module.ValidationLoss.MSE
+        ),
+    )
+    module.set_validation_loader_names(
+        ["unseen_audio_seen_param", "seen_audio_unseen_param"]
+    )
+    captured = {}
+    module.log_dict = lambda logs: captured.update(logs)
+    x = _torch.randn(3, net.receptive_field + 8)
+    targets = _torch.randn(3, x.shape[-1] - net.receptive_field + 1)
+
+    val_loss = module.validation_step((x, targets), 0, dataloader_idx=1)
+
+    assert "val_loss" not in captured
+    assert "ESR" not in captured
+    assert "val_loss_seen_audio_unseen_param" in captured
+    assert "MSE_seen_audio_unseen_param" in captured
+    assert "val_loss_packed_0_seen_audio_unseen_param" in captured
+    assert "ESR_packed_1_seen_audio_unseen_param" in captured
+    assert _torch.allclose(captured["val_loss_seen_audio_unseen_param"], val_loss)
+
+
 def test_packed_lightning_validation_logs_mrstft_per_submodel(mocker):
     net = _packed_wavenet()
     module = _lightning_module.PackedLightningModule(

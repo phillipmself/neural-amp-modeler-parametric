@@ -18,6 +18,7 @@ from nam.data import np_to_wav as _np_to_wav
 from nam.train import core as _core
 from nam.models.parametric import ParametricConcatDataset  # triggers registrations
 from nam.train import full as _full
+from nam.train import parametric as _parametric_train
 
 
 _NUM_SAMPLES = 256
@@ -113,6 +114,20 @@ def _learning_config():
             "logger": False,
         },
         "trainer_fit_kwargs": {},
+    }
+
+
+def _verification_windows():
+    return {
+        "seen_audio": {
+            "start_samples": -2 * _NUM_VALIDATION_SAMPLES,
+            "stop_samples": -_NUM_VALIDATION_SAMPLES,
+            "ny": None,
+        },
+        "unseen_audio": {
+            "start_samples": -_NUM_VALIDATION_SAMPLES,
+            "ny": None,
+        },
     }
 
 
@@ -324,6 +339,107 @@ def test_tf3b_full_main_multi_capture_parametric_saves_plots(tmp_path, monkeypat
     assert (outdir / "comparison_1.png").exists(), "comparison_1.png was not created"
 
 
+def test_tf4_full_main_parametric_logs_all_validation_buckets(tmp_path, monkeypatch):
+    x1, y1 = _write_wav_pair_to(tmp_path, "cap0", seed_offset=0)
+    x2, y2 = _write_wav_pair_to(tmp_path, "cap1", seed_offset=1)
+    x3, y3 = _write_wav_pair_to(tmp_path, "verification", seed_offset=2)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    data_config = {
+        "type": "parametric",
+        "common": {
+            "delay": 0,
+            "require_input_pre_silence": None,
+            "param_names": ["gain"],
+        },
+        "train": [
+            {"x_path": x1, "y_path": y1, "params": [0.0], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+            {"x_path": x2, "y_path": y2, "params": [1.0], "stop_samples": -_NUM_VALIDATION_SAMPLES, "ny": _NY},
+        ],
+        "validation": [
+            {"x_path": x1, "y_path": y1, "params": [0.0], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+            {"x_path": x2, "y_path": y2, "params": [1.0], "start_samples": -_NUM_VALIDATION_SAMPLES, "ny": None},
+        ],
+        "verification_windows": _verification_windows(),
+        "verification": [
+            {"x_path": x3, "y_path": y3, "params": [0.5]},
+        ],
+    }
+    learning_config = _learning_config()
+    learning_config["checkpoint_monitor"] = "val_loss_unseen_audio_unseen_param"
+
+    captured_keys = []
+    original_log_validation_logs = _parametric_train.ParametricLightningModule._log_validation_logs
+
+    def capture_logs(self, logs):
+        captured_keys.extend(logs)
+        return original_log_validation_logs(self, logs)
+
+    monkeypatch.setattr(
+        _parametric_train.ParametricLightningModule,
+        "_log_validation_logs",
+        capture_logs,
+    )
+
+    _full.main(
+        data_config,
+        _model_config(),
+        learning_config,
+        outdir,
+        no_show=True,
+        make_plots=False,
+    )
+
+    captured_keys = set(captured_keys)
+    assert (outdir / "model.nam").exists(), "model.nam was not exported"
+    assert "ESR" in captured_keys
+    assert "val_loss" in captured_keys
+    assert "ESR_seen_audio_seen_param" in captured_keys
+    assert "ESR_seen_audio_unseen_param" in captured_keys
+    assert "ESR_unseen_audio_seen_param" in captured_keys
+    assert "ESR_unseen_audio_unseen_param" in captured_keys
+    assert "val_loss_unseen_audio_unseen_param" in captured_keys
+
+
+def test_tf4b_full_main_single_validation_loader_keeps_legacy_metric_names(
+    tmp_path, monkeypatch
+):
+    x_path, y_path = _write_wav_pair(tmp_path)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    captured_keys = []
+    original_log_validation_logs = (
+        _parametric_train.ParametricLightningModule._log_validation_logs
+    )
+
+    def capture_logs(self, logs):
+        captured_keys.extend(logs)
+        return original_log_validation_logs(self, logs)
+
+    monkeypatch.setattr(
+        _parametric_train.ParametricLightningModule,
+        "_log_validation_logs",
+        capture_logs,
+    )
+
+    _full.main(
+        _data_config(x_path, y_path),
+        _model_config(),
+        _learning_config(),
+        outdir,
+        no_show=True,
+        make_plots=False,
+    )
+
+    captured_keys = set(captured_keys)
+    assert "val_loss" in captured_keys
+    assert "ESR" in captured_keys
+    assert "val_loss_unseen_audio_seen_param" not in captured_keys
+    assert "ESR_unseen_audio_seen_param" not in captured_keys
+
+
 def test_full_main_exports_checkpoint_snapshots_as_nam(tmp_path):
     x_path, y_path = _write_wav_pair(tmp_path)
     outdir = tmp_path / "out"
@@ -354,3 +470,41 @@ def test_create_callbacks_includes_validation_stopping_when_threshold_esr_set():
     )
 
     assert any(isinstance(cb, _core._ValidationStopping) for cb in callbacks)
+
+
+def test_create_callbacks_defaults_threshold_monitor_to_deployment_esr():
+    callbacks = _full._create_callbacks(
+        _learning_config(),
+        threshold_esr=0.01,
+        validation_names=[
+            "unseen_audio_seen_param",
+            "seen_audio_seen_param",
+            "seen_audio_unseen_param",
+            "unseen_audio_unseen_param",
+        ],
+    )
+
+    stopping = next(
+        cb for cb in callbacks if isinstance(cb, _core._ValidationStopping)
+    )
+    assert stopping.monitor == "ESR_unseen_audio_unseen_param"
+
+
+def test_create_callbacks_maps_checkpoint_monitor_to_threshold_monitor():
+    learning_config = _learning_config()
+    learning_config["checkpoint_monitor"] = "val_loss_seen_audio_unseen_param"
+
+    callbacks = _full._create_callbacks(
+        learning_config,
+        threshold_esr=0.01,
+        validation_names=[
+            "unseen_audio_seen_param",
+            "seen_audio_unseen_param",
+            "unseen_audio_unseen_param",
+        ],
+    )
+
+    stopping = next(
+        cb for cb in callbacks if isinstance(cb, _core._ValidationStopping)
+    )
+    assert stopping.monitor == "ESR_seen_audio_unseen_param"

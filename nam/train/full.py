@@ -3,9 +3,12 @@
 # Author: Enrico Schifano (eraz1997@live.it)
 
 import json as _json
+from copy import deepcopy as _deepcopy
 from pathlib import Path as _Path
 from time import time as _time
+from typing import List as _List
 from typing import Optional as _Optional
+from typing import Tuple as _Tuple
 from typing import Union as _Union
 from warnings import warn as _warn
 
@@ -29,6 +32,12 @@ from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
 _torch.manual_seed(0)
+
+_PRIMARY_VALIDATION_NAME = "unseen_audio_seen_param"
+_DEPLOYMENT_VALIDATION_NAME = "unseen_audio_unseen_param"
+_WINDOW_OVERRIDE_KEYS = frozenset(
+    ("start_samples", "stop_samples", "start_seconds", "stop_seconds", "ny")
+)
 
 
 def _handshake_datasets(model, *datasets: _AbstractDataset) -> None:
@@ -178,10 +187,118 @@ def _plot_arrays(
     _plt.close()
 
 
+def _strip_split_window(entry: dict) -> dict:
+    return {k: _deepcopy(v) for k, v in entry.items() if k not in _WINDOW_OVERRIDE_KEYS}
+
+
+def _apply_eval_window(entries, window: dict):
+    def apply(entry: dict) -> dict:
+        # Reuse the same capture metadata/path/params, but swap in a different
+        # time window so one physical file can serve multiple evaluation buckets.
+        out = _strip_split_window(entry)
+        out.update(_deepcopy(window))
+        out.setdefault("ny", None)
+        return out
+
+    if isinstance(entries, list):
+        return [apply(entry) for entry in entries]
+    if isinstance(entries, dict):
+        return apply(entries)
+    raise TypeError(f"Unsupported parametric split type: {type(entries)}")
+
+
+def _build_eval_config(data_config: dict, entries, window: dict) -> dict:
+    return {
+        "type": data_config.get("type", "dataset"),
+        "common": _deepcopy(data_config.get("common", {})),
+        _Split.VALIDATION.value: _apply_eval_window(entries, window),
+    }
+
+
+def _init_validation_datasets(
+    data_config: dict,
+) -> _List[_Tuple[str, _AbstractDataset]]:
+    primary_validation = _init_dataset(data_config, _Split.VALIDATION)
+    datasets = [("validation", primary_validation)]
+    if data_config.get("type") != "parametric":
+        return datasets
+
+    has_verification = "verification" in data_config
+    has_windows = "verification_windows" in data_config
+    if has_verification != has_windows:
+        raise ValueError(
+            "Parametric verification requires both 'verification' and "
+            "'verification_windows' in the data config."
+        )
+    if not has_verification:
+        return datasets
+
+    datasets[0] = (_PRIMARY_VALIDATION_NAME, primary_validation)
+    windows = data_config["verification_windows"]
+    missing_windows = [
+        key for key in ("seen_audio", "unseen_audio") if key not in windows
+    ]
+    if missing_windows:
+        raise ValueError(
+            "Parametric verification_windows is missing required keys: "
+            + ", ".join(missing_windows)
+        )
+
+    datasets.extend(
+        [
+            (
+                "seen_audio_seen_param",
+                _init_dataset(
+                    # Build an eval-only view over the train captures so we can score
+                    # "seen audio, seen param" separately from the held-out tail.
+                    _build_eval_config(data_config, data_config[_Split.TRAIN.value], windows["seen_audio"]),
+                    _Split.VALIDATION,
+                ),
+            ),
+            (
+                "seen_audio_unseen_param",
+                _init_dataset(
+                    # Verification captures are held-out parameter settings; pairing
+                    # them with the seen-audio window isolates parametric generalization.
+                    _build_eval_config(data_config, data_config["verification"], windows["seen_audio"]),
+                    _Split.VALIDATION,
+                ),
+            ),
+            (
+                "unseen_audio_unseen_param",
+                _init_dataset(
+                    # Same held-out parameter settings, but now scored on the unseen
+                    # audio window to approximate the full deployment case.
+                    _build_eval_config(data_config, data_config["verification"], windows["unseen_audio"]),
+                    _Split.VALIDATION,
+                ),
+            ),
+        ]
+    )
+    return datasets
+
+
+def _get_threshold_esr_monitor(
+    learning_config: dict, validation_names: _List[str]
+) -> str:
+    if "threshold_esr_monitor" in learning_config:
+        return learning_config["threshold_esr_monitor"]
+
+    checkpoint_monitor = learning_config.get("checkpoint_monitor")
+    if checkpoint_monitor == "val_loss":
+        return "ESR"
+    if isinstance(checkpoint_monitor, str) and checkpoint_monitor.startswith("val_loss_"):
+        return f"ESR_{checkpoint_monitor.removeprefix('val_loss_')}"
+    if _DEPLOYMENT_VALIDATION_NAME in validation_names:
+        return f"ESR_{_DEPLOYMENT_VALIDATION_NAME}"
+    return "ESR"
+
+
 def _create_callbacks(
     learning_config,
     packed: bool = False,
     threshold_esr: _Optional[float] = None,
+    validation_names: _Optional[_List[str]] = None,
 ):
     """
     Checkpointing, essentially
@@ -203,7 +320,7 @@ def _create_callbacks(
     checkpoint_best = _core._ModelCheckpoint(
         filename="{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}",
         save_top_k=3,
-        monitor="val_loss",
+        monitor=learning_config.get("checkpoint_monitor", "val_loss"),
         **kwargs,
     )
 
@@ -222,7 +339,12 @@ def _create_callbacks(
         )
     if threshold_esr is not None:
         callbacks.append(
-            _core._ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
+            _core._ValidationStopping(
+                monitor=_get_threshold_esr_monitor(
+                    learning_config, validation_names or ["validation"]
+                ),
+                stopping_threshold=threshold_esr,
+            )
         )
     if not validate_inside_epoch:
         callbacks.append(checkpoint_epoch)
@@ -279,26 +401,37 @@ def main(
     data_config["common"]["nx"] = model.net.receptive_field
 
     dataset_train = _init_dataset(data_config, _Split.TRAIN)
-    dataset_validation = _init_dataset(data_config, _Split.VALIDATION)
+    validation_sets = _init_validation_datasets(data_config)
+    validation_names = [name for name, _ in validation_sets]
+    validation_datasets = [dataset for _, dataset in validation_sets]
+    dataset_validation = validation_datasets[0]
     _apply_joint_dataset_hooks(
         dataset_train=dataset_train,
-        dataset_validation=dataset_validation,
+        dataset_validation=validation_datasets,
         hooks=_get_joint_dataset_hooks(data_config.get("joint", [])),
     )
     model.net.sample_rate = dataset_train.sample_rate
 
     # Perform handshakes:
-    _handshake_datasets(model, dataset_train, dataset_validation)
+    _handshake_datasets(model, dataset_train, *validation_datasets)
+    if hasattr(model, "set_validation_loader_names"):
+        model.set_validation_loader_names(validation_names)
 
     train_dataloader = _DataLoader(dataset_train, **learning_config["train_dataloader"])
-    val_dataloader = _DataLoader(
-        dataset_validation, **learning_config["val_dataloader"]
-    )
+    val_dataloader = [
+        _DataLoader(dataset_validation_i, **learning_config["val_dataloader"])
+        for dataset_validation_i in validation_datasets
+    ]
+    # Preserve Lightning's original single-loader shape for legacy configs so the
+    # rest of the training path behaves exactly as before when verification is absent.
+    if len(val_dataloader) == 1:
+        val_dataloader = val_dataloader[0]
 
     callbacks = _create_callbacks(
         learning_config,
         packed=is_packed,
         threshold_esr=learning_config.get("threshold_esr"),
+        validation_names=validation_names,
     )
     packed_best_callback = next(
         (c for c in callbacks if isinstance(c, _lightning_module.PackedBestCheckpoint)),
@@ -332,7 +465,9 @@ def main(
         model.cpu()
         model.eval()
         model.net.sample_rate = dataset_train.sample_rate
-        _handshake_datasets(model, dataset_train, dataset_validation)
+        if hasattr(model, "set_validation_loader_names"):
+            model.set_validation_loader_names(validation_names)
+        _handshake_datasets(model, dataset_train, *validation_datasets)
         should_save_plot = make_plots if save_plot is None else save_plot
         if make_plots or should_save_plot:
             _plot(
@@ -360,4 +495,5 @@ def main(
 
         # Tear down the datasets
         train_dataloader.dataset.teardown()
-        val_dataloader.dataset.teardown()
+        for dataset_validation_i in validation_datasets:
+            dataset_validation_i.teardown()

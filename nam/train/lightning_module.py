@@ -215,6 +215,7 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Keeping it on-device is preferable, but if that fails, then remember to drop
         # it to cpu from then on.
         self._mrstft_device: _Optional[_torch.device] = None
+        self._validation_loader_names: _List[str] = ["validation"]
 
     @classmethod
     def init_from_config(cls, config):
@@ -303,6 +304,49 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Resolves https://github.com/sdatkinson/neural-amp-modeler/issues/351
         checkpoint["sample_rate"] = self.net.sample_rate
 
+    def set_validation_loader_names(self, names: _List[str]) -> None:
+        if len(names) == 0:
+            raise ValueError("Expected at least one validation loader name")
+        self._validation_loader_names = list(names)
+
+    def _get_validation_loader_name(self, dataloader_idx: int) -> str:
+        if 0 <= dataloader_idx < len(self._validation_loader_names):
+            return self._validation_loader_names[dataloader_idx]
+        return f"validation_{dataloader_idx}"
+
+    def _log_validation_logs(self, logs: _Dict[str, _torch.Tensor]) -> None:
+        try:
+            self.log_dict(logs, add_dataloader_idx=False)
+        except TypeError as e:
+            if "add_dataloader_idx" not in str(e):
+                raise
+            self.log_dict(logs)
+
+    def _get_validation_logs(
+        self,
+        loss_dict: _Dict[str, _LossItem],
+        val_loss: _torch.Tensor,
+        dataloader_idx: int,
+    ) -> _Dict[str, _torch.Tensor]:
+        loader_name = self._get_validation_loader_name(dataloader_idx)
+        logs = {}
+        if dataloader_idx == 0:
+            # Keep the historical metric names on the primary validation loader so
+            # existing checkpoint monitors, plots, and downstream tooling still work.
+            logs["val_loss"] = val_loss
+            logs.update({key: value.value for key, value in loss_dict.items()})
+        if len(self._validation_loader_names) > 1 or loader_name != "validation":
+            # Also emit explicit per-bucket names so parametric runs can analyze and
+            # monitor each validation regime independently.
+            logs[f"val_loss_{loader_name}"] = val_loss
+            logs.update(
+                {
+                    f"{key}_{loader_name}": value.value
+                    for key, value in loss_dict.items()
+                }
+            )
+        return logs
+
     def _shared_step(
         self, batch
     ) -> _Tuple[_torch.Tensor, _torch.Tensor, _Dict[str, _LossItem]]:
@@ -326,7 +370,7 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
                 loss = loss + v.weight * v.value
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         preds, targets, loss_dict = self._shared_step(batch)
 
         def get_val_loss():
@@ -349,11 +393,8 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
 
         loss_dict["ESR"] = _LossItem(None, self._esr_loss(preds, targets))
         val_loss = get_val_loss()
-        self.log_dict(
-            {
-                "val_loss": val_loss,
-                **{key: value.value for key, value in loss_dict.items()},
-            }
+        self._log_validation_logs(
+            self._get_validation_logs(loss_dict, val_loss, dataloader_idx)
         )
         return val_loss
 
@@ -499,10 +540,14 @@ class PackedLightningModule(LightningModule):
                     loss = loss + v.weight * v.value
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         preds, targets, loss_dicts = self._shared_step(batch)
         logs = {}
         val_losses = []
+        loader_name = self._get_validation_loader_name(dataloader_idx)
+        should_log_named = (
+            len(self._validation_loader_names) > 1 or loader_name != "validation"
+        )
 
         for i, loss_dict in enumerate(loss_dicts):
             if "MSE" not in loss_dict:
@@ -512,9 +557,17 @@ class PackedLightningModule(LightningModule):
             loss_dict["ESR"] = _LossItem(None, self._esr_loss(preds[:, i, :], targets))
             val_loss = self._get_val_loss_from_loss_dict(loss_dict)
             val_losses.append(val_loss)
-            logs[f"val_loss_packed_{i}"] = val_loss
-            for key, item in loss_dict.items():
-                logs[f"{key}_packed_{i}"] = item.value
+            if dataloader_idx == 0:
+                # Preserve the packed-per-submodel metric names on the primary loader.
+                logs[f"val_loss_packed_{i}"] = val_loss
+                for key, item in loss_dict.items():
+                    logs[f"{key}_packed_{i}"] = item.value
+            if should_log_named:
+                # Mirror those metrics with the loader suffix so each validation bucket
+                # can still be inspected at the per-submodel level.
+                logs[f"val_loss_packed_{i}_{loader_name}"] = val_loss
+                for key, item in loss_dict.items():
+                    logs[f"{key}_packed_{i}_{loader_name}"] = item.value
 
         loss_keys = sorted({key for loss_dict in loss_dicts for key in loss_dict})
         for key in loss_keys:
@@ -522,13 +575,22 @@ class PackedLightningModule(LightningModule):
                 loss_dict[key].value for loss_dict in loss_dicts if key in loss_dict
             ]
             if values:
-                logs[key] = sum(values) / len(values)
-        logs["ESR"] = sum(loss_dict["ESR"].value for loss_dict in loss_dicts) / len(
+                if dataloader_idx == 0:
+                    logs[key] = sum(values) / len(values)
+                if should_log_named:
+                    logs[f"{key}_{loader_name}"] = sum(values) / len(values)
+        esr = sum(loss_dict["ESR"].value for loss_dict in loss_dicts) / len(
             loss_dicts
         )
-        logs["val_loss"] = sum(val_losses) / len(val_losses)
-        self.log_dict(logs)
-        return logs["val_loss"]
+        val_loss = sum(val_losses) / len(val_losses)
+        if dataloader_idx == 0:
+            logs["ESR"] = esr
+            logs["val_loss"] = val_loss
+        if should_log_named:
+            logs[f"ESR_{loader_name}"] = esr
+            logs[f"val_loss_{loader_name}"] = val_loss
+        self._log_validation_logs(logs)
+        return val_loss
 
     def optimizer_step(self, *args, **kwargs):
         out = super().optimizer_step(*args, **kwargs)

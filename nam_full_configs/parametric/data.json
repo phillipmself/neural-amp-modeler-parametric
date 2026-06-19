@@ -6,6 +6,7 @@
         "- one output capture per parameter setting",
         "- training starts 10 seconds in and stops 9 seconds before the end",
         "- the final 9 seconds are reserved for validation",
+        "- optional verification captures plus verification_windows report four ESR buckets",
         "Replace the example WAV paths with your real captures."
     ],
     "type": "parametric",
@@ -82,6 +83,35 @@
             ],
             "start_seconds": -9.0,
             "ny": null
+        }
+    ],
+    "verification_windows": {
+        "seen_audio": {
+            "start_seconds": -18.0,
+            "stop_seconds": -9.0,
+            "ny": null
+        },
+        "unseen_audio": {
+            "start_seconds": -9.0,
+            "ny": null
+        }
+    },
+    "verification": [
+        {
+            "y_path": "C:\\path\\to\\captures\\gain_35_bright_2_output.wav",
+            "delay": 0,
+            "params": [
+                0.35,
+                0.2
+            ]
+        },
+        {
+            "y_path": "C:\\path\\to\\captures\\gain_65_bright_8_output.wav",
+            "delay": 0,
+            "params": [
+                0.65,
+                0.8
+            ]
         }
     ],
     "joint": [

@@ -1021,8 +1021,87 @@ class JointDatasetHook(_abc.ABC):
         self, dataset_train: AbstractDataset, dataset_validation: AbstractDataset
     ): ...
 
+    def apply_many(
+        self,
+        dataset_train: AbstractDataset,
+        dataset_validations: _Sequence[AbstractDataset],
+    ) -> None:
+        dataset_validation = (
+            dataset_validations[0]
+            if len(dataset_validations) == 1
+            else _CombinedValidationDataset(dataset_validations)
+        )
+        self.apply(
+            dataset_train=dataset_train, dataset_validation=dataset_validation
+        )
+
 
 class JointDatasetValidationError(RuntimeError): ...
+
+
+class _CombinedValidationDataset(AbstractDataset):
+    def __init__(self, datasets: _Sequence[AbstractDataset]):
+        if len(datasets) == 0:
+            raise JointDatasetValidationError(
+                "Expected at least one validation dataset"
+            )
+        self._datasets = list(datasets)
+        self._lookup = self._make_lookup()
+        self._validate_datasets()
+
+    def __getitem__(self, idx: int):
+        dataset_index, item_index = self._lookup[idx]
+        return self._datasets[dataset_index][item_index]
+
+    def __len__(self) -> int:
+        return sum(len(dataset) for dataset in self._datasets)
+
+    @property
+    def datasets(self):
+        return list(self._datasets)
+
+    @property
+    def nx(self):
+        return self._datasets[0].nx
+
+    @property
+    def ny(self):
+        return self._datasets[0].ny
+
+    @property
+    def sample_rate(self):
+        return self._datasets[0].sample_rate
+
+    def teardown(self):
+        for dataset in self._datasets:
+            dataset.teardown()
+
+    def _make_lookup(self):
+        lookup = {}
+        offset = 0
+        dataset_index = 0
+        for i in range(len(self)):
+            if offset == len(self._datasets[dataset_index]):
+                offset -= len(self._datasets[dataset_index])
+                dataset_index += 1
+            lookup[i] = (dataset_index, offset)
+            offset += 1
+        return lookup
+
+    def _validate_datasets(self) -> None:
+        reference_attrs = {
+            name: getattr(self._datasets[0], name, None)
+            for name in ("nx", "ny", "sample_rate")
+        }
+        for i, dataset in enumerate(self._datasets[1:], start=1):
+            for name, reference_value in reference_attrs.items():
+                value = getattr(dataset, name, None)
+                if value != reference_value:
+                    raise JointDatasetValidationError(
+                        "Validation datasets must agree on "
+                        f"{name}; dataset 0 has {reference_value} but dataset {i} "
+                        f"has {value}."
+                    )
 
 
 class _AssertSameSampleRate(JointDatasetHook):
@@ -1052,11 +1131,20 @@ def get_joint_dataset_hooks(hook_configs: _List[dict]) -> _List[JointDatasetHook
 
 def apply_joint_dataset_hooks(
     dataset_train: AbstractDataset,
-    dataset_validation: AbstractDataset,
+    dataset_validation: _Union[AbstractDataset, _Sequence[AbstractDataset]],
     hooks: _Sequence[JointDatasetHook],
 ):
+    # Training now may fan out into several named validation datasets; normalize the
+    # call shape here so individual hooks don't need to care.
+    dataset_validations = (
+        [dataset_validation]
+        if isinstance(dataset_validation, AbstractDataset)
+        else list(dataset_validation)
+    )
     for hook in hooks:
-        hook.apply(dataset_train=dataset_train, dataset_validation=dataset_validation)
+        hook.apply_many(
+            dataset_train=dataset_train, dataset_validations=dataset_validations
+        )
 
 
 class NormalizeJointDatasetOutput(JointDatasetHook):
@@ -1066,10 +1154,19 @@ class NormalizeJointDatasetOutput(JointDatasetHook):
     def apply(
         self, dataset_train: AbstractDataset, dataset_validation: AbstractDataset
     ):
+        self.apply_many(dataset_train, [dataset_validation])
+
+    def apply_many(
+        self,
+        dataset_train: AbstractDataset,
+        dataset_validations: _Sequence[AbstractDataset],
+    ) -> None:
         train_datasets = list(_iter_base_datasets(dataset_train, label="Train"))
-        validation_datasets = list(
-            _iter_base_datasets(dataset_validation, label="Validation")
-        )
+        validation_datasets = []
+        for dataset_validation in dataset_validations:
+            validation_datasets.extend(
+                _iter_base_datasets(dataset_validation, label="Validation")
+            )
         train_sum_squares = sum(
             _torch.sum(_torch.square(dataset.y)).item() for dataset in train_datasets
         )
@@ -1088,6 +1185,9 @@ class NormalizeJointDatasetOutput(JointDatasetHook):
             raise RuntimeError(
                 "Scale factor is invalid. Your data must have an `inf` or `nan` in it."
             )
+        # Compute one scale factor from the train split, then apply it everywhere.
+        # This keeps all validation buckets on the same loudness reference and avoids
+        # re-scaling the train targets once per validation dataset.
         for dataset in train_datasets + validation_datasets:
             dataset.scale_output(gain=scale_factor)
 
