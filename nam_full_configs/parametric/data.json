@@ -1,16 +1,16 @@
 {
     "_notes": [
-        "Parametric multi-capture example for this branch.",
-        "This mirrors the regular UI trainer data config style where possible:",
-        "- allow_unequal_lengths=true",
-        "- joint output normalization to -18 dBFS",
-        "- 8192-sample training targets",
-        "- final 9 seconds reserved for validation",
+        "Parametric config-based training example for this branch.",
+        "This mirrors the GUI trainer layout where possible:",
+        "- one shared input capture in common.x_path",
+        "- one output capture per parameter setting",
+        "- training starts 10 seconds in and stops 9 seconds before the end",
+        "- the final 9 seconds are reserved for validation",
         "Replace the example WAV paths with your real captures."
     ],
     "type": "parametric",
     "common": {
-        "delay": 0,
+        "x_path": "C:\\path\\to\\captures\\input.wav",
         "allow_unequal_lengths": true,
         "param_names": [
             "gain",
@@ -19,40 +19,43 @@
     },
     "train": [
         {
-            "x_path": "C:\\path\\to\\captures\\gain_2_bright_0_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
+            "delay": 0,
             "params": [
                 0.2,
                 0.0
             ],
-            "stop_seconds": -9.0,
-            "ny": 8192
+            "ny": 8192,
+            "start_seconds": 10.0,
+            "stop_seconds": -9.0
         },
         {
-            "x_path": "C:\\path\\to\\captures\\gain_5_bright_5_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
+            "delay": 0,
             "params": [
                 0.5,
                 0.5
             ],
-            "stop_seconds": -9.0,
-            "ny": 8192
+            "ny": 8192,
+            "start_seconds": 10.0,
+            "stop_seconds": -9.0
         },
         {
-            "x_path": "C:\\path\\to\\captures\\gain_8_bright_10_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
+            "delay": 0,
             "params": [
                 0.8,
                 1.0
             ],
-            "stop_seconds": -9.0,
-            "ny": 8192
+            "ny": 8192,
+            "start_seconds": 10.0,
+            "stop_seconds": -9.0
         }
     ],
     "validation": [
         {
-            "x_path": "C:\\path\\to\\captures\\gain_2_bright_0_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
+            "delay": 0,
             "params": [
                 0.2,
                 0.0
@@ -61,8 +64,8 @@
             "ny": null
         },
         {
-            "x_path": "C:\\path\\to\\captures\\gain_5_bright_5_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
+            "delay": 0,
             "params": [
                 0.5,
                 0.5
@@ -71,8 +74,8 @@
             "ny": null
         },
         {
-            "x_path": "C:\\path\\to\\captures\\gain_8_bright_10_input.wav",
             "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
+            "delay": 0,
             "params": [
                 0.8,
                 1.0
