@@ -144,4 +144,6 @@ tests/resources/*.reapeaks
 .DS_Store
 
 # claude
-.claude/worktrees/
+.claude
+
+/AGENTS.md
