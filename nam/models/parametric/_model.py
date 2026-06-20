@@ -4,7 +4,8 @@ conditioning. The adapter implements:
 
     z1' = (1 + gamma(p)) * z1 + beta(p)
 
-where gamma and beta are zero-initialized linear maps from parameter vector p.
+where gamma and beta are zero-initialized linear maps from a normalized parameter
+vector p.
 Zero-init guarantees z1' == z1 for all p at construction, so importing ordinary
 A2 weights into self._net gives exact parity before any fine-tuning.
 """
@@ -129,6 +130,18 @@ class ParametricWaveNet(_BaseNet):
             raise ValueError("param_specs must contain at least one ParamSpec.")
         self._net = net
         self._param_specs = list(param_specs)
+        param_mins = _torch.tensor([s.min for s in param_specs], dtype=_torch.float32)
+        param_maxs = _torch.tensor([s.max for s in param_specs], dtype=_torch.float32)
+        param_centers = _torch.tensor(
+            [s.center for s in param_specs], dtype=_torch.float32
+        )
+        param_half_ranges = _torch.tensor(
+            [s.half_range for s in param_specs], dtype=_torch.float32
+        )
+        self.register_buffer("_param_mins", param_mins)
+        self.register_buffer("_param_maxs", param_maxs)
+        self.register_buffer("_param_centers", param_centers)
+        self.register_buffer("_param_half_ranges", param_half_ranges)
         # Derive internal state from specs so the forward pass is unchanged: the net
         # still receives default values positionally, exactly as nominal_params did.
         self._nominal_params = _torch.tensor(
@@ -211,9 +224,36 @@ class ParametricWaveNet(_BaseNet):
             raise ValueError(
                 f"params must be 1-D (P,) or 2-D (B, P), got shape {tuple(p.shape)}"
             )
+        p = self._normalize_params(p, dtype=x.dtype)
         y = self._net(x, adapter=self._adapter, p=p)
         assert y.shape[1] == 1
         return y[:, 0, :]
+
+    def _normalize_params(
+        self,
+        params: _torch.Tensor,
+        dtype: _Optional[_torch.dtype] = None,
+    ) -> _torch.Tensor:
+        """
+        Map raw user-space knob values to the adapter's signed unit range.
+
+        Raw values are first clamped to the declared [min, max] bounds, then
+        affine-mapped into [-1, 1] so midpoints land at 0.0.
+        """
+        target_dtype = dtype
+        if target_dtype is None:
+            target_dtype = (
+                params.dtype if params.is_floating_point() else self._param_mins.dtype
+            )
+        params = params.to(dtype=target_dtype)
+        mins = self._param_mins.to(device=params.device, dtype=target_dtype)
+        maxs = self._param_maxs.to(device=params.device, dtype=target_dtype)
+        centers = self._param_centers.to(device=params.device, dtype=target_dtype)
+        half_ranges = self._param_half_ranges.to(
+            device=params.device, dtype=target_dtype
+        )
+        clipped = _torch.maximum(_torch.minimum(params, maxs), mins)
+        return (clipped - centers) / half_ranges
 
     def forward(  # type: ignore[override]
         self,
@@ -256,7 +296,8 @@ class ParametricWaveNet(_BaseNet):
     def _export_config(self) -> dict:
         cfg = self._net.export_config(sample_rate=self.sample_rate)
         # Self-describing params array: order is significant (positional net input).
-        # min/max are metadata for plugin/UI clamping; they do not affect the forward pass.
+        # Raw host/UI values are normalized to [-1, 1] from these bounds before
+        # reaching the adapter, so downstream runtimes should apply the same rule.
         cfg["params"] = [s.to_dict() for s in self._param_specs]
         return cfg
 

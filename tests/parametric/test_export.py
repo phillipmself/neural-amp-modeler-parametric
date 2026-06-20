@@ -143,6 +143,24 @@ def test_pa4_params_array_is_json_serializable(tmp_path):
     assert params[1]["default"] == pytest.approx(0.3, rel=1e-5)
 
 
+def test_pa4_export_params_describe_input_normalization(tmp_path):
+    """PA4: exported params declare the signed min/max normalization contract."""
+    model = _build(
+        {
+            **_SINGLE_C_CONFIG,
+            "params": [{"name": "gain", "min": 0.0, "max": 10.0, "default": 5.0}],
+        }
+    )
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    entry = nam["config"]["params"][0]
+    assert entry["input_normalization"] == "min_max_signed"
+    assert entry["normalized_min"] == pytest.approx(-1.0)
+    assert entry["normalized_max"] == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # PA4b — missing or invalid params raises a clear error
 # ---------------------------------------------------------------------------
@@ -167,6 +185,12 @@ def test_pa4b_param_spec_default_gt_max_raises():
     """PA4b: ParamSpec with default > max raises ValueError at construction."""
     with pytest.raises(ValueError, match="min <= default <= max"):
         ParamSpec(name="gain", min=0.0, max=0.4, default=0.5)
+
+
+def test_pa4b_param_spec_zero_span_raises():
+    """PA4b: ParamSpec with min == max is invalid because the control cannot vary."""
+    with pytest.raises(ValueError, match="min < max"):
+        ParamSpec(name="gain", min=0.5, max=0.5, default=0.5)
 
 
 def test_pa4b_param_spec_infinite_raises():
@@ -457,6 +481,44 @@ def test_paramspec_boundary_default_equals_max():
     """ParamSpec: default == max is valid (boundary case)."""
     spec = ParamSpec(name="x", min=0.0, max=1.0, default=1.0)
     assert spec.default == 1.0
+
+
+def test_paramspec_from_dict_rejects_unsupported_input_normalization():
+    """ParamSpec: loader must reject exported normalization metadata it cannot honor."""
+    with pytest.raises(ValueError, match="Unsupported param input normalization"):
+        ParamSpec.from_dict(
+            {
+                "name": "bright",
+                "min": 0.0,
+                "max": 1.0,
+                "default": 0.5,
+                "input_normalization": "unsupported",
+            }
+        )
+
+
+def test_paramspec_from_dict_rejects_unsupported_normalized_bounds():
+    """ParamSpec: loader must reject mismatched normalized bounds metadata."""
+    with pytest.raises(ValueError, match="Unsupported normalized_min"):
+        ParamSpec.from_dict(
+            {
+                "name": "bright",
+                "min": 0.0,
+                "max": 1.0,
+                "default": 0.5,
+                "normalized_min": 0.0,
+            }
+        )
+    with pytest.raises(ValueError, match="Unsupported normalized_max"):
+        ParamSpec.from_dict(
+            {
+                "name": "bright",
+                "min": 0.0,
+                "max": 1.0,
+                "default": 0.5,
+                "normalized_max": 0.0,
+            }
+        )
 
 
 def test_paramspec_to_dict_from_dict_roundtrip():

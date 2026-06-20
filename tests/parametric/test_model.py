@@ -111,6 +111,51 @@ def test_pa1_forward_shape_multi_c():
     assert y.shape[1] == seq_len - model.receptive_field + 1
 
 
+def test_pa1b_raw_params_are_normalized_to_signed_unit_range():
+    """PA1b: raw knob values normalize into [-1, 1] using each spec's min/max."""
+    config = {
+        **_MULTI_C_CONFIG,
+        "params": [
+            {"name": "gain", "min": 0.0, "max": 10.0, "default": 5.0},
+            {"name": "bright", "min": 0.0, "max": 1.0, "default": 0.5},
+        ],
+    }
+    model = _build_parametric(config)
+
+    raw = torch.tensor(
+        [
+            [0.0, 0.0],
+            [5.0, 0.5],
+            [10.0, 1.0],
+            [-2.0, 2.0],
+        ]
+    )
+    normalized = model._normalize_params(raw)
+
+    torch.testing.assert_close(
+        normalized,
+        torch.tensor(
+            [
+                [-1.0, -1.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [-1.0, 1.0],
+            ]
+        ),
+    )
+
+
+def test_pa1b_integer_params_are_normalized_in_floating_point():
+    """PA1b: integer raw params normalize safely into the model's float dtype."""
+    model = _build_parametric(_SINGLE_C_CONFIG)
+
+    raw = torch.tensor([[0], [1]], dtype=torch.int64)
+    normalized = model._normalize_params(raw)
+
+    assert normalized.dtype == torch.float32
+    torch.testing.assert_close(normalized, torch.tensor([[-1.0], [1.0]]))
+
+
 # ---------------------------------------------------------------------------
 # PA1c — MERGE GATE: zero-adapter parity with ordinary WaveNet
 # ---------------------------------------------------------------------------

@@ -89,7 +89,7 @@ def _make_model(param_names: _List[str], nominal_params: _List[float]) -> Parame
     """Build the smallest valid ParametricWaveNet for the given param schema.
 
     Uses symmetric [0, 1] min/max ranges and the supplied nominal as default.
-    min/max are metadata-only; they don't affect the forward pass or test math.
+    The model normalizes raw parameter values from these bounds into [-1, 1].
     """
     config = {
         "layers_configs": [
