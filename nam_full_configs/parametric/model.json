@@ -3,7 +3,8 @@
         "ParametricWaveNet example for this branch.",
         "The stock GUI trainer currently builds a PackedWaveNet container for regular A2 training.",
         "Packed parametric training is not supported on this branch, so this example keeps a single ParametricWaveNet wrapper while matching the PackedWaveNet channels_8 inner WaveNet config and training hyperparameters.",
-        "params is an ordered array of {name, min, max, default} objects. Order is significant (positional net input). default is the export-time/reference operating point."
+        "params is an ordered array of {name, min, max, default} objects. Order is significant (positional net input). default is the export-time/reference operating point.",
+        "Provide parameter values everywhere else in raw knob/display units. The model maps each parameter from its declared [min, max] range into an internal [-1, 1] range before the adapter sees it."
     ],
     "net": {
         "name": "ParametricWaveNet",

@@ -7,6 +7,7 @@
         "- training starts 10 seconds in and stops 9 seconds before the end",
         "- the final 9 seconds are reserved for validation",
         "- optional verification captures plus verification_windows report four ESR buckets",
+        "- params below are raw knob/display values, not pre-normalized fractions",
         "Replace the example WAV paths with your real captures."
     ],
     "type": "parametric",
@@ -23,7 +24,7 @@
             "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
             "delay": 0,
             "params": [
-                0.2,
+                2.0,
                 0.0
             ],
             "ny": 8192,
@@ -34,8 +35,8 @@
             "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
             "delay": 0,
             "params": [
-                0.5,
-                0.5
+                5.0,
+                5.0
             ],
             "ny": 8192,
             "start_seconds": 10.0,
@@ -45,8 +46,8 @@
             "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
             "delay": 0,
             "params": [
-                0.8,
-                1.0
+                8.0,
+                10.0
             ],
             "ny": 8192,
             "start_seconds": 10.0,
@@ -58,7 +59,7 @@
             "y_path": "C:\\path\\to\\captures\\gain_2_bright_0_output.wav",
             "delay": 0,
             "params": [
-                0.2,
+                2.0,
                 0.0
             ],
             "start_seconds": -9.0,
@@ -68,8 +69,8 @@
             "y_path": "C:\\path\\to\\captures\\gain_5_bright_5_output.wav",
             "delay": 0,
             "params": [
-                0.5,
-                0.5
+                5.0,
+                5.0
             ],
             "start_seconds": -9.0,
             "ny": null
@@ -78,8 +79,8 @@
             "y_path": "C:\\path\\to\\captures\\gain_8_bright_10_output.wav",
             "delay": 0,
             "params": [
-                0.8,
-                1.0
+                8.0,
+                10.0
             ],
             "start_seconds": -9.0,
             "ny": null
@@ -101,16 +102,16 @@
             "y_path": "C:\\path\\to\\captures\\gain_35_bright_2_output.wav",
             "delay": 0,
             "params": [
-                0.35,
-                0.2
+                3.5,
+                2.0
             ]
         },
         {
             "y_path": "C:\\path\\to\\captures\\gain_65_bright_8_output.wav",
             "delay": 0,
             "params": [
-                0.65,
-                0.8
+                6.5,
+                9.0
             ]
         }
     ],
