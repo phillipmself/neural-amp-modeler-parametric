@@ -508,3 +508,54 @@ def test_create_callbacks_maps_checkpoint_monitor_to_threshold_monitor():
         cb for cb in callbacks if isinstance(cb, _core._ValidationStopping)
     )
     assert stopping.monitor == "ESR_seen_audio_unseen_param"
+
+
+def test_create_callbacks_defaults_checkpoint_monitor_to_deployment_bucket():
+    callbacks = _full._create_callbacks(
+        _learning_config(),
+        validation_names=[
+            "unseen_audio_seen_param",
+            "seen_audio_seen_param",
+            "seen_audio_unseen_param",
+            "unseen_audio_unseen_param",
+        ],
+    )
+
+    checkpoint = next(cb for cb in callbacks if isinstance(cb, _core._ModelCheckpoint))
+    assert checkpoint.monitor == "val_loss_unseen_audio_unseen_param"
+    assert checkpoint.filename == (
+        "{epoch:04d}_{step}_{ESR_unseen_audio_unseen_param:.3e}"
+        "_{MSE_unseen_audio_unseen_param:.3e}"
+    )
+
+
+def test_create_callbacks_keeps_legacy_checkpoint_monitor_without_deployment_bucket():
+    callbacks = _full._create_callbacks(
+        _learning_config(),
+        validation_names=["validation"],
+    )
+
+    checkpoint = next(cb for cb in callbacks if isinstance(cb, _core._ModelCheckpoint))
+    assert checkpoint.monitor == "val_loss"
+    assert checkpoint.filename == "{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}"
+
+
+def test_create_callbacks_filename_tracks_explicit_checkpoint_bucket():
+    learning_config = _learning_config()
+    learning_config["checkpoint_monitor"] = "val_loss_seen_audio_unseen_param"
+
+    callbacks = _full._create_callbacks(
+        learning_config,
+        validation_names=[
+            "unseen_audio_seen_param",
+            "seen_audio_unseen_param",
+            "unseen_audio_unseen_param",
+        ],
+    )
+
+    checkpoint = next(cb for cb in callbacks if isinstance(cb, _core._ModelCheckpoint))
+    assert checkpoint.monitor == "val_loss_seen_audio_unseen_param"
+    assert checkpoint.filename == (
+        "{epoch:04d}_{step}_{ESR_seen_audio_unseen_param:.3e}"
+        "_{MSE_seen_audio_unseen_param:.3e}"
+    )

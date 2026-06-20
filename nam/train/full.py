@@ -294,6 +294,33 @@ def _get_threshold_esr_monitor(
     return "ESR"
 
 
+def _get_checkpoint_monitor(
+    learning_config: dict, validation_names: _List[str]
+) -> str:
+    checkpoint_monitor = learning_config.get("checkpoint_monitor")
+    if checkpoint_monitor is not None:
+        return checkpoint_monitor
+    if _DEPLOYMENT_VALIDATION_NAME in validation_names:
+        return f"val_loss_{_DEPLOYMENT_VALIDATION_NAME}"
+    return "val_loss"
+
+
+def _get_checkpoint_metric_suffix(checkpoint_monitor: str) -> _Optional[str]:
+    for prefix in ("val_loss_", "ESR_", "MSE_", "MRSTFT_"):
+        if checkpoint_monitor.startswith(prefix):
+            return checkpoint_monitor.removeprefix(prefix)
+    return None
+
+
+def _get_best_checkpoint_filename(checkpoint_monitor: str) -> str:
+    suffix = _get_checkpoint_metric_suffix(checkpoint_monitor)
+    if suffix is None:
+        return "{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}"
+    return (
+        f"{{epoch:04d}}_{{step}}_{{ESR_{suffix}:.3e}}_{{MSE_{suffix}:.3e}}"
+    )
+
+
 def _create_callbacks(
     learning_config,
     packed: bool = False,
@@ -317,10 +344,14 @@ def _create_callbacks(
             )
         }
 
+    checkpoint_monitor = _get_checkpoint_monitor(
+        learning_config, validation_names or ["validation"]
+    )
+
     checkpoint_best = _core._ModelCheckpoint(
-        filename="{epoch:04d}_{step}_{ESR:.3e}_{MSE:.3e}",
+        filename=_get_best_checkpoint_filename(checkpoint_monitor),
         save_top_k=3,
-        monitor=learning_config.get("checkpoint_monitor", "val_loss"),
+        monitor=checkpoint_monitor,
         **kwargs,
     )
 
