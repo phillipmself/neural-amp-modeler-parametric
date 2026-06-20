@@ -19,6 +19,37 @@ class ParametricLightningModule(_LightningModule):
     as x and x as params on a 3-tuple batch. This override corrects the routing.
     """
 
+    def configure_optimizers(self):
+        adapter_lr = self._optimizer_config.get("adapter_lr")
+        if adapter_lr is None:
+            return super().configure_optimizers()
+
+        optimizer_config = dict(self._optimizer_config)
+        optimizer_config.pop("adapter_lr")
+        adapter_params = list(self.net._adapter.parameters())
+        adapter_param_ids = {id(param) for param in adapter_params}
+        trunk_params = [
+            param for param in self.parameters() if id(param) not in adapter_param_ids
+        ]
+        optimizer = _torch.optim.Adam(
+            [
+                {"params": trunk_params},
+                {"params": adapter_params, "lr": adapter_lr},
+            ],
+            **optimizer_config,
+        )
+        if self._scheduler_config is None:
+            return optimizer
+
+        lr_scheduler = getattr(
+            _torch.optim.lr_scheduler, self._scheduler_config["class"]
+        )(optimizer, **self._scheduler_config["kwargs"])
+        lr_scheduler_config = {"scheduler": lr_scheduler}
+        for key in ("interval", "frequency", "monitor"):
+            if key in self._scheduler_config:
+                lr_scheduler_config[key] = self._scheduler_config[key]
+        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+
     def _shared_step(
         self, batch
     ) -> _Tuple[_torch.Tensor, _torch.Tensor, _Dict[str, _LossItem]]:

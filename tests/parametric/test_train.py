@@ -105,3 +105,51 @@ def test_pa8b_base_shared_step_misroutes_3tuple():
     with torch.no_grad():
         with pytest.raises(ValueError):
             module._shared_step(batch)
+
+
+def test_pa8c_parametric_optimizer_uses_single_group_by_default():
+    net = _build_param_net()
+    module = ParametricLightningModule(
+        net,
+        optimizer_config={"lr": 1.0e-3},
+        loss_config=_LOSS_CONFIG,
+    )
+
+    optimizer = module.configure_optimizers()
+
+    assert isinstance(optimizer, torch.optim.Adam)
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+
+
+def test_pa8d_parametric_optimizer_can_split_adapter_learning_rate():
+    net = _build_param_net()
+    net.register_parameter(
+        "_test_wrapper_parameter", torch.nn.Parameter(torch.tensor(1.0))
+    )
+    module = ParametricLightningModule(
+        net,
+        optimizer_config={
+            "lr": 1.0e-3,
+            "adapter_lr": 5.0e-4,
+            "weight_decay": 1.0e-6,
+        },
+        loss_config=_LOSS_CONFIG,
+    )
+
+    optimizer = module.configure_optimizers()
+
+    assert isinstance(optimizer, torch.optim.Adam)
+    assert len(optimizer.param_groups) == 2
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(5.0e-4)
+
+    all_param_ids = {id(param) for param in module.parameters()}
+    adapter_param_ids = {id(param) for param in module.net._adapter.parameters()}
+    trunk_param_ids = all_param_ids - adapter_param_ids
+    optimizer_trunk_ids = {id(param) for param in optimizer.param_groups[0]["params"]}
+    optimizer_adapter_ids = {id(param) for param in optimizer.param_groups[1]["params"]}
+
+    assert optimizer_trunk_ids == trunk_param_ids
+    assert optimizer_adapter_ids == adapter_param_ids
+    assert optimizer_trunk_ids.isdisjoint(optimizer_adapter_ids)

@@ -41,7 +41,10 @@ def test_build_parametric_model_config_matches_standard_a2_channels_8():
     assert built["net"]["config"]["layers_configs"] == channels_8["config"]["layers_configs"]
     assert built["net"]["config"]["head_scale"] == channels_8["config"]["head_scale"]
     assert built["loss"] == packed["loss"]
-    assert built["optimizer"] == packed["optimizer"]
+    assert built["optimizer"]["lr"] == packed["optimizer"]["lr"]
+    assert built["optimizer"]["weight_decay"] == packed["optimizer"]["weight_decay"]
+    assert built["optimizer"]["adapter_lr"] == _helpers._DEFAULT_ADAPTER_LR
+    assert set(built["optimizer"]) == set(packed["optimizer"]) | {"adapter_lr"}
     assert built["lr_scheduler"] == packed["lr_scheduler"]
     assert built["net"]["config"]["params"] == [spec.to_dict() for spec in param_specs]
 

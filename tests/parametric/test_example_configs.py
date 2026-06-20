@@ -34,7 +34,10 @@ def test_example_model_matches_channels_8_topology_and_hyperparameters():
     assert example["net"]["config"]["layers_configs"] == channels_8["config"]["layers_configs"]
     assert example["net"]["config"]["head_scale"] == channels_8["config"]["head_scale"]
     assert example["loss"] == packed["loss"]
-    assert example["optimizer"] == packed["optimizer"]
+    assert example["optimizer"]["lr"] == packed["optimizer"]["lr"]
+    assert example["optimizer"]["weight_decay"] == packed["optimizer"]["weight_decay"]
+    assert example["optimizer"]["adapter_lr"] == 5.0e-4
+    assert set(example["optimizer"]) == set(packed["optimizer"]) | {"adapter_lr"}
     assert example["lr_scheduler"] == packed["lr_scheduler"]
     assert "params" in example["net"]["config"]
 

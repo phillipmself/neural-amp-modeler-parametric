@@ -180,6 +180,9 @@ def format_coverage_message(gaps: _Sequence[CoverageGap]) -> str:
     return "\n".join(lines)
 
 
+_DEFAULT_ADAPTER_LR = 5.0e-4
+
+
 def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[str, _Any]:
     packed = _core.get_packed_model_config()
     channels_8 = next(
@@ -187,6 +190,8 @@ def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[s
         for submodel in packed["net"]["config"]["submodels"]
         if submodel["name"] == "channels_8"
     )
+    optimizer = _deepcopy(packed["optimizer"])
+    optimizer["adapter_lr"] = _DEFAULT_ADAPTER_LR
     return {
         "net": {
             "name": "ParametricWaveNet",
@@ -197,7 +202,7 @@ def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[s
             },
         },
         "loss": _deepcopy(packed["loss"]),
-        "optimizer": _deepcopy(packed["optimizer"]),
+        "optimizer": optimizer,
         "lr_scheduler": _deepcopy(packed["lr_scheduler"]),
     }
 
