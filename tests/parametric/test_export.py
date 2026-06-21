@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from nam.models.parametric import ParametricWaveNet, load_parametric_nam
-from nam.models.parametric._model import _ChannelAdapter
+from nam.models.parametric._model import _LayerAdapter
 from nam.models.parametric._spec import ParamSpec
 from nam.models.wavenet import WaveNet as _WaveNet
 
@@ -111,6 +111,8 @@ def test_pa4_export_config_contains_params_array(tmp_path):
         nam = _json.load(fp)
     cfg = nam["config"]
     assert "params" in cfg, "'params' array missing from exported config"
+    assert cfg["adapter_hidden_dim"] == model._adapter_hidden_dim
+    assert cfg["adapter_activation"] == model._adapter_activation
     # Old flat keys must be absent (no legacy fallback — parametric is unreleased)
     assert "param_names" not in cfg, "Old 'param_names' key must be absent from export"
     assert "param_dim" not in cfg, "Old 'param_dim' key must be absent from export"
@@ -141,6 +143,27 @@ def test_pa4_params_array_is_json_serializable(tmp_path):
     # Use approx because float32 round-trip may differ at float64 precision
     assert params[0]["default"] == pytest.approx(0.5, rel=1e-5)
     assert params[1]["default"] == pytest.approx(0.3, rel=1e-5)
+
+
+def test_pa4_export_config_contains_custom_adapter_activation(tmp_path):
+    """PA4: custom adapter activation is exported in init_from_config format."""
+    model = _build(
+        {
+            **_SINGLE_C_CONFIG,
+            "adapter_activation": {
+                "name": "LeakyReLU",
+                "negative_slope": 0.2,
+            },
+        }
+    )
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    assert nam["config"]["adapter_activation"] == {
+        "name": "LeakyReLU",
+        "negative_slope": 0.2,
+    }
 
 
 def test_pa4_export_params_describe_input_normalization(tmp_path):
@@ -255,9 +278,11 @@ def test_pa6_nominal_params_differ_from_zero():
     # Manually set non-zero adapter weights so that the adapter is no longer
     # a no-op for non-zero p. Any non-trivial weight suffices.
     with torch.no_grad():
-        for sub in model._adapter._adapters.values():
-            sub_typed = cast(_ChannelAdapter, sub)
-            torch.nn.init.constant_(sub_typed.gamma_map.weight, 0.01)
+        torch.nn.init.constant_(model._adapter._shared_encoder.fc.weight, 0.1)
+        torch.nn.init.zeros_(model._adapter._shared_encoder.fc.bias)
+        for sub in model._adapter._adapters:
+            sub_typed = cast(_LayerAdapter, sub)
+            torch.nn.init.constant_(sub_typed.gamma_head.weight, 0.01)
 
     rf = model.receptive_field
     x = torch.randn(1, rf + 32)
@@ -313,6 +338,8 @@ def test_pa5_load_parametric_nam_roundtrip(tmp_path):
     )
     assert loaded._param_names == model._param_names
     assert loaded._param_dim == model._param_dim
+    assert loaded._adapter_hidden_dim == model._adapter_hidden_dim
+    assert loaded._adapter_activation == model._adapter_activation
     torch.testing.assert_close(loaded._nominal_params, model._nominal_params)
 
 
@@ -401,9 +428,11 @@ def test_x1_export_snapshot_uses_nominal_params():
 
     # Give the adapter non-trivial weights so nominal p != zero p has a real effect.
     with torch.no_grad():
-        for sub in model._adapter._adapters.values():
-            cast(_ChannelAdapter, sub)
-            torch.nn.init.constant_(sub.gamma_map.weight, 0.1)  # type: ignore[attr-defined]
+        torch.nn.init.constant_(model._adapter._shared_encoder.fc.weight, 0.1)
+        torch.nn.init.zeros_(model._adapter._shared_encoder.fc.bias)
+        for sub in model._adapter._adapters:
+            sub = cast(_LayerAdapter, sub)
+            torch.nn.init.constant_(sub.gamma_head.weight, 0.1)
 
     x_np, y_snap_np = model._export_input_output()
 

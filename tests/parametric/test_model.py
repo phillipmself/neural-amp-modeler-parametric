@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from nam.models.parametric import ParametricWaveNet
-from nam.models.parametric._model import _ChannelAdapter
+from nam.models.parametric._model import _LayerAdapter
 from nam.models.wavenet._wavenet import WaveNet as _InnerWaveNet
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ _SINGLE_C_CONFIG = {
 # Multi-channel-size config: two layer arrays with DIFFERENT channel counts (8 and 4).
 # The second layer array's input_size must equal the first's channels (8) because the
 # first layer array outputs 8-channel tensors.  condition_size=1 throughout (mono audio).
-# This exercises the heterogeneous _ChannelAdapter dispatch path (PA1c gate).
+# This exercises heterogeneous per-layer adapter registration across layer arrays.
 _MULTI_C_CONFIG = {
     "layers_configs": [
         {
@@ -188,12 +188,13 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
     P = parametric._param_dim
 
     # Adapter must still be zero-init (we haven't trained or set any adapter weights)
-    for key, sub_adapter in parametric._adapter._adapters.items():
-        sa = cast(_ChannelAdapter, sub_adapter)
-        gamma_out = sa.gamma_map(torch.ones(1, P))
-        beta_out = sa.beta_map(torch.ones(1, P))
-        assert torch.all(gamma_out == 0), f"gamma_map not zero at C={key}"
-        assert torch.all(beta_out == 0), f"beta_map not zero at C={key}"
+    hidden = parametric._adapter._shared_encoder(torch.ones(1, P))
+    for layer_index, sub_adapter in enumerate(parametric._adapter._adapters):
+        sa = cast(_LayerAdapter, sub_adapter)
+        gamma_out = sa.gamma_head(hidden)
+        beta_out = sa.beta_head(hidden)
+        assert torch.all(gamma_out == 0), f"gamma_head not zero at layer={layer_index}"
+        assert torch.all(beta_out == 0), f"beta_head not zero at layer={layer_index}"
 
     rf = parametric.receptive_field
     torch.manual_seed(42)
@@ -235,8 +236,8 @@ def test_pa1c_zero_adapter_parity_with_inner_wavenet():
 
 def test_pa1d_zero_init_all_channel_sizes():
     """
-    PA1d: at construction (before any training), gamma_map(p)==0 and beta_map(p)==0
-    for arbitrary p, for EVERY channel-size sub-adapter in the ModuleDict.
+    PA1d: at construction (before any training), each per-layer adapter still
+    produces zero gamma and beta for arbitrary p.
     """
     model = _build_parametric(_MULTI_C_CONFIG)
     model.eval()
@@ -250,18 +251,58 @@ def test_pa1d_zero_init_all_channel_sizes():
         torch.full((1, P), -3.7),
     ]
 
-    for key, sub_adapter in model._adapter._adapters.items():
-        sa = cast(_ChannelAdapter, sub_adapter)
-        for p in test_ps:
+    hidden_states = [model._adapter._shared_encoder(p) for p in test_ps]
+    for layer_index, sub_adapter in enumerate(model._adapter._adapters):
+        sa = cast(_LayerAdapter, sub_adapter)
+        for p, hidden in zip(test_ps, hidden_states):
             with torch.no_grad():
-                gamma_out = sa.gamma_map(p)
-                beta_out = sa.beta_map(p)
+                gamma_out = sa.gamma_head(hidden)
+                beta_out = sa.beta_head(hidden)
             assert torch.all(gamma_out == 0), (
-                f"PA1d FAILED: gamma_map not zero for C={key}, p={p}"
+                f"PA1d FAILED: gamma_head not zero for layer={layer_index}, p={p}"
             )
             assert torch.all(beta_out == 0), (
-                f"PA1d FAILED: beta_map not zero for C={key}, p={p}"
+                f"PA1d FAILED: beta_head not zero for layer={layer_index}, p={p}"
             )
+
+
+def test_pa1e_adapter_has_one_subnetwork_per_inner_layer():
+    """PA1e: adapter registration is per inner WaveNet layer, not per channel size."""
+    model = _build_parametric(_MULTI_C_CONFIG)
+
+    expected_layers = sum(
+        len(layer_array._layers)  # type: ignore[attr-defined]
+        for layer_array in model._net._layer_arrays
+    )
+
+    assert len(model._adapter._adapters) == expected_layers
+
+
+def test_pa1f_shared_encoder_runs_once_per_model_forward(monkeypatch):
+    """PA1f: the shared param encoder is computed once, then reused by all layers."""
+    model = _build_parametric(_MULTI_C_CONFIG)
+    model.eval()
+
+    call_count = 0
+    original_forward = model._adapter._shared_encoder.forward
+
+    def counted_forward(params):
+        nonlocal call_count
+        call_count += 1
+        return original_forward(params)
+
+    monkeypatch.setattr(
+        model._adapter._shared_encoder,
+        "forward",
+        counted_forward,
+    )
+
+    x = torch.randn(2, model.receptive_field + 32)
+    params = torch.randn(2, model._param_dim)
+    with torch.no_grad():
+        model(x, params, pad_start=False)
+
+    assert call_count == 1
 
 
 # ---------------------------------------------------------------------------

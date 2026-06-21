@@ -26,6 +26,8 @@ from nam.models._from_nam import _init_wavenet as _init_wavenet
 from nam.models._from_nam import init_from_nam as _init_from_nam
 
 from ._model import ParametricWaveNet
+from ._model import _DEFAULT_ADAPTER_ACTIVATION
+from ._model import _DEFAULT_ADAPTER_HIDDEN_DIM
 from ._spec import ParamSpec as _ParamSpec
 
 
@@ -59,6 +61,12 @@ def load_parametric_nam(nam_dict: dict) -> Any:
         config = _deepcopy(nam_dict["config"])
         sample_rate = config.pop("sample_rate", None)
         raw_specs = config.pop("params")
+        adapter_hidden_dim = int(
+            config.pop("adapter_hidden_dim", _DEFAULT_ADAPTER_HIDDEN_DIM)
+        )
+        adapter_activation = _deepcopy(
+            config.pop("adapter_activation", _DEFAULT_ADAPTER_ACTIVATION)
+        )
         param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
 
         # The remaining config is the inner WaveNet in .nam export format.
@@ -73,6 +81,8 @@ def load_parametric_nam(nam_dict: dict) -> Any:
             net=inner_net._net,  # unwrap the WaveNet wrapper to get the inner _WaveNet
             param_specs=param_specs,
             sample_rate=sample_rate,
+            adapter_hidden_dim=adapter_hidden_dim,
+            adapter_activation=adapter_activation,
         )
 
         # Weights are stored as a plain Python list in the .nam JSON; convert once

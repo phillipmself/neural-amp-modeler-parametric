@@ -4,22 +4,25 @@ conditioning. The adapter implements:
 
     z1' = (1 + gamma(p)) * z1 + beta(p)
 
-where gamma and beta are zero-initialized linear maps from a normalized parameter
-vector p.
-Zero-init guarantees z1' == z1 for all p at construction, so importing ordinary
-A2 weights into self._net gives exact parity before any fine-tuning.
+where gamma and beta are zero-initialized per-layer heads on top of a shared
+nonlinear parameter encoder. Zero-init guarantees z1' == z1 for all p at
+construction, so importing ordinary A2 weights into self._net gives exact parity
+before any fine-tuning.
 """
 
+from copy import deepcopy as _deepcopy
+from typing import Any as _Any
 from typing import Dict as _Dict
 from typing import List as _List
 from typing import Optional as _Optional
-from typing import Set as _Set
 from typing import Tuple as _Tuple
+from typing import Union as _Union
 
 import numpy as _np
 import torch as _torch
 import torch.nn as _nn
 
+from .._activations import get_activation as _get_activation
 from ..base import BaseNet as _BaseNet
 from ..wavenet._wavenet import WaveNet as _InnerWaveNet
 from ..wavenet._wavenet_wrapper import WaveNet as _WaveNetWrapper
@@ -29,81 +32,150 @@ from ._spec import ParamSpec as _ParamSpec
 __all__ = ["ResidualAffineAdapter", "ParametricWaveNet"]
 
 
-class _ChannelAdapter(_nn.Module):
-    """
-    Residual affine adapter for a single channel dimension C.
+_DEFAULT_ADAPTER_HIDDEN_DIM = 8
+_DEFAULT_ADAPTER_ACTIVATION = "SiLU"
+_AdapterActivation = _Union[str, _Dict[str, _Any]]
 
-    gamma_map and beta_map are zero-init so that at construction the adapter
-    is an identity transformation: z1' = z1 for all p.
+
+class _SharedParamEncoder(_nn.Module):
+    """
+    Shared nonlinear encoder from normalized params to a hidden modulation state.
     """
 
-    def __init__(self, param_dim: int, channels: int):
+    def __init__(
+        self,
+        param_dim: int,
+        hidden_dim: int,
+        activation: _AdapterActivation,
+    ):
         super().__init__()
-        self.gamma_map = _nn.Linear(param_dim, channels, bias=True)
-        self.beta_map = _nn.Linear(param_dim, channels, bias=True)
-        # Zero-init: both weight and bias → gamma(p) = beta(p) = 0 for all p
-        _nn.init.zeros_(self.gamma_map.weight)
-        _nn.init.zeros_(self.gamma_map.bias)
-        _nn.init.zeros_(self.beta_map.weight)
-        _nn.init.zeros_(self.beta_map.bias)
+        self.fc = _nn.Linear(param_dim, hidden_dim, bias=True)
+        self.activation = _get_activation(activation)
+
+    def forward(self, params: _torch.Tensor) -> _torch.Tensor:
+        return self.activation(self.fc(params))
+
+
+class _LayerAdapter(_nn.Module):
+    """
+    Residual affine adapter heads for one specific inner WaveNet layer.
+
+    Each layer keeps its own zero-init gamma and beta heads while sharing the
+    upstream nonlinear parameter encoder across the whole WaveNet.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        channels: int,
+    ):
+        super().__init__()
+        self.gamma_head = _nn.Linear(hidden_dim, channels, bias=True)
+        self.beta_head = _nn.Linear(hidden_dim, channels, bias=True)
+        # Zero-init: both weight and bias → gamma(h) = beta(h) = 0 for all h
+        _nn.init.zeros_(self.gamma_head.weight)
+        _nn.init.zeros_(self.gamma_head.bias)
+        _nn.init.zeros_(self.beta_head.weight)
+        _nn.init.zeros_(self.beta_head.bias)
 
     def forward(
-        self, z1: _torch.Tensor, p: _torch.Tensor
+        self, z1: _torch.Tensor, hidden: _torch.Tensor
     ) -> _torch.Tensor:
-        # z1: (B, C, L), p: (B, P) or (P,)
-        gamma = self.gamma_map(p)  # (B, C) or (C,)
-        beta = self.beta_map(p)    # (B, C) or (C,)
+        # z1: (B, C, L), hidden: (B, H) or (H,)
+        gamma = self.gamma_head(hidden)  # (B, C) or (C,)
+        beta = self.beta_head(hidden)  # (B, C) or (C,)
         # Broadcast channel dim over length axis: (..., C) → (..., C, 1)
         return (1.0 + gamma).unsqueeze(-1) * z1 + beta.unsqueeze(-1)
 
 
 class ResidualAffineAdapter(_nn.Module):
     """
-    Dispatches z1 to the per-channel-size _ChannelAdapter based on z1.shape[1].
+    Dispatches z1 to a dedicated per-layer adapter based on a stable layer index.
 
-    Standard NAM A2 WaveNet can have multiple LayerArrays with DIFFERENT channel
-    counts (e.g. 16 and 8). The adapter is called inside every _Layer.forward, so
-    it must handle whichever C it receives. We keep one sub-adapter per distinct C
-    keyed by str(C) in a ModuleDict so all are registered as parameters.
+    Standard NAM A2 WaveNet invokes the adapter once at each inner layer's
+    pre-activation hook. This module keeps one shared nonlinear parameter encoder
+    and one registered affine-head adapter per inner layer, preserving the
+    existing hook traversal and deterministic export/import ordering.
     """
 
-    def __init__(self, param_dim: int, channel_sizes: _Set[int]):
+    uses_layer_index = True
+
+    def __init__(
+        self,
+        param_dim: int,
+        layer_channels: _List[int],
+        hidden_dim: int = _DEFAULT_ADAPTER_HIDDEN_DIM,
+        activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
+    ):
         super().__init__()
+        if hidden_dim < 1:
+            raise ValueError(
+                f"adapter_hidden_dim must be positive, got {hidden_dim}."
+            )
         self._param_dim = param_dim
-        # ModuleDict requires string keys
-        self._adapters = _nn.ModuleDict(
-            {
-                str(c): _ChannelAdapter(param_dim, c)
-                for c in sorted(channel_sizes)
-            }
+        self._hidden_dim = hidden_dim
+        self._layer_channels = list(layer_channels)
+        self._shared_encoder = _SharedParamEncoder(
+            param_dim,
+            hidden_dim,
+            activation,
+        )
+        self._adapters = _nn.ModuleList(
+            [
+                _LayerAdapter(hidden_dim, channels)
+                for channels in self._layer_channels
+            ]
         )
 
-    def forward(self, z1: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
-        c = z1.shape[1]
-        key = str(c)
-        if key not in self._adapters:
-            raise KeyError(
-                f"ResidualAffineAdapter has no sub-adapter for C={c}. "
-                f"Registered sizes: {sorted(int(k) for k in self._adapters.keys())}"
+    def forward(
+        self,
+        z1: _torch.Tensor,
+        params: _torch.Tensor,
+        *,
+        layer_index: int,
+        hidden: _Optional[_torch.Tensor] = None,
+    ) -> _torch.Tensor:
+        if not (0 <= layer_index < len(self._adapters)):
+            raise IndexError(
+                f"ResidualAffineAdapter got layer_index={layer_index}, but has "
+                f"{len(self._adapters)} per-layer adapters."
             )
-        return self._adapters[key](z1, p)
+        adapter = self._adapters[layer_index]
+        if z1.shape[1] != self._layer_channels[layer_index]:
+            raise ValueError(
+                f"Per-layer adapter {layer_index} expects C="
+                f"{self._layer_channels[layer_index]}, got C={z1.shape[1]}."
+            )
+        hidden = self._shared_encoder(params) if hidden is None else hidden
+        return adapter(z1, hidden)
 
 
-def _collect_channel_sizes(inner_net: _InnerWaveNet) -> _Set[int]:
+def _collect_layer_channels(inner_net: _InnerWaveNet) -> _List[int]:
     """
-    Walk the inner WaveNet's layer arrays and collect the distinct z1 channel
-    sizes across all layers.  z1 = zconv + mix_out, so z1.shape[1] equals
+    Walk the inner WaveNet's layer arrays and collect z1 channel sizes in the
+    exact order layers are visited during forward. z1 = zconv + mix_out, so
+    z1.shape[1] equals
     the dilated conv's OUTPUT channel count (conv.out_channels), which equals
     mid_channels (== 2*bottleneck for gated activations, == channels for Tanh).
-    Using conv.out_channels is the only safe way to determine C at adapter time;
-    reading the 'channels' config key would be wrong for gated activations.
+    Using conv.out_channels is the only safe way to determine C at adapter time.
     """
-    sizes: _Set[int] = set()
+    channels: _List[int] = []
     for layer_array in inner_net._layer_arrays:
         for layer in layer_array._layers:  # type: ignore[union-attr]
-            # conv is a LayerConv; .out_channels is the number of output features
-            sizes.add(layer.conv.out_channels)
-    return sizes
+            channels.append(layer.conv.out_channels)
+    return channels
+
+
+def _assign_adapter_indices(inner_net: _InnerWaveNet) -> int:
+    """
+    Tag each inner WaveNet layer with a stable traversal-order adapter index.
+    """
+    layer_index = 0
+    for layer_array in inner_net._layer_arrays:
+        for layer in layer_array._layers:  # type: ignore[union-attr]
+            layer._parametric_adapter_index = layer_index
+            layer_index += 1
+    return layer_index
 
 
 class ParametricWaveNet(_BaseNet):
@@ -124,12 +196,20 @@ class ParametricWaveNet(_BaseNet):
         net: _InnerWaveNet,
         param_specs: _List[_ParamSpec],
         sample_rate: _Optional[float] = None,
+        adapter_hidden_dim: int = _DEFAULT_ADAPTER_HIDDEN_DIM,
+        adapter_activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
     ):
         super().__init__(sample_rate=sample_rate)
         if len(param_specs) == 0:
             raise ValueError("param_specs must contain at least one ParamSpec.")
         self._net = net
         self._param_specs = list(param_specs)
+        self._adapter_hidden_dim = int(adapter_hidden_dim)
+        self._adapter_activation = (
+            _deepcopy(adapter_activation)
+            if isinstance(adapter_activation, dict)
+            else adapter_activation
+        )
         param_mins = _torch.tensor([s.min for s in param_specs], dtype=_torch.float32)
         param_maxs = _torch.tensor([s.max for s in param_specs], dtype=_torch.float32)
         param_centers = _torch.tensor(
@@ -147,8 +227,14 @@ class ParametricWaveNet(_BaseNet):
         self._nominal_params = _torch.tensor(
             [s.default for s in param_specs], dtype=_torch.float32
         )
-        channel_sizes = _collect_channel_sizes(net)
-        self._adapter = ResidualAffineAdapter(len(param_specs), channel_sizes)
+        layer_channels = _collect_layer_channels(net)
+        _assign_adapter_indices(net)
+        self._adapter = ResidualAffineAdapter(
+            len(param_specs),
+            layer_channels,
+            hidden_dim=self._adapter_hidden_dim,
+            activation=self._adapter_activation,
+        )
 
     # ------------------------------------------------------------------
     # Derived read-only properties (backward-compat for callers that read
@@ -176,12 +262,20 @@ class ParametricWaveNet(_BaseNet):
             )
         raw_specs = config.pop("params")
         param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
+        adapter_hidden_dim = int(
+            config.pop("adapter_hidden_dim", _DEFAULT_ADAPTER_HIDDEN_DIM)
+        )
+        adapter_activation = _deepcopy(
+            config.pop("adapter_activation", _DEFAULT_ADAPTER_ACTIVATION)
+        )
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
             "net": net,
             "param_specs": param_specs,
             "sample_rate": sample_rate,
+            "adapter_hidden_dim": adapter_hidden_dim,
+            "adapter_activation": adapter_activation,
         }
 
     # ------------------------------------------------------------------
@@ -225,7 +319,8 @@ class ParametricWaveNet(_BaseNet):
                 f"params must be 1-D (P,) or 2-D (B, P), got shape {tuple(p.shape)}"
             )
         p = self._normalize_params(p, dtype=x.dtype)
-        y = self._net(x, adapter=self._adapter, p=p)
+        adapter_hidden = self._adapter._shared_encoder(p)
+        y = self._net(x, adapter=self._adapter, p=p, adapter_hidden=adapter_hidden)
         assert y.shape[1] == 1
         return y[:, 0, :]
 
@@ -299,6 +394,8 @@ class ParametricWaveNet(_BaseNet):
         # Raw host/UI values are normalized to [-1, 1] from these bounds before
         # reaching the adapter, so downstream runtimes should apply the same rule.
         cfg["params"] = [s.to_dict() for s in self._param_specs]
+        cfg["adapter_hidden_dim"] = self._adapter_hidden_dim
+        cfg["adapter_activation"] = _deepcopy(self._adapter_activation)
         return cfg
 
     def _export_weights(self) -> _np.ndarray:

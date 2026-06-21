@@ -74,6 +74,8 @@
                     "gated": false
                 }
             ],
+            "adapter_hidden_dim": 8,
+            "adapter_activation": "SiLU",
             "head_scale": 0.01,
             "params": [
                 {"name": "gain",   "min": 0.0, "max": 10.0, "default": 5.0},

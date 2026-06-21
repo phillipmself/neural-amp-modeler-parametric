@@ -702,7 +702,13 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         return _torch.cat(tensors)
 
     def forward(
-        self, x: _torch.Tensor, h: _torch.Tensor, out_length: int, adapter=None, p=None
+        self,
+        x: _torch.Tensor,
+        h: _torch.Tensor,
+        out_length: int,
+        adapter=None,
+        p=None,
+        adapter_hidden=None,
     ) -> _Tuple[_Optional[_torch.Tensor], _torch.Tensor]:
         """
         :param x: (B,C,L1) From last layer
@@ -746,7 +752,16 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         # Pre-activation is the right hook point: conditioning here reaches features
         # before the nonlinearity compresses them, giving adapters maximum influence.
         if adapter is not None:
-            z1 = adapter(z1, p)
+            if getattr(adapter, "uses_layer_index", False):
+                layer_index = getattr(self, "_parametric_adapter_index", None)
+                if layer_index is None:
+                    raise RuntimeError(
+                        "Adapter expects a per-layer index, but this WaveNet layer "
+                        "was not tagged with one."
+                    )
+                z1 = adapter(z1, p, layer_index=layer_index, hidden=adapter_hidden)
+            else:
+                z1 = adapter(z1, p)
         if self._activation_pre_film is not None:
             z1 = self._activation_pre_film(z1, _c(z1.shape[2]))
 
@@ -1056,6 +1071,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         head_input: _Optional[_torch.Tensor] = None,
         adapter=None,
         p=None,
+        adapter_hidden=None,
     ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         """
         :param x: (B,Dx,L) layer input
@@ -1064,6 +1080,8 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             allows parametric conditioning without touching layer architecture. None = ordinary behavior.
         :param p: parameter tensor forwarded verbatim to adapter (e.g., amp/gear settings
             encoded by a conditioning network); unused when adapter is None.
+        :param adapter_hidden: optional precomputed adapter state shared across the
+            current WaveNet forward pass.
 
         Layer array receptive field is R.
 
@@ -1078,7 +1096,12 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         x = self._rechannel(x)
         for layer in self._layers:
             x, head_term = layer(
-                x, c, out_length_no_head_rechannel, adapter=adapter, p=p
+                x,
+                c,
+                out_length_no_head_rechannel,
+                adapter=adapter,
+                p=p,
+                adapter_hidden=adapter_hidden,
             )  # Ensures head_term sample length
             head_input = (
                 head_term
