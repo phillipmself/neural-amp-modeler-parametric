@@ -5,9 +5,10 @@ conditioning. The adapter implements:
     z1' = (1 + gamma(p)) * z1 + beta(p)
 
 where gamma and beta are zero-initialized per-layer heads on top of a shared
-nonlinear parameter encoder. Zero-init guarantees z1' == z1 for all p at
-construction, so importing ordinary A2 weights into self._net gives exact parity
-before any fine-tuning.
+nonlinear parameter encoder. The raw head outputs are bounded and scaled so the
+adapter remains a residual modulation instead of an unconstrained re-gain stage.
+Zero-init guarantees z1' == z1 for all p at construction, so importing ordinary
+A2 weights into self._net gives exact parity before any fine-tuning.
 """
 
 from copy import deepcopy as _deepcopy
@@ -34,6 +35,8 @@ __all__ = ["ResidualAffineAdapter", "ParametricWaveNet"]
 
 _DEFAULT_ADAPTER_HIDDEN_DIM = 8
 _DEFAULT_ADAPTER_ACTIVATION = "SiLU"
+_DEFAULT_ADAPTER_GAMMA_SCALE = 0.05
+_DEFAULT_ADAPTER_BETA_SCALE = 0.05
 _AdapterActivation = _Union[str, _Dict[str, _Any]]
 
 
@@ -68,8 +71,16 @@ class _LayerAdapter(_nn.Module):
         self,
         hidden_dim: int,
         channels: int,
+        gamma_scale: float,
+        beta_scale: float,
     ):
         super().__init__()
+        if gamma_scale <= 0.0:
+            raise ValueError(f"adapter_gamma_scale must be positive, got {gamma_scale}.")
+        if beta_scale <= 0.0:
+            raise ValueError(f"adapter_beta_scale must be positive, got {beta_scale}.")
+        self._gamma_scale = float(gamma_scale)
+        self._beta_scale = float(beta_scale)
         self.gamma_head = _nn.Linear(hidden_dim, channels, bias=True)
         self.beta_head = _nn.Linear(hidden_dim, channels, bias=True)
         # Zero-init: both weight and bias → gamma(h) = beta(h) = 0 for all h
@@ -82,8 +93,8 @@ class _LayerAdapter(_nn.Module):
         self, z1: _torch.Tensor, hidden: _torch.Tensor
     ) -> _torch.Tensor:
         # z1: (B, C, L), hidden: (B, H) or (H,)
-        gamma = self.gamma_head(hidden)  # (B, C) or (C,)
-        beta = self.beta_head(hidden)  # (B, C) or (C,)
+        gamma = _torch.tanh(self.gamma_head(hidden)) * self._gamma_scale  # (B, C) or (C,)
+        beta = _torch.tanh(self.beta_head(hidden)) * self._beta_scale  # (B, C) or (C,)
         # Broadcast channel dim over length axis: (..., C) → (..., C, 1)
         return (1.0 + gamma).unsqueeze(-1) * z1 + beta.unsqueeze(-1)
 
@@ -106,6 +117,8 @@ class ResidualAffineAdapter(_nn.Module):
         layer_channels: _List[int],
         hidden_dim: int = _DEFAULT_ADAPTER_HIDDEN_DIM,
         activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
+        gamma_scale: float = _DEFAULT_ADAPTER_GAMMA_SCALE,
+        beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
     ):
         super().__init__()
         if hidden_dim < 1:
@@ -114,6 +127,8 @@ class ResidualAffineAdapter(_nn.Module):
             )
         self._param_dim = param_dim
         self._hidden_dim = hidden_dim
+        self._gamma_scale = float(gamma_scale)
+        self._beta_scale = float(beta_scale)
         self._layer_channels = list(layer_channels)
         self._shared_encoder = _SharedParamEncoder(
             param_dim,
@@ -122,7 +137,12 @@ class ResidualAffineAdapter(_nn.Module):
         )
         self._adapters = _nn.ModuleList(
             [
-                _LayerAdapter(hidden_dim, channels)
+                _LayerAdapter(
+                    hidden_dim,
+                    channels,
+                    gamma_scale=self._gamma_scale,
+                    beta_scale=self._beta_scale,
+                )
                 for channels in self._layer_channels
             ]
         )
@@ -198,6 +218,8 @@ class ParametricWaveNet(_BaseNet):
         sample_rate: _Optional[float] = None,
         adapter_hidden_dim: int = _DEFAULT_ADAPTER_HIDDEN_DIM,
         adapter_activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
+        adapter_gamma_scale: float = _DEFAULT_ADAPTER_GAMMA_SCALE,
+        adapter_beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
     ):
         super().__init__(sample_rate=sample_rate)
         if len(param_specs) == 0:
@@ -210,6 +232,8 @@ class ParametricWaveNet(_BaseNet):
             if isinstance(adapter_activation, dict)
             else adapter_activation
         )
+        self._adapter_gamma_scale = float(adapter_gamma_scale)
+        self._adapter_beta_scale = float(adapter_beta_scale)
         param_mins = _torch.tensor([s.min for s in param_specs], dtype=_torch.float32)
         param_maxs = _torch.tensor([s.max for s in param_specs], dtype=_torch.float32)
         param_centers = _torch.tensor(
@@ -234,6 +258,8 @@ class ParametricWaveNet(_BaseNet):
             layer_channels,
             hidden_dim=self._adapter_hidden_dim,
             activation=self._adapter_activation,
+            gamma_scale=self._adapter_gamma_scale,
+            beta_scale=self._adapter_beta_scale,
         )
 
     # ------------------------------------------------------------------
@@ -268,6 +294,12 @@ class ParametricWaveNet(_BaseNet):
         adapter_activation = _deepcopy(
             config.pop("adapter_activation", _DEFAULT_ADAPTER_ACTIVATION)
         )
+        adapter_gamma_scale = float(
+            config.pop("adapter_gamma_scale", _DEFAULT_ADAPTER_GAMMA_SCALE)
+        )
+        adapter_beta_scale = float(
+            config.pop("adapter_beta_scale", _DEFAULT_ADAPTER_BETA_SCALE)
+        )
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
@@ -276,6 +308,8 @@ class ParametricWaveNet(_BaseNet):
             "sample_rate": sample_rate,
             "adapter_hidden_dim": adapter_hidden_dim,
             "adapter_activation": adapter_activation,
+            "adapter_gamma_scale": adapter_gamma_scale,
+            "adapter_beta_scale": adapter_beta_scale,
         }
 
     # ------------------------------------------------------------------
@@ -396,6 +430,8 @@ class ParametricWaveNet(_BaseNet):
         cfg["params"] = [s.to_dict() for s in self._param_specs]
         cfg["adapter_hidden_dim"] = self._adapter_hidden_dim
         cfg["adapter_activation"] = _deepcopy(self._adapter_activation)
+        cfg["adapter_gamma_scale"] = self._adapter_gamma_scale
+        cfg["adapter_beta_scale"] = self._adapter_beta_scale
         return cfg
 
     def _export_weights(self) -> _np.ndarray:

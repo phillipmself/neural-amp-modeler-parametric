@@ -305,6 +305,35 @@ def test_pa1f_shared_encoder_runs_once_per_model_forward(monkeypatch):
     assert call_count == 1
 
 
+def test_pa1g_adapter_outputs_are_bounded_by_configured_scales():
+    """PA1g: effective gamma/beta modulation stays inside the configured caps."""
+    config = {
+        **_SINGLE_C_CONFIG,
+        "adapter_gamma_scale": 0.1,
+        "adapter_beta_scale": 0.02,
+    }
+    model = _build_parametric(config)
+    model.eval()
+
+    sub_adapter = cast(_LayerAdapter, model._adapter._adapters[0])
+    with torch.no_grad():
+        sub_adapter.gamma_head.weight.fill_(100.0)
+        sub_adapter.gamma_head.bias.fill_(100.0)
+        sub_adapter.beta_head.weight.fill_(-100.0)
+        sub_adapter.beta_head.bias.fill_(-100.0)
+
+    hidden = torch.full((1, model._adapter._hidden_dim), 100.0)
+    gamma = torch.tanh(sub_adapter.gamma_head(hidden)) * model._adapter._gamma_scale
+    beta = torch.tanh(sub_adapter.beta_head(hidden)) * model._adapter._beta_scale
+
+    assert float(gamma.detach().abs().max()) <= config["adapter_gamma_scale"] + 1.0e-7
+    assert float(beta.detach().abs().max()) <= config["adapter_beta_scale"] + 1.0e-7
+
+    export_config = model._export_config()
+    assert export_config["adapter_gamma_scale"] == config["adapter_gamma_scale"]
+    assert export_config["adapter_beta_scale"] == config["adapter_beta_scale"]
+
+
 # ---------------------------------------------------------------------------
 # PA2 — mismatched param_dim raises a clear error
 # ---------------------------------------------------------------------------
