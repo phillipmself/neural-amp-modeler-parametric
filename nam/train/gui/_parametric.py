@@ -192,6 +192,7 @@ def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[s
     )
     optimizer = _deepcopy(packed["optimizer"])
     optimizer["adapter_lr"] = _DEFAULT_ADAPTER_LR
+    optimizer["adapter_weight_decay"] = optimizer["weight_decay"]
     return {
         "net": {
             "name": "ParametricWaveNet",

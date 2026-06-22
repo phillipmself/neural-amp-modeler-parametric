@@ -3,7 +3,7 @@
         "ParametricWaveNet example for this branch.",
         "The stock GUI trainer currently builds a PackedWaveNet container for regular A2 training.",
         "Packed parametric training is not supported on this branch, so this example keeps a single ParametricWaveNet wrapper while matching the PackedWaveNet channels_8 inner WaveNet config and training hyperparameters.",
-        "For parametric runs, optimizer.lr targets the inner WaveNet trunk and optimizer.adapter_lr can separately target the residual adapter.",
+        "For parametric runs, optimizer.lr and optimizer.weight_decay target the inner WaveNet trunk, while optimizer.adapter_lr and optimizer.adapter_weight_decay can separately target the residual adapter.",
         "params is an ordered array of {name, min, max, default} objects. Order is significant (positional net input). default is the export-time/reference operating point.",
         "Provide parameter values everywhere else in raw knob/display units. The model maps each parameter from its declared [min, max] range into an internal [-1, 1] range before the adapter sees it.",
         "adapter_gamma_scale and adapter_beta_scale keep the per-layer residual modulation bounded during training and export."
@@ -93,7 +93,8 @@
     "optimizer": {
         "lr": 0.004,
         "adapter_lr": 0.0005,
-        "weight_decay": 3.17e-07
+        "weight_decay": 3.17e-07,
+        "adapter_weight_decay": 3.17e-07
     },
     "lr_scheduler": {
         "class": "ExponentialLR",

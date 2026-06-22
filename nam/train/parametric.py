@@ -21,20 +21,27 @@ class ParametricLightningModule(_LightningModule):
 
     def configure_optimizers(self):
         adapter_lr = self._optimizer_config.get("adapter_lr")
-        if adapter_lr is None:
+        adapter_weight_decay = self._optimizer_config.get("adapter_weight_decay")
+        if adapter_lr is None and adapter_weight_decay is None:
             return super().configure_optimizers()
 
         optimizer_config = dict(self._optimizer_config)
-        optimizer_config.pop("adapter_lr")
+        optimizer_config.pop("adapter_lr", None)
+        optimizer_config.pop("adapter_weight_decay", None)
         adapter_params = list(self.net._adapter.parameters())
         adapter_param_ids = {id(param) for param in adapter_params}
         trunk_params = [
             param for param in self.parameters() if id(param) not in adapter_param_ids
         ]
+        adapter_group = {"params": adapter_params}
+        if adapter_lr is not None:
+            adapter_group["lr"] = adapter_lr
+        if adapter_weight_decay is not None:
+            adapter_group["weight_decay"] = adapter_weight_decay
         optimizer = _torch.optim.Adam(
             [
                 {"params": trunk_params},
-                {"params": adapter_params, "lr": adapter_lr},
+                adapter_group,
             ],
             **optimizer_config,
         )
