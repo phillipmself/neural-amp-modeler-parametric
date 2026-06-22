@@ -183,7 +183,33 @@ def format_coverage_message(gaps: _Sequence[CoverageGap]) -> str:
 _DEFAULT_ADAPTER_LR = 5.0e-4
 
 
-def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[str, _Any]:
+def _normalize_optional_non_negative_int(
+    value: _Any,
+    *,
+    field_name: str,
+) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {parsed}.")
+    return parsed
+
+
+def build_parametric_model_config(
+    param_specs: _Sequence[_ParamSpec],
+    *,
+    adapter_first_n_layers: int | None = None,
+    adapter_last_n_layers: int | None = None,
+) -> _Dict[str, _Any]:
+    adapter_first_n_layers = _normalize_optional_non_negative_int(
+        adapter_first_n_layers,
+        field_name="adapter_first_n_layers",
+    )
+    adapter_last_n_layers = _normalize_optional_non_negative_int(
+        adapter_last_n_layers,
+        field_name="adapter_last_n_layers",
+    )
     packed = _core.get_packed_model_config()
     channels_8 = next(
         submodel
@@ -200,6 +226,16 @@ def build_parametric_model_config(param_specs: _Sequence[_ParamSpec]) -> _Dict[s
                 "layers_configs": _deepcopy(channels_8["config"]["layers_configs"]),
                 "head_scale": channels_8["config"]["head_scale"],
                 "params": [spec.to_dict() for spec in param_specs],
+                **(
+                    {"adapter_first_n_layers": adapter_first_n_layers}
+                    if adapter_first_n_layers is not None
+                    else {}
+                ),
+                **(
+                    {"adapter_last_n_layers": adapter_last_n_layers}
+                    if adapter_last_n_layers is not None
+                    else {}
+                ),
             },
         },
         "loss": _deepcopy(packed["loss"]),

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from nam.models.parametric import ParametricWaveNet
+from nam.models.parametric._model import _IdentityLayerAdapter
 from nam.models.parametric._model import _LayerAdapter
 from nam.models.wavenet._wavenet import WaveNet as _InnerWaveNet
 
@@ -332,6 +333,54 @@ def test_pa1g_adapter_outputs_are_bounded_by_configured_scales():
     export_config = model._export_config()
     assert export_config["adapter_gamma_scale"] == config["adapter_gamma_scale"]
     assert export_config["adapter_beta_scale"] == config["adapter_beta_scale"]
+
+
+def test_pa1h_adapter_can_target_only_the_first_n_layers():
+    """PA1h: adapter_first_n_layers leaves later inner layers as identities."""
+    model = _build_parametric({**_MULTI_C_CONFIG, "adapter_first_n_layers": 2})
+
+    assert model._adapter_first_n_layers == 2
+    assert model._adapter_last_n_layers is None
+    assert isinstance(model._adapter._adapters[0], _LayerAdapter)
+    assert isinstance(model._adapter._adapters[1], _LayerAdapter)
+    assert isinstance(model._adapter._adapters[2], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[3], _IdentityLayerAdapter)
+
+
+def test_pa1i_adapter_can_target_only_the_last_n_layers():
+    """PA1i: adapter_last_n_layers leaves earlier inner layers as identities."""
+    model = _build_parametric({**_MULTI_C_CONFIG, "adapter_last_n_layers": 1})
+
+    assert model._adapter_first_n_layers is None
+    assert model._adapter_last_n_layers == 1
+    assert isinstance(model._adapter._adapters[0], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[1], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[2], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[3], _LayerAdapter)
+
+
+def test_pa1j_adapter_layer_subset_selection_can_combine_first_and_last_ranges():
+    """PA1j: first-N and last-N selections combine as a union of active layers."""
+    model = _build_parametric(
+        {
+            **_MULTI_C_CONFIG,
+            "adapter_first_n_layers": 1,
+            "adapter_last_n_layers": 1,
+        }
+    )
+
+    assert model._adapter_first_n_layers == 1
+    assert model._adapter_last_n_layers == 1
+    assert isinstance(model._adapter._adapters[0], _LayerAdapter)
+    assert isinstance(model._adapter._adapters[1], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[2], _IdentityLayerAdapter)
+    assert isinstance(model._adapter._adapters[3], _LayerAdapter)
+
+
+def test_pa1k_adapter_layer_subset_selection_must_fit_inner_depth():
+    """PA1k: layer subset counts must not exceed the inner WaveNet depth."""
+    with pytest.raises(ValueError, match="exceeds the number of inner WaveNet layers"):
+        _build_parametric({**_MULTI_C_CONFIG, "adapter_first_n_layers": 5})
 
 
 # ---------------------------------------------------------------------------

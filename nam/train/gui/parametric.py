@@ -59,6 +59,13 @@ def _optional_float_or_default(val: str, default: float | None) -> float | None:
         return default
 
 
+def _optional_non_negative_int_or_default(val: str, default: int | None) -> int | None:
+    parsed = _optional_int_or_default(val, default)
+    if parsed is None:
+        return None
+    return max(parsed, 0)
+
+
 class _AdvancedOptionsWindow(object):
     def __init__(self, resume_main, parent: "GUI"):
         self._parent = parent
@@ -82,6 +89,16 @@ class _AdvancedOptionsWindow(object):
             if self._parent.advanced_options.threshold_esr is None
             else str(self._parent.advanced_options.threshold_esr)
         )
+        self._adapter_first_n_layers = _tk.StringVar(
+            value=""
+            if self._parent.advanced_options.adapter_first_n_layers is None
+            else str(self._parent.advanced_options.adapter_first_n_layers)
+        )
+        self._adapter_last_n_layers = _tk.StringVar(
+            value=""
+            if self._parent.advanced_options.adapter_last_n_layers is None
+            else str(self._parent.advanced_options.adapter_last_n_layers)
+        )
 
         self._build_layout()
         self._root.grab_set()
@@ -97,6 +114,18 @@ class _AdvancedOptionsWindow(object):
             row=2,
             label="Threshold ESR",
             variable=self._threshold_esr,
+        )
+        self._make_row(
+            frame,
+            row=3,
+            label="Adapter first N",
+            variable=self._adapter_first_n_layers,
+        )
+        self._make_row(
+            frame,
+            row=4,
+            label="Adapter last N",
+            variable=self._adapter_last_n_layers,
         )
 
         button_frame = _tk.Frame(self._root)
@@ -131,6 +160,14 @@ class _AdvancedOptionsWindow(object):
         )
 
     def _apply_and_close(self):
+        adapter_first_n_layers = _optional_non_negative_int_or_default(
+            self._adapter_first_n_layers.get(),
+            self._parent.advanced_options.adapter_first_n_layers,
+        )
+        adapter_last_n_layers = _optional_non_negative_int_or_default(
+            self._adapter_last_n_layers.get(),
+            self._parent.advanced_options.adapter_last_n_layers,
+        )
         self._parent.advanced_options.num_epochs = _non_negative_int_or_default(
             self._num_epochs.get(),
             self._parent.advanced_options.num_epochs,
@@ -143,6 +180,8 @@ class _AdvancedOptionsWindow(object):
             self._threshold_esr.get(),
             self._parent.advanced_options.threshold_esr,
         )
+        self._parent.advanced_options.adapter_first_n_layers = adapter_first_n_layers
+        self._parent.advanced_options.adapter_last_n_layers = adapter_last_n_layers
         self._close()
 
     def _close(self):
@@ -644,7 +683,11 @@ class GUI(object):
             data_config = _helpers.build_parametric_data_config(
                 self._input_path, param_specs, captures
             )
-            model_config = _helpers.build_parametric_model_config(param_specs)
+            model_config = _helpers.build_parametric_model_config(
+                param_specs,
+                adapter_first_n_layers=self.advanced_options.adapter_first_n_layers,
+                adapter_last_n_layers=self.advanced_options.adapter_last_n_layers,
+            )
             learning_config = _helpers.build_learning_config(
                 num_epochs=self.advanced_options.num_epochs,
                 batch_size=_helpers.default_batch_size(),

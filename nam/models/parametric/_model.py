@@ -99,6 +99,68 @@ class _LayerAdapter(_nn.Module):
         return (1.0 + gamma).unsqueeze(-1) * z1 + beta.unsqueeze(-1)
 
 
+class _IdentityLayerAdapter(_nn.Module):
+    """
+    Placeholder for inner layers that should skip parametric modulation.
+    """
+
+    def forward(
+        self, z1: _torch.Tensor, hidden: _Optional[_torch.Tensor] = None
+    ) -> _torch.Tensor:
+        return z1
+
+
+def _validate_adapter_layer_selection(
+    adapter_first_n_layers: _Optional[int],
+    adapter_last_n_layers: _Optional[int],
+) -> _Tuple[_Optional[int], _Optional[int]]:
+    validated = []
+    for name, value in (
+        ("adapter_first_n_layers", adapter_first_n_layers),
+        ("adapter_last_n_layers", adapter_last_n_layers),
+    ):
+        if value is None:
+            validated.append(None)
+            continue
+        parsed = int(value)
+        if parsed < 0:
+            raise ValueError(f"{name} must be non-negative, got {parsed}.")
+        validated.append(parsed)
+    first_n_layers, last_n_layers = validated
+    return first_n_layers, last_n_layers
+
+
+def _resolve_active_adapter_layer_mask(
+    num_layers: int,
+    adapter_first_n_layers: _Optional[int],
+    adapter_last_n_layers: _Optional[int],
+) -> _List[bool]:
+    first_n_layers, last_n_layers = _validate_adapter_layer_selection(
+        adapter_first_n_layers, adapter_last_n_layers
+    )
+    if first_n_layers is None and last_n_layers is None:
+        return [True] * num_layers
+    first_active_layer = num_layers
+    if first_n_layers is not None:
+        if first_n_layers > num_layers:
+            raise ValueError(
+                "adapter_first_n_layers exceeds the number of inner WaveNet layers: "
+                f"{first_n_layers} > {num_layers}."
+            )
+    if last_n_layers is not None:
+        if last_n_layers > num_layers:
+            raise ValueError(
+                "adapter_last_n_layers exceeds the number of inner WaveNet layers: "
+                f"{last_n_layers} > {num_layers}."
+            )
+        first_active_layer = num_layers - last_n_layers
+    return [
+        (first_n_layers is not None and layer_index < first_n_layers)
+        or layer_index >= first_active_layer
+        for layer_index in range(num_layers)
+    ]
+
+
 class ResidualAffineAdapter(_nn.Module):
     """
     Dispatches z1 to a dedicated per-layer adapter based on a stable layer index.
@@ -119,6 +181,8 @@ class ResidualAffineAdapter(_nn.Module):
         activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
         gamma_scale: float = _DEFAULT_ADAPTER_GAMMA_SCALE,
         beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
+        adapter_first_n_layers: _Optional[int] = None,
+        adapter_last_n_layers: _Optional[int] = None,
     ):
         super().__init__()
         if hidden_dim < 1:
@@ -130,6 +194,17 @@ class ResidualAffineAdapter(_nn.Module):
         self._gamma_scale = float(gamma_scale)
         self._beta_scale = float(beta_scale)
         self._layer_channels = list(layer_channels)
+        (
+            self._adapter_first_n_layers,
+            self._adapter_last_n_layers,
+        ) = _validate_adapter_layer_selection(
+            adapter_first_n_layers, adapter_last_n_layers
+        )
+        self._active_layer_mask = _resolve_active_adapter_layer_mask(
+            len(self._layer_channels),
+            self._adapter_first_n_layers,
+            self._adapter_last_n_layers,
+        )
         self._shared_encoder = _SharedParamEncoder(
             param_dim,
             hidden_dim,
@@ -137,13 +212,19 @@ class ResidualAffineAdapter(_nn.Module):
         )
         self._adapters = _nn.ModuleList(
             [
-                _LayerAdapter(
-                    hidden_dim,
-                    channels,
-                    gamma_scale=self._gamma_scale,
-                    beta_scale=self._beta_scale,
+                (
+                    _LayerAdapter(
+                        hidden_dim,
+                        channels,
+                        gamma_scale=self._gamma_scale,
+                        beta_scale=self._beta_scale,
+                    )
+                    if is_active
+                    else _IdentityLayerAdapter()
                 )
-                for channels in self._layer_channels
+                for channels, is_active in zip(
+                    self._layer_channels, self._active_layer_mask
+                )
             ]
         )
 
@@ -160,6 +241,8 @@ class ResidualAffineAdapter(_nn.Module):
                 f"ResidualAffineAdapter got layer_index={layer_index}, but has "
                 f"{len(self._adapters)} per-layer adapters."
             )
+        if not self._active_layer_mask[layer_index]:
+            return z1
         adapter = self._adapters[layer_index]
         if z1.shape[1] != self._layer_channels[layer_index]:
             raise ValueError(
@@ -220,6 +303,8 @@ class ParametricWaveNet(_BaseNet):
         adapter_activation: _AdapterActivation = _DEFAULT_ADAPTER_ACTIVATION,
         adapter_gamma_scale: float = _DEFAULT_ADAPTER_GAMMA_SCALE,
         adapter_beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
+        adapter_first_n_layers: _Optional[int] = None,
+        adapter_last_n_layers: _Optional[int] = None,
     ):
         super().__init__(sample_rate=sample_rate)
         if len(param_specs) == 0:
@@ -234,6 +319,12 @@ class ParametricWaveNet(_BaseNet):
         )
         self._adapter_gamma_scale = float(adapter_gamma_scale)
         self._adapter_beta_scale = float(adapter_beta_scale)
+        (
+            self._adapter_first_n_layers,
+            self._adapter_last_n_layers,
+        ) = _validate_adapter_layer_selection(
+            adapter_first_n_layers, adapter_last_n_layers
+        )
         param_mins = _torch.tensor([s.min for s in param_specs], dtype=_torch.float32)
         param_maxs = _torch.tensor([s.max for s in param_specs], dtype=_torch.float32)
         param_centers = _torch.tensor(
@@ -260,6 +351,8 @@ class ParametricWaveNet(_BaseNet):
             activation=self._adapter_activation,
             gamma_scale=self._adapter_gamma_scale,
             beta_scale=self._adapter_beta_scale,
+            adapter_first_n_layers=self._adapter_first_n_layers,
+            adapter_last_n_layers=self._adapter_last_n_layers,
         )
 
     # ------------------------------------------------------------------
@@ -300,6 +393,8 @@ class ParametricWaveNet(_BaseNet):
         adapter_beta_scale = float(
             config.pop("adapter_beta_scale", _DEFAULT_ADAPTER_BETA_SCALE)
         )
+        adapter_first_n_layers = config.pop("adapter_first_n_layers", None)
+        adapter_last_n_layers = config.pop("adapter_last_n_layers", None)
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
@@ -310,6 +405,8 @@ class ParametricWaveNet(_BaseNet):
             "adapter_activation": adapter_activation,
             "adapter_gamma_scale": adapter_gamma_scale,
             "adapter_beta_scale": adapter_beta_scale,
+            "adapter_first_n_layers": adapter_first_n_layers,
+            "adapter_last_n_layers": adapter_last_n_layers,
         }
 
     # ------------------------------------------------------------------
@@ -432,6 +529,10 @@ class ParametricWaveNet(_BaseNet):
         cfg["adapter_activation"] = _deepcopy(self._adapter_activation)
         cfg["adapter_gamma_scale"] = self._adapter_gamma_scale
         cfg["adapter_beta_scale"] = self._adapter_beta_scale
+        if self._adapter_first_n_layers is not None:
+            cfg["adapter_first_n_layers"] = self._adapter_first_n_layers
+        if self._adapter_last_n_layers is not None:
+            cfg["adapter_last_n_layers"] = self._adapter_last_n_layers
         return cfg
 
     def _export_weights(self) -> _np.ndarray:

@@ -53,6 +53,35 @@ def test_build_parametric_model_config_matches_standard_a2_channels_8():
     assert built["net"]["config"]["params"] == [spec.to_dict() for spec in param_specs]
 
 
+def test_build_parametric_model_config_includes_optional_adapter_layer_subset():
+    param_specs = _helpers.build_param_specs(
+        [{"name": "gain", "min": 0.0, "max": 10.0, "default": 5.0}]
+    )
+
+    built = _helpers.build_parametric_model_config(
+        param_specs,
+        adapter_last_n_layers=3,
+    )
+
+    assert built["net"]["config"]["adapter_last_n_layers"] == 3
+    assert "adapter_first_n_layers" not in built["net"]["config"]
+
+
+def test_build_parametric_model_config_allows_combined_adapter_layer_subset():
+    param_specs = _helpers.build_param_specs(
+        [{"name": "gain", "min": 0.0, "max": 10.0, "default": 5.0}]
+    )
+
+    built = _helpers.build_parametric_model_config(
+        param_specs,
+        adapter_first_n_layers=2,
+        adapter_last_n_layers=2,
+    )
+
+    assert built["net"]["config"]["adapter_first_n_layers"] == 2
+    assert built["net"]["config"]["adapter_last_n_layers"] == 2
+
+
 def test_build_param_specs_requires_unique_nonempty_names():
     try:
         _helpers.build_param_specs(
@@ -543,6 +572,7 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
         latency=123,
         ignore_checks=False,
         threshold_esr=0.004,
+        adapter_first_n_layers=4,
     )
     gui._validate_for_training = lambda: (
         [_helpers.build_param_specs([{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}])[0]],
@@ -582,7 +612,12 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
     monkeypatch.setattr(
         _gui._helpers,
         "build_parametric_model_config",
-        lambda param_specs: model_config_calls.append(param_specs) or {"model": "config"},
+        lambda param_specs, adapter_first_n_layers=None, adapter_last_n_layers=None: (
+            model_config_calls.append(
+                (param_specs, adapter_first_n_layers, adapter_last_n_layers)
+            )
+            or {"model": "config"}
+        ),
     )
     monkeypatch.setattr(
         _gui._helpers,
@@ -630,6 +665,11 @@ def test_train_passes_advanced_options_to_learning_config(tmp_path, monkeypatch)
     scheduled[0][0](*scheduled[0][1])
 
     assert learning_config_calls == [(77, 9, 0.004)]
+    assert model_config_calls == [(
+        gui._validate_for_training()[0],
+        4,
+        None,
+    )]
     assert len(full_main_calls) == 1
     assert full_main_calls[0][2] == {
         "trainer": {"max_epochs": 77},
@@ -654,6 +694,7 @@ def test_train_respects_plot_checkbox_combinations(tmp_path, monkeypatch):
         latency=123,
         ignore_checks=False,
         threshold_esr=None,
+        adapter_last_n_layers=2,
     )
     gui._validate_for_training = lambda: (
         [_helpers.build_param_specs([{"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5}])[0]],

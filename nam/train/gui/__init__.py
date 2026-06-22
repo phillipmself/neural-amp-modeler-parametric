@@ -132,12 +132,18 @@ class AdvancedOptions(object):
     :param ignore_checks: Keep going even if a check says that something is wrong.
     :param threshold_esr: Stop training if the ESR gets better than this. If None, don't
         stop.
+    :param adapter_first_n_layers: For parametric training, optionally apply adapters
+        only to the first N inner WaveNet layers.
+    :param adapter_last_n_layers: For parametric training, optionally apply adapters
+        only to the last N inner WaveNet layers.
     """
 
     num_epochs: int
     latency: _Optional[int]
     ignore_checks: bool
     threshold_esr: _Optional[float]
+    adapter_first_n_layers: _Optional[int] = None
+    adapter_last_n_layers: _Optional[int] = None
 
 
 class _PathType(_Enum):

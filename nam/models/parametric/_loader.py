@@ -27,6 +27,8 @@ from nam.models._from_nam import init_from_nam as _init_from_nam
 
 from ._model import ParametricWaveNet
 from ._model import _DEFAULT_ADAPTER_ACTIVATION
+from ._model import _DEFAULT_ADAPTER_BETA_SCALE
+from ._model import _DEFAULT_ADAPTER_GAMMA_SCALE
 from ._model import _DEFAULT_ADAPTER_HIDDEN_DIM
 from ._spec import ParamSpec as _ParamSpec
 
@@ -67,6 +69,14 @@ def load_parametric_nam(nam_dict: dict) -> Any:
         adapter_activation = _deepcopy(
             config.pop("adapter_activation", _DEFAULT_ADAPTER_ACTIVATION)
         )
+        adapter_gamma_scale = float(
+            config.pop("adapter_gamma_scale", _DEFAULT_ADAPTER_GAMMA_SCALE)
+        )
+        adapter_beta_scale = float(
+            config.pop("adapter_beta_scale", _DEFAULT_ADAPTER_BETA_SCALE)
+        )
+        adapter_first_n_layers = config.pop("adapter_first_n_layers", None)
+        adapter_last_n_layers = config.pop("adapter_last_n_layers", None)
         param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
 
         # The remaining config is the inner WaveNet in .nam export format.
@@ -83,6 +93,10 @@ def load_parametric_nam(nam_dict: dict) -> Any:
             sample_rate=sample_rate,
             adapter_hidden_dim=adapter_hidden_dim,
             adapter_activation=adapter_activation,
+            adapter_gamma_scale=adapter_gamma_scale,
+            adapter_beta_scale=adapter_beta_scale,
+            adapter_first_n_layers=adapter_first_n_layers,
+            adapter_last_n_layers=adapter_last_n_layers,
         )
 
         # Weights are stored as a plain Python list in the .nam JSON; convert once

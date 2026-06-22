@@ -340,7 +340,37 @@ def test_pa5_load_parametric_nam_roundtrip(tmp_path):
     assert loaded._param_dim == model._param_dim
     assert loaded._adapter_hidden_dim == model._adapter_hidden_dim
     assert loaded._adapter_activation == model._adapter_activation
+    assert loaded._adapter_gamma_scale == model._adapter_gamma_scale
+    assert loaded._adapter_beta_scale == model._adapter_beta_scale
+    assert loaded._adapter_first_n_layers == model._adapter_first_n_layers
+    assert loaded._adapter_last_n_layers == model._adapter_last_n_layers
     torch.testing.assert_close(loaded._nominal_params, model._nominal_params)
+
+
+def test_pa5_load_parametric_nam_roundtrip_preserves_layer_subset_and_scales(tmp_path):
+    """PA5: export/load preserves adapter subset selection and custom scales."""
+    model = _build(
+        {
+            **_MULTI_C_CONFIG,
+            "adapter_last_n_layers": 1,
+            "adapter_gamma_scale": 0.1,
+            "adapter_beta_scale": 0.02,
+        }
+    )
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    assert nam["config"]["adapter_last_n_layers"] == 1
+    assert nam["config"]["adapter_gamma_scale"] == pytest.approx(0.1)
+    assert nam["config"]["adapter_beta_scale"] == pytest.approx(0.02)
+
+    loaded = load_parametric_nam(nam)
+
+    assert loaded._adapter_last_n_layers == 1
+    assert loaded._adapter_first_n_layers is None
+    assert loaded._adapter_gamma_scale == pytest.approx(0.1)
+    assert loaded._adapter_beta_scale == pytest.approx(0.02)
 
 
 # ---------------------------------------------------------------------------
