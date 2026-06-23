@@ -344,6 +344,7 @@ def test_pa5_load_parametric_nam_roundtrip(tmp_path):
     assert loaded._adapter_beta_scale == model._adapter_beta_scale
     assert loaded._adapter_first_n_layers == model._adapter_first_n_layers
     assert loaded._adapter_last_n_layers == model._adapter_last_n_layers
+    assert loaded._adapter_layer_groups == model._adapter_layer_groups
     torch.testing.assert_close(loaded._nominal_params, model._nominal_params)
 
 
@@ -371,6 +372,27 @@ def test_pa5_load_parametric_nam_roundtrip_preserves_layer_subset_and_scales(tmp
     assert loaded._adapter_first_n_layers is None
     assert loaded._adapter_gamma_scale == pytest.approx(0.1)
     assert loaded._adapter_beta_scale == pytest.approx(0.02)
+
+
+def test_pa5_load_parametric_nam_roundtrip_preserves_adapter_layer_groups(tmp_path):
+    """PA5: export/load preserves configured grouped-head layer sharing."""
+    model = _build(
+        {
+            **_MULTI_C_CONFIG,
+            "adapter_layer_groups": [[0, 1], [2, 3]],
+        }
+    )
+    model.export(tmp_path, basename="model")
+    with open(tmp_path / "model.nam") as fp:
+        nam = _json.load(fp)
+
+    assert nam["config"]["adapter_layer_groups"] == [[0, 1], [2, 3]]
+
+    loaded = load_parametric_nam(nam)
+
+    assert loaded._adapter_layer_groups == ((0, 1), (2, 3))
+    assert loaded._adapter._adapters[0] is loaded._adapter._adapters[1]
+    assert loaded._adapter._adapters[2] is loaded._adapter._adapters[3]
 
 
 # ---------------------------------------------------------------------------

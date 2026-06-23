@@ -4,11 +4,14 @@ conditioning. The adapter implements:
 
     z1' = (1 + gamma(p)) * z1 + beta(p)
 
-where gamma and beta are zero-initialized per-layer heads on top of a shared
+where gamma and beta are zero-initialized affine heads on top of a shared
 nonlinear parameter encoder. The raw head outputs are bounded and scaled so the
 adapter remains a residual modulation instead of an unconstrained re-gain stage.
-Zero-init guarantees z1' == z1 for all p at construction, so importing ordinary
-A2 weights into self._net gives exact parity before any fine-tuning.
+Heads may be configured per layer or shared across layer groups. Zero-init
+guarantees z1' == z1 for all p at construction. That preserves exact base-net
+behavior at initialization and keeps export/import semantics simple; it does not
+imply that parametric training should be initialized from a standard
+single-setting model.
 """
 
 from copy import deepcopy as _deepcopy
@@ -38,6 +41,7 @@ _DEFAULT_ADAPTER_ACTIVATION = "SiLU"
 _DEFAULT_ADAPTER_GAMMA_SCALE = 0.05
 _DEFAULT_ADAPTER_BETA_SCALE = 0.05
 _AdapterActivation = _Union[str, _Dict[str, _Any]]
+_AdapterLayerGroups = _Optional[_Tuple[_Tuple[int, ...], ...]]
 
 
 class _SharedParamEncoder(_nn.Module):
@@ -61,10 +65,11 @@ class _SharedParamEncoder(_nn.Module):
 
 class _LayerAdapter(_nn.Module):
     """
-    Residual affine adapter heads for one specific inner WaveNet layer.
+    Residual affine adapter heads for one specific inner WaveNet channel shape.
 
-    Each layer keeps its own zero-init gamma and beta heads while sharing the
-    upstream nonlinear parameter encoder across the whole WaveNet.
+    Multiple layers may reuse the same zero-init gamma and beta heads as long as
+    they share the same channel count. The upstream nonlinear parameter encoder
+    remains shared across the whole WaveNet.
     """
 
     def __init__(
@@ -161,14 +166,106 @@ def _resolve_active_adapter_layer_mask(
     ]
 
 
+def _normalize_adapter_layer_groups(
+    adapter_layer_groups: _Any,
+) -> _AdapterLayerGroups:
+    if adapter_layer_groups is None:
+        return None
+    normalized_groups: _List[_Tuple[int, ...]] = []
+    seen_layers = set()
+    for group_index, group in enumerate(adapter_layer_groups):
+        if isinstance(group, dict):
+            raw_layers = group.get("layers")
+        else:
+            raw_layers = group
+        if raw_layers is None:
+            raise ValueError(
+                "Each adapter_layer_groups entry must provide a 'layers' list or "
+                f"be a list of layer indices directly; group {group_index} did not."
+            )
+        parsed_layers = tuple(int(layer_index) for layer_index in raw_layers)
+        if len(parsed_layers) == 0:
+            raise ValueError(
+                f"adapter_layer_groups[{group_index}] must contain at least one layer."
+            )
+        if len(set(parsed_layers)) != len(parsed_layers):
+            raise ValueError(
+                f"adapter_layer_groups[{group_index}] contains duplicate layer indices."
+            )
+        overlapping_layers = sorted(set(parsed_layers) & seen_layers)
+        if overlapping_layers:
+            raise ValueError(
+                "adapter_layer_groups may not assign a layer to multiple groups; "
+                f"layer(s) {overlapping_layers} were repeated."
+            )
+        seen_layers.update(parsed_layers)
+        normalized_groups.append(parsed_layers)
+    return tuple(normalized_groups)
+
+
+def _resolve_effective_adapter_groups(
+    layer_channels: _List[int],
+    active_layer_mask: _List[bool],
+    adapter_layer_groups: _AdapterLayerGroups,
+) -> _Tuple[_List[_Tuple[int, ...]], _List[_Optional[int]]]:
+    num_layers = len(layer_channels)
+    layer_to_group_index: _List[_Optional[int]] = [None] * num_layers
+    effective_groups: _List[_Tuple[int, ...]] = []
+
+    if adapter_layer_groups is None:
+        for layer_index, is_active in enumerate(active_layer_mask):
+            if not is_active:
+                continue
+            layer_to_group_index[layer_index] = len(effective_groups)
+            effective_groups.append((layer_index,))
+        return effective_groups, layer_to_group_index
+
+    mentioned_layers = set()
+    for group_index, group in enumerate(adapter_layer_groups):
+        for layer_index in group:
+            if layer_index < 0 or layer_index >= num_layers:
+                raise ValueError(
+                    "adapter_layer_groups contains a layer index outside the inner "
+                    f"WaveNet depth: {layer_index} not in [0, {num_layers - 1}]."
+                )
+            mentioned_layers.add(layer_index)
+        active_group_layers = tuple(
+            layer_index for layer_index in group if active_layer_mask[layer_index]
+        )
+        if len(active_group_layers) == 0:
+            continue
+        group_channels = {
+            layer_channels[layer_index] for layer_index in active_group_layers
+        }
+        if len(group_channels) != 1:
+            raise ValueError(
+                "All active layers in an adapter layer group must share the same "
+                f"channel count; adapter_layer_groups[{group_index}] resolved to "
+                f"channels {sorted(group_channels)}."
+            )
+        resolved_group_index = len(effective_groups)
+        effective_groups.append(active_group_layers)
+        for layer_index in active_group_layers:
+            layer_to_group_index[layer_index] = resolved_group_index
+
+    for layer_index, is_active in enumerate(active_layer_mask):
+        if not is_active or layer_index in mentioned_layers:
+            continue
+        layer_to_group_index[layer_index] = len(effective_groups)
+        effective_groups.append((layer_index,))
+
+    return effective_groups, layer_to_group_index
+
+
 class ResidualAffineAdapter(_nn.Module):
     """
-    Dispatches z1 to a dedicated per-layer adapter based on a stable layer index.
+    Dispatches z1 to a shared-or-dedicated adapter based on a stable layer index.
 
     Standard NAM A2 WaveNet invokes the adapter once at each inner layer's
     pre-activation hook. This module keeps one shared nonlinear parameter encoder
-    and one registered affine-head adapter per inner layer, preserving the
-    existing hook traversal and deterministic export/import ordering.
+    plus a deterministic set of affine-head adapters. By default each active
+    layer gets its own heads. When adapter_layer_groups is configured, layers in
+    the same group reuse a single gamma head and beta head.
     """
 
     uses_layer_index = True
@@ -183,6 +280,7 @@ class ResidualAffineAdapter(_nn.Module):
         beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
         adapter_first_n_layers: _Optional[int] = None,
         adapter_last_n_layers: _Optional[int] = None,
+        adapter_layer_groups: _Any = None,
     ):
         super().__init__()
         if hidden_dim < 1:
@@ -200,32 +298,46 @@ class ResidualAffineAdapter(_nn.Module):
         ) = _validate_adapter_layer_selection(
             adapter_first_n_layers, adapter_last_n_layers
         )
+        self._adapter_layer_groups = _normalize_adapter_layer_groups(
+            adapter_layer_groups
+        )
         self._active_layer_mask = _resolve_active_adapter_layer_mask(
             len(self._layer_channels),
             self._adapter_first_n_layers,
             self._adapter_last_n_layers,
+        )
+        (
+            self._effective_layer_groups,
+            self._layer_to_group_index,
+        ) = _resolve_effective_adapter_groups(
+            self._layer_channels,
+            self._active_layer_mask,
+            self._adapter_layer_groups,
         )
         self._shared_encoder = _SharedParamEncoder(
             param_dim,
             hidden_dim,
             activation,
         )
-        self._adapters = _nn.ModuleList(
+        self._group_adapters = _nn.ModuleList(
             [
-                (
-                    _LayerAdapter(
-                        hidden_dim,
-                        channels,
-                        gamma_scale=self._gamma_scale,
-                        beta_scale=self._beta_scale,
-                    )
-                    if is_active
-                    else _IdentityLayerAdapter()
+                _LayerAdapter(
+                    hidden_dim,
+                    self._layer_channels[group_layers[0]],
+                    gamma_scale=self._gamma_scale,
+                    beta_scale=self._beta_scale,
                 )
-                for channels, is_active in zip(
-                    self._layer_channels, self._active_layer_mask
-                )
+                for group_layers in self._effective_layer_groups
             ]
+        )
+        identity_adapter = _IdentityLayerAdapter()
+        self._adapters = tuple(
+            (
+                identity_adapter
+                if group_index is None
+                else self._group_adapters[group_index]
+            )
+            for group_index in self._layer_to_group_index
         )
 
     def forward(
@@ -239,14 +351,14 @@ class ResidualAffineAdapter(_nn.Module):
         if not (0 <= layer_index < len(self._adapters)):
             raise IndexError(
                 f"ResidualAffineAdapter got layer_index={layer_index}, but has "
-                f"{len(self._adapters)} per-layer adapters."
+                f"{len(self._adapters)} layer dispatch slots."
             )
         if not self._active_layer_mask[layer_index]:
             return z1
         adapter = self._adapters[layer_index]
         if z1.shape[1] != self._layer_channels[layer_index]:
             raise ValueError(
-                f"Per-layer adapter {layer_index} expects C="
+                f"Adapter dispatch slot {layer_index} expects C="
                 f"{self._layer_channels[layer_index]}, got C={z1.shape[1]}."
             )
         hidden = self._shared_encoder(params) if hidden is None else hidden
@@ -286,8 +398,9 @@ class ParametricWaveNet(_BaseNet):
     WaveNet wrapper that adds parametric conditioning via a ResidualAffineAdapter.
 
     Architecture: ordinary inner WaveNet + residual affine adapter. The adapter
-    is kept on the wrapper (NOT inside the inner net) so that A2 weights import
-    unchanged and adapter weights are appended in a separate block.
+    is kept on the wrapper (NOT inside the inner net) so the inner WaveNet
+    weight layout stays unchanged and adapter weights can be appended in a
+    separate block.
 
     param_specs: ordered list of ParamSpec objects (name/min/max/default per param).
                  List order is significant — it determines positional index in the
@@ -305,6 +418,7 @@ class ParametricWaveNet(_BaseNet):
         adapter_beta_scale: float = _DEFAULT_ADAPTER_BETA_SCALE,
         adapter_first_n_layers: _Optional[int] = None,
         adapter_last_n_layers: _Optional[int] = None,
+        adapter_layer_groups: _Any = None,
     ):
         super().__init__(sample_rate=sample_rate)
         if len(param_specs) == 0:
@@ -324,6 +438,9 @@ class ParametricWaveNet(_BaseNet):
             self._adapter_last_n_layers,
         ) = _validate_adapter_layer_selection(
             adapter_first_n_layers, adapter_last_n_layers
+        )
+        self._adapter_layer_groups = _normalize_adapter_layer_groups(
+            adapter_layer_groups
         )
         param_mins = _torch.tensor([s.min for s in param_specs], dtype=_torch.float32)
         param_maxs = _torch.tensor([s.max for s in param_specs], dtype=_torch.float32)
@@ -353,6 +470,7 @@ class ParametricWaveNet(_BaseNet):
             beta_scale=self._adapter_beta_scale,
             adapter_first_n_layers=self._adapter_first_n_layers,
             adapter_last_n_layers=self._adapter_last_n_layers,
+            adapter_layer_groups=self._adapter_layer_groups,
         )
 
     # ------------------------------------------------------------------
@@ -395,6 +513,7 @@ class ParametricWaveNet(_BaseNet):
         )
         adapter_first_n_layers = config.pop("adapter_first_n_layers", None)
         adapter_last_n_layers = config.pop("adapter_last_n_layers", None)
+        adapter_layer_groups = config.pop("adapter_layer_groups", None)
         # Remaining keys are forwarded to the inner WaveNet
         net = _InnerWaveNet.init_from_config(config)
         return {
@@ -407,6 +526,7 @@ class ParametricWaveNet(_BaseNet):
             "adapter_beta_scale": adapter_beta_scale,
             "adapter_first_n_layers": adapter_first_n_layers,
             "adapter_last_n_layers": adapter_last_n_layers,
+            "adapter_layer_groups": adapter_layer_groups,
         }
 
     # ------------------------------------------------------------------
@@ -533,6 +653,10 @@ class ParametricWaveNet(_BaseNet):
             cfg["adapter_first_n_layers"] = self._adapter_first_n_layers
         if self._adapter_last_n_layers is not None:
             cfg["adapter_last_n_layers"] = self._adapter_last_n_layers
+        if self._adapter_layer_groups is not None:
+            cfg["adapter_layer_groups"] = [
+                list(group_layers) for group_layers in self._adapter_layer_groups
+            ]
         return cfg
 
     def _export_weights(self) -> _np.ndarray:

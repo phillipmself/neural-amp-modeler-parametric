@@ -7,7 +7,8 @@
         "params is an ordered array of {name, min, max, default} objects. Order is significant (positional net input). default is the export-time/reference operating point.",
         "Provide parameter values everywhere else in raw knob/display units. The model maps each parameter from its declared [min, max] range into an internal [-1, 1] range before the adapter sees it.",
         "adapter_gamma_scale and adapter_beta_scale keep the per-layer residual modulation bounded during training and export.",
-        "Optional adapter_first_n_layers or adapter_last_n_layers can limit parametric modulation to only the first or last N inner WaveNet layers."
+        "Optional adapter_first_n_layers or adapter_last_n_layers can limit parametric modulation to only the first or last N inner WaveNet layers.",
+        "adapter_layer_groups can share one gamma/beta head pair across multiple inner layers. This example uses three fixed groups over the 23 channels_8 layers: early 0-7, mid 8-15, late 16-22."
     ],
     "net": {
         "name": "ParametricWaveNet",
@@ -80,6 +81,11 @@
             "adapter_activation": "SiLU",
             "adapter_gamma_scale": 0.05,
             "adapter_beta_scale": 0.05,
+            "adapter_layer_groups": [
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [8, 9, 10, 11, 12, 13, 14, 15],
+                [16, 17, 18, 19, 20, 21, 22]
+            ],
             "head_scale": 0.01,
             "params": [
                 {"name": "gain",   "min": 0.0, "max": 10.0, "default": 5.0},

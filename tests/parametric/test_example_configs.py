@@ -42,6 +42,11 @@ def test_example_model_matches_channels_8_topology_and_hyperparameters():
     assert "params" in example["net"]["config"]
     assert example["net"]["config"]["adapter_hidden_dim"] == 8
     assert "adapter_activation" in example["net"]["config"]
+    assert example["net"]["config"]["adapter_layer_groups"] == [
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [8, 9, 10, 11, 12, 13, 14, 15],
+        [16, 17, 18, 19, 20, 21, 22],
+    ]
 
 
 def test_example_model_net_config_initializes_parametric_wavenet():
@@ -58,4 +63,4 @@ def test_example_model_adapter_param_count_matches_shared_encoder_design():
 
     adapter_param_count = sum(param.numel() for param in model._adapter.parameters())
 
-    assert adapter_param_count == 3336
+    assert adapter_param_count == 456

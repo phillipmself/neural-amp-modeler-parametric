@@ -201,6 +201,7 @@ def build_parametric_model_config(
     *,
     adapter_first_n_layers: int | None = None,
     adapter_last_n_layers: int | None = None,
+    adapter_layer_groups: _Sequence[_Sequence[int]] | None = None,
 ) -> _Dict[str, _Any]:
     adapter_first_n_layers = _normalize_optional_non_negative_int(
         adapter_first_n_layers,
@@ -234,6 +235,16 @@ def build_parametric_model_config(
                 **(
                     {"adapter_last_n_layers": adapter_last_n_layers}
                     if adapter_last_n_layers is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "adapter_layer_groups": [
+                            [int(layer_index) for layer_index in group]
+                            for group in adapter_layer_groups
+                        ]
+                    }
+                    if adapter_layer_groups is not None
                     else {}
                 ),
             },

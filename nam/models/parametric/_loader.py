@@ -77,6 +77,7 @@ def load_parametric_nam(nam_dict: dict) -> Any:
         )
         adapter_first_n_layers = config.pop("adapter_first_n_layers", None)
         adapter_last_n_layers = config.pop("adapter_last_n_layers", None)
+        adapter_layer_groups = config.pop("adapter_layer_groups", None)
         param_specs = [_ParamSpec.from_dict(d) for d in raw_specs]
 
         # The remaining config is the inner WaveNet in .nam export format.
@@ -97,6 +98,7 @@ def load_parametric_nam(nam_dict: dict) -> Any:
             adapter_beta_scale=adapter_beta_scale,
             adapter_first_n_layers=adapter_first_n_layers,
             adapter_last_n_layers=adapter_last_n_layers,
+            adapter_layer_groups=adapter_layer_groups,
         )
 
         # Weights are stored as a plain Python list in the .nam JSON; convert once

@@ -82,6 +82,19 @@ def test_build_parametric_model_config_allows_combined_adapter_layer_subset():
     assert built["net"]["config"]["adapter_last_n_layers"] == 2
 
 
+def test_build_parametric_model_config_includes_adapter_layer_groups():
+    param_specs = _helpers.build_param_specs(
+        [{"name": "gain", "min": 0.0, "max": 10.0, "default": 5.0}]
+    )
+
+    built = _helpers.build_parametric_model_config(
+        param_specs,
+        adapter_layer_groups=[[0, 1], [2, 3]],
+    )
+
+    assert built["net"]["config"]["adapter_layer_groups"] == [[0, 1], [2, 3]]
+
+
 def test_build_param_specs_requires_unique_nonempty_names():
     try:
         _helpers.build_param_specs(

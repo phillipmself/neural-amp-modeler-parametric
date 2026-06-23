@@ -383,6 +383,46 @@ def test_pa1k_adapter_layer_subset_selection_must_fit_inner_depth():
         _build_parametric({**_MULTI_C_CONFIG, "adapter_first_n_layers": 5})
 
 
+def test_pa1l_adapter_layer_groups_share_heads_within_each_group():
+    """PA1l: grouped layers reuse one adapter object per configured group."""
+    model = _build_parametric(
+        {
+            **_MULTI_C_CONFIG,
+            "adapter_layer_groups": [[0, 1], [2, 3]],
+        }
+    )
+
+    assert model._adapter_layer_groups == ((0, 1), (2, 3))
+    assert model._adapter._adapters[0] is model._adapter._adapters[1]
+    assert model._adapter._adapters[2] is model._adapter._adapters[3]
+    assert model._adapter._adapters[0] is not model._adapter._adapters[2]
+
+
+def test_pa1m_adapter_layer_groups_leave_unmentioned_layers_independent():
+    """PA1m: ungrouped layers fall back to the original one-head-per-layer behavior."""
+    model = _build_parametric(
+        {
+            **_MULTI_C_CONFIG,
+            "adapter_layer_groups": [[0, 1]],
+        }
+    )
+
+    assert model._adapter._adapters[0] is model._adapter._adapters[1]
+    assert model._adapter._adapters[2] is not model._adapter._adapters[3]
+    assert model._adapter._adapters[1] is not model._adapter._adapters[2]
+
+
+def test_pa1n_adapter_layer_groups_require_matching_channel_counts():
+    """PA1n: grouped layers must agree on channel count for shared heads."""
+    with pytest.raises(ValueError, match="must share the same channel count"):
+        _build_parametric(
+            {
+                **_MULTI_C_CONFIG,
+                "adapter_layer_groups": [[1, 2]],
+            }
+        )
+
+
 # ---------------------------------------------------------------------------
 # PA2 — mismatched param_dim raises a clear error
 # ---------------------------------------------------------------------------
