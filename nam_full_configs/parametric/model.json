@@ -1,0 +1,32 @@
+{
+    "_notes": [
+        "Example parametric model config fragment containing only parameter definitions.",
+        "Later HyperWaveNet examples can extend this with the actual WaveNet and hypernetwork settings."
+    ],
+    "net": {
+        "name": "HyperWaveNet",
+        "config": {
+            "params": [
+                {
+                    "name": "gain",
+                    "min": 0.0,
+                    "max": 10.0,
+                    "default": 5.0,
+                    "type": "continuous"
+                },
+                {
+                    "name": "mode",
+                    "min": 0,
+                    "max": 2,
+                    "default": 0,
+                    "type": "switch",
+                    "enum_names": [
+                        "clean",
+                        "crunch",
+                        "lead"
+                    ]
+                }
+            ]
+        }
+    }
+}

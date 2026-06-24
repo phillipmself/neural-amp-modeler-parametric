@@ -15,7 +15,6 @@ _MIN_MAX_SIGNED = "min_max_signed"
 # Unit min-max scaling maps the user-facing range [min, max] to [0, 1].
 _MIN_MAX_UNIT = "min_max_unit"
 _VALID_TYPES = (_CONTINUOUS, _SWITCH)
-_VALID_NORMALIZATIONS = (_MIN_MAX_SIGNED, _MIN_MAX_UNIT)
 
 
 def _is_finite(value: _Any) -> bool:
@@ -50,7 +49,6 @@ class ParamSpec:
     max: float
     default: float
     type: str = _CONTINUOUS
-    normalization: str = _MIN_MAX_SIGNED
     enum_names: _Optional[tuple[str, ...]] = None
 
     def __post_init__(self):
@@ -59,11 +57,6 @@ class ParamSpec:
         if self.type not in _VALID_TYPES:
             raise ValueError(
                 f"Unsupported ParamSpec type {self.type!r}; expected one of {_VALID_TYPES}"
-            )
-        if self.normalization not in _VALID_NORMALIZATIONS:
-            raise ValueError(
-                "Unsupported ParamSpec normalization "
-                f"{self.normalization!r}; expected one of {_VALID_NORMALIZATIONS}"
             )
         if not all(_is_finite(v) for v in (self.min, self.max, self.default)):
             raise ValueError("ParamSpec min/max/default must all be finite")
@@ -124,17 +117,12 @@ class ParamSpec:
         object.__setattr__(self, "min", min_index)
         object.__setattr__(self, "max", max_index)
         object.__setattr__(self, "default", default_index)
-        # Switch parameters are expanded to one-hot inputs, so their normalized range is [0, 1].
-        object.__setattr__(self, "normalization", _MIN_MAX_UNIT)
         object.__setattr__(self, "enum_names", enum_names)
 
     @property
-    def center(self) -> float:
-        return 0.5 * (self.min + self.max)
-
-    @property
-    def half_range(self) -> float:
-        return 0.5 * (self.max - self.min)
+    def normalization(self) -> str:
+        # Normalization mode is an internal training detail, not a user-configurable field.
+        return _MIN_MAX_UNIT if self.type == _SWITCH else _MIN_MAX_SIGNED
 
     @property
     def normalized_min(self) -> float:
@@ -160,22 +148,13 @@ class ParamSpec:
             "min": self.min,
             "max": self.max,
             "default": self.default,
-            "center": self.center,
-            "half_range": self.half_range,
             "type": self.type,
-            "normalization": self.normalization,
-            "normalized_min": self.normalized_min,
-            "normalized_max": self.normalized_max,
             "enum_names": None if self.enum_names is None else list(self.enum_names),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, _Any]) -> "ParamSpec":
         config = dict(d)
-        normalized_min = config.pop("normalized_min", None)
-        normalized_max = config.pop("normalized_max", None)
-        config.pop("center", None)
-        config.pop("half_range", None)
         required_keys = ("name", "min", "max", "default")
         missing_keys = [key for key in required_keys if key not in config]
         if missing_keys:
@@ -195,17 +174,6 @@ class ParamSpec:
             max=config["max"],
             default=config["default"],
             type=config.get("type", _CONTINUOUS),
-            normalization=config.get("normalization", _MIN_MAX_SIGNED),
             enum_names=enum_names,
         )
-        if normalized_min is not None and normalized_min != spec.normalized_min:
-            raise ValueError(
-                f"ParamSpec {spec.name!r} normalized_min {normalized_min} does not "
-                f"match normalization {spec.normalization!r}"
-            )
-        if normalized_max is not None and normalized_max != spec.normalized_max:
-            raise ValueError(
-                f"ParamSpec {spec.name!r} normalized_max {normalized_max} does not "
-                f"match normalization {spec.normalization!r}"
-            )
         return spec

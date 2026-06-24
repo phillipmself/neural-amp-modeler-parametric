@@ -1,4 +1,6 @@
 import pytest as _pytest
+from typing import Any as _Any
+from typing import cast as _cast
 
 from nam.models.parametric import ParamSpec as _ParamSpec
 
@@ -10,14 +12,14 @@ def test_continuous_spec_round_trip():
     restored = _ParamSpec.from_dict(exported)
 
     assert restored == spec
-    assert restored.center == 5.0
-    assert restored.half_range == 5.0
     assert restored.num_inputs == 1
     assert restored.normalized_min == -1.0
     assert restored.normalized_max == 1.0
     assert exported["type"] == "continuous"
-    assert exported["normalization"] == "min_max_signed"
     assert exported["enum_names"] is None
+    assert "normalization" not in exported
+    assert "normalized_min" not in exported
+    assert "normalized_max" not in exported
 
 
 def test_switch_spec_round_trip():
@@ -34,8 +36,6 @@ def test_switch_spec_round_trip():
     restored = _ParamSpec.from_dict(exported)
 
     assert restored == spec
-    assert restored.center == 1.0
-    assert restored.half_range == 1.0
     assert restored.num_inputs == 3
     assert restored.normalized_min == 0.0
     assert restored.normalized_max == 1.0
@@ -75,10 +75,6 @@ def test_switch_specs_default_to_unit_normalization():
         (
             {"name": "gain", "min": 0.0, "max": 1.0, "default": 2.0},
             "default must satisfy min <= default <= max",
-        ),
-        (
-            {"name": "gain", "min": 0.0, "max": 1.0, "default": 0.5, "normalization": "bad"},
-            "Unsupported ParamSpec normalization",
         ),
         (
             {"name": "mode", "min": 0, "max": 1, "default": 0, "type": "switch"},
@@ -145,16 +141,10 @@ def test_validation_errors(kwargs, match):
         _ParamSpec(**kwargs)
 
 
-def test_from_dict_rejects_inconsistent_normalized_bounds():
-    with _pytest.raises(ValueError, match="normalized_min"):
-        _ParamSpec.from_dict(
-            {
-                "name": "gain",
-                "min": 0.0,
-                "max": 1.0,
-                "default": 0.5,
-                "normalized_min": 0.0,
-            }
+def test_constructor_rejects_internal_normalization_argument():
+    with _pytest.raises(TypeError, match="unexpected keyword argument 'normalization'"):
+        _cast(_Any, _ParamSpec)(
+            name="gain", min=0.0, max=1.0, default=0.5, normalization="bad"
         )
 
 
