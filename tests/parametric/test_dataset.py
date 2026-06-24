@@ -55,7 +55,7 @@ def test_parametric_dataset_returns_params_x_y(tmp_path):
         }
     )
 
-    params, x, y = dataset[0]
+    x, params, y = dataset[0]
 
     assert _torch.equal(params, _torch.tensor([8.0, 1.0]))
     assert x.shape == (11,)
@@ -167,7 +167,7 @@ def test_parametric_list_config_builds_concat_dataset(tmp_path):
     assert isinstance(dataset, _ConcatDataset)
     assert all(isinstance(subdataset, _ParametricDataset) for subdataset in dataset.datasets)
     subdataset = _cast(_ParametricDataset, dataset.datasets[0])
-    params, _, _ = subdataset[0]
+    _, params, _ = subdataset[0]
     assert _torch.equal(params, _torch.tensor([2.0, 0.0]))
 
 
@@ -203,7 +203,7 @@ def test_parametric_train_and_validation_lists_use_held_out_settings(tmp_path):
     assert isinstance(validation_dataset, _ConcatDataset)
     assert len(train_dataset.datasets) == 2
     assert len(validation_dataset.datasets) == 1
-    validation_params, _, _ = _cast(_ParametricDataset, validation_dataset.datasets[0])[0]
+    _, validation_params, _ = _cast(_ParametricDataset, validation_dataset.datasets[0])[0]
     assert _torch.equal(validation_params, _torch.tensor([6.0, 2.0]))  # "lead" -> index 2
 
 

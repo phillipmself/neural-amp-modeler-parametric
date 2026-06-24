@@ -95,9 +95,11 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
     """
     Compose a stock :class:`~nam.data.Dataset` with a fixed parameter vector.
 
-    Each item is ``(params, x, y)``. ``params`` is a 1D float32 tensor in the model's
-    declared parameter order. Its entries carry mixed semantics, resolved against the
-    ParamSpecs at build time and decoded again by the model:
+    Each item is ``(x, params, y)`` — audio input first, to match the model's
+    ``forward(x, params)`` signature so the stock training loop's ``self(*args)`` works
+    unchanged. ``params`` is a 1D float32 tensor in the model's declared parameter order.
+    Its entries carry mixed semantics, resolved against the ParamSpecs at build time and
+    decoded again by the model:
 
     - continuous params  -> the raw user-facing value (e.g. ``8.0``)
     - switch params      -> the integer class index (e.g. ``"crunch"`` -> ``1.0``)
@@ -118,7 +120,7 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
 
     def __getitem__(self, idx: int) -> _Any:
         x, y = self._dataset[idx]
-        return self._params, x, y
+        return x, self._params, y
 
     def __len__(self) -> int:
         return len(self._dataset)
