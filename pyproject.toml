@@ -67,6 +67,7 @@ packages = [
     "nam.train.gui._resources",
     "nam.models",
     "nam.models._resources",
+    "nam.models.parametric",
     "nam.models.wavenet",
 ]
 

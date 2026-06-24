@@ -1,0 +1,211 @@
+"""
+Parameter metadata for parametric NAM models.
+"""
+
+import math as _math
+from dataclasses import dataclass as _dataclass
+from typing import Any as _Any
+from typing import Optional as _Optional
+
+
+_CONTINUOUS = "continuous"
+_SWITCH = "switch"
+# Signed min-max scaling maps the user-facing range [min, max] to [-1, 1].
+_MIN_MAX_SIGNED = "min_max_signed"
+# Unit min-max scaling maps the user-facing range [min, max] to [0, 1].
+_MIN_MAX_UNIT = "min_max_unit"
+_VALID_TYPES = (_CONTINUOUS, _SWITCH)
+_VALID_NORMALIZATIONS = (_MIN_MAX_SIGNED, _MIN_MAX_UNIT)
+
+
+def _is_finite(value: _Any) -> bool:
+    try:
+        return _math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_int_like(value: _Any) -> bool:
+    return _is_finite(value) and float(value).is_integer()
+
+
+def _coerce_enum_names(name: str, raw_enum_names: _Any) -> tuple[str, ...]:
+    if isinstance(raw_enum_names, (str, bytes)):
+        raise ValueError(
+            f"Switch ParamSpec {name!r} enum_names must be a sequence of names, not a string"
+        )
+    try:
+        enum_names = tuple(str(value) for value in raw_enum_names)
+    except TypeError as exc:
+        raise ValueError(
+            f"Switch ParamSpec {name!r} enum_names must be an iterable of names"
+        ) from exc
+    return enum_names
+
+
+@_dataclass(frozen=True)
+class ParamSpec:
+    name: str
+    min: float
+    max: float
+    default: float
+    type: str = _CONTINUOUS
+    normalization: str = _MIN_MAX_SIGNED
+    enum_names: _Optional[tuple[str, ...]] = None
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("ParamSpec name must be non-empty")
+        if self.type not in _VALID_TYPES:
+            raise ValueError(
+                f"Unsupported ParamSpec type {self.type!r}; expected one of {_VALID_TYPES}"
+            )
+        if self.normalization not in _VALID_NORMALIZATIONS:
+            raise ValueError(
+                "Unsupported ParamSpec normalization "
+                f"{self.normalization!r}; expected one of {_VALID_NORMALIZATIONS}"
+            )
+        if not all(_is_finite(v) for v in (self.min, self.max, self.default)):
+            raise ValueError("ParamSpec min/max/default must all be finite")
+        if self.min >= self.max:
+            raise ValueError(
+                f"ParamSpec {self.name!r} must satisfy min < max; got {self.min} >= {self.max}"
+            )
+        if not (self.min <= self.default <= self.max):
+            raise ValueError(
+                f"ParamSpec {self.name!r} default must satisfy min <= default <= max; "
+                f"got {self.min} <= {self.default} <= {self.max}"
+            )
+
+        if self.type == _CONTINUOUS:
+            if self.enum_names is not None:
+                raise ValueError(
+                    f"Continuous ParamSpec {self.name!r} cannot define enum_names"
+                )
+            object.__setattr__(self, "min", float(self.min))
+            object.__setattr__(self, "max", float(self.max))
+            object.__setattr__(self, "default", float(self.default))
+            return
+
+        if self.enum_names is None:
+            raise ValueError(f"Switch ParamSpec {self.name!r} requires enum_names")
+        enum_names = _coerce_enum_names(self.name, self.enum_names)
+        if len(enum_names) < 2:
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} must define at least two enum_names"
+            )
+        if len(set(enum_names)) != len(enum_names):
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} enum_names must be unique"
+            )
+        if not all(name for name in enum_names):
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} enum_names must all be non-empty"
+            )
+        if not all(_is_int_like(v) for v in (self.min, self.max, self.default)):
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} min/max/default must be integer indices"
+            )
+
+        min_index = int(self.min)
+        max_index = int(self.max)
+        default_index = int(self.default)
+        expected_max = len(enum_names) - 1
+        if min_index != 0 or max_index != expected_max:
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} must use min/max index bounds [0, {expected_max}]"
+            )
+        if not (min_index <= default_index <= max_index):
+            raise ValueError(
+                f"Switch ParamSpec {self.name!r} default index {default_index} "
+                f"must be within [{min_index}, {max_index}]"
+            )
+
+        object.__setattr__(self, "min", min_index)
+        object.__setattr__(self, "max", max_index)
+        object.__setattr__(self, "default", default_index)
+        # Switch parameters are expanded to one-hot inputs, so their normalized range is [0, 1].
+        object.__setattr__(self, "normalization", _MIN_MAX_UNIT)
+        object.__setattr__(self, "enum_names", enum_names)
+
+    @property
+    def center(self) -> float:
+        return 0.5 * (self.min + self.max)
+
+    @property
+    def half_range(self) -> float:
+        return 0.5 * (self.max - self.min)
+
+    @property
+    def normalized_min(self) -> float:
+        return -1.0 if self.normalization == _MIN_MAX_SIGNED else 0.0
+
+    @property
+    def normalized_max(self) -> float:
+        return 1.0
+
+    @property
+    def num_inputs(self) -> int:
+        if self.type == _CONTINUOUS:
+            return 1
+        if self.enum_names is None:
+            raise RuntimeError(
+                f"Switch ParamSpec {self.name!r} is missing enum_names after validation"
+            )
+        return len(self.enum_names)
+
+    def to_dict(self) -> dict[str, _Any]:
+        return {
+            "name": self.name,
+            "min": self.min,
+            "max": self.max,
+            "default": self.default,
+            "center": self.center,
+            "half_range": self.half_range,
+            "type": self.type,
+            "normalization": self.normalization,
+            "normalized_min": self.normalized_min,
+            "normalized_max": self.normalized_max,
+            "enum_names": None if self.enum_names is None else list(self.enum_names),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, _Any]) -> "ParamSpec":
+        config = dict(d)
+        normalized_min = config.pop("normalized_min", None)
+        normalized_max = config.pop("normalized_max", None)
+        config.pop("center", None)
+        config.pop("half_range", None)
+        required_keys = ("name", "min", "max", "default")
+        missing_keys = [key for key in required_keys if key not in config]
+        if missing_keys:
+            missing_keys_str = ", ".join(missing_keys)
+            raise ValueError(
+                f"ParamSpec config is missing required field(s): {missing_keys_str}"
+            )
+        raw_enum_names = config.get("enum_names")
+        enum_names = (
+            None
+            if raw_enum_names is None
+            else _coerce_enum_names(str(config["name"]), raw_enum_names)
+        )
+        spec = cls(
+            name=config["name"],
+            min=config["min"],
+            max=config["max"],
+            default=config["default"],
+            type=config.get("type", _CONTINUOUS),
+            normalization=config.get("normalization", _MIN_MAX_SIGNED),
+            enum_names=enum_names,
+        )
+        if normalized_min is not None and normalized_min != spec.normalized_min:
+            raise ValueError(
+                f"ParamSpec {spec.name!r} normalized_min {normalized_min} does not "
+                f"match normalization {spec.normalization!r}"
+            )
+        if normalized_max is not None and normalized_max != spec.normalized_max:
+            raise ValueError(
+                f"ParamSpec {spec.name!r} normalized_max {normalized_max} does not "
+                f"match normalization {spec.normalization!r}"
+            )
+        return spec
