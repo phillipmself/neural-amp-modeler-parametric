@@ -10,6 +10,10 @@ from .. import factory as _factory
 from ._dataset import data_config_from_model
 from ._dataset import init_dataset as _init_dataset
 from ._dataset import ParametricDataset
+from ._export import bake
+from ._export import bake_to_files
+from ._export import export_parametric
+from ._export import output_scale_from_datasets
 from ._hypernet import Hypernetwork
 from ._hyperwavenet import HyperWaveNet
 from ._spec import ParamSpec
@@ -22,5 +26,9 @@ __all__ = [
     "HyperWaveNet",
     "ParamSpec",
     "ParametricDataset",
+    "bake",
+    "bake_to_files",
     "data_config_from_model",
+    "export_parametric",
+    "output_scale_from_datasets",
 ]

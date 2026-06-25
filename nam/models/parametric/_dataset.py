@@ -91,6 +91,49 @@ def _resolve_continuous_value(name: str, raw_value: _Any) -> float:
     return value
 
 
+def resolve_named_params(
+    raw_params: _Any,
+    param_specs: tuple[_ParamSpec, ...],
+) -> _torch.Tensor:
+    """
+    Resolve a named ``{name: value}`` mapping into a positional ``(P,)`` float tensor in the
+    declared ``param_specs`` order. Switches accept an enum name or integer index; continuous
+    values pass through unclamped. Shared by the dataset and the export bake path so both use
+    one resolver.
+    """
+    if not isinstance(raw_params, _Mapping):
+        raise ValueError("params must be a mapping from parameter name to raw value")
+
+    param_names = tuple(spec.name for spec in param_specs)
+    expected_names = set(param_names)
+    provided_names = {str(name) for name in raw_params.keys()}
+    missing_names = [name for name in param_names if name not in provided_names]
+    if missing_names:
+        raise ValueError(
+            "params is missing declared parameter name(s): " + ", ".join(missing_names)
+        )
+    unknown_names = sorted(provided_names - expected_names)
+    if unknown_names:
+        raise ValueError(
+            "params contains unknown parameter name(s): " + ", ".join(unknown_names)
+        )
+
+    resolved_values = []
+    for spec in param_specs:
+        raw_value = raw_params[spec.name]
+        if spec.type == "switch":
+            if spec.enum_names is None:
+                raise RuntimeError(
+                    f"Switch ParamSpec {spec.name!r} is missing enum_names after validation"
+                )
+            resolved_values.append(
+                _resolve_switch_value(spec.name, raw_value, spec.enum_names)
+            )
+        else:
+            resolved_values.append(_resolve_continuous_value(spec.name, raw_value))
+    return _torch.tensor(resolved_values, dtype=_torch.float32)
+
+
 class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
     """
     Compose a stock :class:`~nam.data.Dataset` with a fixed parameter vector.
@@ -163,37 +206,7 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
         raw_params: _Any,
         param_specs: tuple[_ParamSpec, ...],
     ) -> _torch.Tensor:
-        if not isinstance(raw_params, _Mapping):
-            raise ValueError("params must be a mapping from parameter name to raw value")
-
-        param_names = tuple(spec.name for spec in param_specs)
-        expected_names = set(param_names)
-        provided_names = {str(name) for name in raw_params.keys()}
-        missing_names = [name for name in param_names if name not in provided_names]
-        if missing_names:
-            raise ValueError(
-                "params is missing declared parameter name(s): " + ", ".join(missing_names)
-            )
-        unknown_names = sorted(provided_names - expected_names)
-        if unknown_names:
-            raise ValueError(
-                "params contains unknown parameter name(s): " + ", ".join(unknown_names)
-            )
-
-        resolved_values = []
-        for spec in param_specs:
-            raw_value = raw_params[spec.name]
-            if spec.type == "switch":
-                if spec.enum_names is None:
-                    raise RuntimeError(
-                        f"Switch ParamSpec {spec.name!r} is missing enum_names after validation"
-                    )
-                resolved_values.append(
-                    _resolve_switch_value(spec.name, raw_value, spec.enum_names)
-                )
-            else:
-                resolved_values.append(_resolve_continuous_value(spec.name, raw_value))
-        return _torch.tensor(resolved_values, dtype=_torch.float32)
+        return resolve_named_params(raw_params, param_specs)
 
     @classmethod
     def _parse_param_specs(cls, config: dict[str, _Any]) -> tuple[_ParamSpec, ...]:

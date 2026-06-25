@@ -154,6 +154,17 @@ class HyperWaveNet(_ParametricNet):
         self._wavenet_config["head_scale"] = float(self._template._head_scale)
 
     def _export_inner_config(self) -> dict[str, _Any]:
+        # NOTE ON SCHEMA: the parametric `.nam` stores the base WaveNet config in the
+        # *init/parse* layout (`layers_configs`, raw layer keys), NOT the canonical stock
+        # export layout (`layers` + `head1x1`/`layer1x1`/flat-FiLM keys that `init_from_nam`
+        # produces). This is deliberate: HyperWaveNet has a single construction entry point
+        # (`parse_config` -> `WaveNet.init_from_config`), so reusing the init layout lets the
+        # exact same path reconstruct both a training config and a reloaded `.nam` with no
+        # export->init conversion step. The trade-off is that the base sub-config does not
+        # byte-match a stock WaveNet `.nam`'s config (the *weights* still use stock export
+        # order). The bake path (arch "WaveNet") is the one that must be stock-compatible, and
+        # it is; the parametric file targets a future HyperWaveNet-aware runtime that parses
+        # this self-consistent layout directly.
         self._sync_wavenet_config_state()
         config = _deepcopy(self._wavenet_config)
         config["hypernet"] = _deepcopy(self._hypernet.config)
