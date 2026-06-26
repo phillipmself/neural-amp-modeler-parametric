@@ -3,7 +3,8 @@ Parametric WaveNet wrapper built from a frozen template plus generated weight de
 
 Exported weight layout:
 1. Inner WaveNet weights in the stock WaveNet export order.
-2. Hypernetwork parameters in ``named_parameters()`` order.
+2. Hypernetwork serialized state: parameters in ``named_parameters()`` order, then the
+   low-rank anchor buffer.
 """
 
 from collections.abc import Mapping as _Mapping
@@ -155,10 +156,7 @@ class HyperWaveNet(_ParametricNet):
         tensors = [
             _torch.from_numpy(self._template.export_weights()).to(dtype=_torch.float32)
         ]
-        tensors.extend(
-            parameter.detach().reshape(-1).cpu()
-            for _, parameter in self._hypernet.named_parameters()
-        )
+        tensors.append(self._hypernet.export_state())
         return _torch.cat(tensors).numpy()
 
     def import_weights(self, weights: _WeightsLike, i: int = 0) -> int:
@@ -172,7 +170,6 @@ class HyperWaveNet(_ParametricNet):
             )
 
         i = self._template.import_weights(weights_tensor, i)
-        hypernet_parameters = tuple(self._hypernet.named_parameters())
         # Tail-ownership assumption: the hypernet weights are expected to run to the END of
         # the blob, so `remaining` is everything after the base. `remaining == 0` seeds the
         # base only (e.g. from a stock WaveNet checkpoint) and leaves the hypernet as-is;
@@ -181,7 +178,7 @@ class HyperWaveNet(_ParametricNet):
         # weights owned by another module, so HyperWaveNet can't yet be embedded as a
         # sub-component of a larger (e.g. packed) blob.
         remaining = len(weights_tensor) - i
-        expected = sum(parameter.numel() for _, parameter in hypernet_parameters)
+        expected = self._hypernet.state_count()
         if remaining == 0:
             return i
         if remaining != expected:
@@ -189,13 +186,4 @@ class HyperWaveNet(_ParametricNet):
                 f"Expected either 0 or {expected} hypernetwork weights after the base "
                 f"WaveNet blob, but found {remaining}"
             )
-
-        for _, parameter in hypernet_parameters:
-            n = parameter.numel()
-            parameter.data.copy_(
-                weights_tensor[i : i + n]
-                .to(device=parameter.device, dtype=parameter.dtype)
-                .reshape(parameter.shape)
-            )
-            i += n
-        return i
+        return self._hypernet.import_state(weights_tensor, i)

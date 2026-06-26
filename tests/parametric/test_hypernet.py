@@ -364,6 +364,41 @@ def test_param_count_positive_and_gradients_flow():
     assert any(name.startswith("_trunk.") for name in nonzero_grad_names)
 
 
+@_pytest.mark.parametrize(
+    ("mode", "rank"),
+    (
+        ("low_rank", 2),
+        ("full", None),
+    ),
+)
+def test_serialized_state_matches_state_dict_size(mode: str, rank: int | None):
+    hypernet = _Hypernetwork(
+        input_dim=3,
+        named_shapes={"weight": _torch.Size((4, 4))},
+        target_names=("weight",),
+        mode=mode,
+        rank=rank,
+    )
+
+    assert hypernet.state_count() == sum(
+        tensor.numel() for tensor in hypernet.state_dict().values()
+    )
+    assert hypernet.export_state().numel() == hypernet.state_count()
+
+
+def test_import_state_rejects_non_flat_tensor():
+    hypernet = _Hypernetwork(
+        input_dim=3,
+        named_shapes={"weight": _torch.Size((4, 4))},
+        target_names=("weight",),
+        mode="low_rank",
+        rank=2,
+    )
+
+    with _pytest.raises(ValueError, match="flat 1-D tensor"):
+        hypernet.import_state(hypernet.export_state().reshape(-1, 1))
+
+
 def test_config_round_trips_with_explicit_selector():
     named_shapes = _channels_8_named_shapes()
     hypernet = _Hypernetwork.from_config(

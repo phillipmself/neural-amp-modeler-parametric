@@ -485,6 +485,42 @@ class Hypernetwork(_nn.Module):
             if parameter.requires_grad
         )
 
+    def state_count(self) -> int:
+        return sum(tensor.numel() for tensor in self._serialized_tensors())
+
+    def export_state(self) -> _torch.Tensor:
+        return _torch.cat(
+            [tensor.detach().reshape(-1).cpu() for tensor in self._serialized_tensors()]
+        )
+
+    def import_state(self, weights: _torch.Tensor, i: int = 0) -> int:
+        if weights.ndim != 1:
+            raise ValueError(
+                f"Hypernetwork state must be a flat 1-D tensor; got shape {tuple(weights.shape)}"
+            )
+        expected = self.state_count()
+        remaining = len(weights) - i
+        if remaining != expected:
+            raise ValueError(
+                f"Expected {expected} serialized hypernetwork values, but found {remaining}"
+            )
+
+        with _torch.no_grad():
+            for tensor in self._serialized_tensors():
+                n = tensor.numel()
+                tensor.copy_(
+                    weights[i : i + n]
+                    .to(device=tensor.device, dtype=tensor.dtype)
+                    .reshape(tensor.shape)
+                )
+                i += n
+        return i
+
+    def _serialized_tensors(self) -> tuple[_torch.Tensor, ...]:
+        return tuple(parameter for _, parameter in self.named_parameters()) + (
+            _cast(_torch.Tensor, self._low_rank_anchor),
+        )
+
     def _build_low_rank_anchor(self) -> _torch.Tensor:
         anchor = self._final.bias.detach().clone()
         if self._low_rank_seed_std <= 0.0:

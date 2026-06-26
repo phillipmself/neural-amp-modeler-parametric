@@ -212,14 +212,19 @@ def test_bake_to_files_rejects_duplicate_basenames(tmp_path):
 
 def test_export_parametric_round_trips_through_factory(tmp_path):
     model = _make_nonzero_model()
+    with _torch.no_grad():
+        _cast(_torch.Tensor, model._hypernet._low_rank_anchor).add_(0.125)
     _export_parametric(model, tmp_path)
     model_dict = _load_nam(tmp_path / "model.nam")
     base_len = len(model._template.export_weights())
 
-    round_tripped = _factory.init(
-        "HyperWaveNet",
-        args=(
-            {**model_dict["config"], "sample_rate": model_dict.get("sample_rate")},
+    round_tripped = _cast(
+        _HyperWaveNet,
+        _factory.init(
+            "HyperWaveNet",
+            args=(
+                {**model_dict["config"], "sample_rate": model_dict.get("sample_rate")},
+            ),
         ),
     )
     end = round_tripped.import_weights(model_dict["weights"])
@@ -233,8 +238,14 @@ def test_export_parametric_round_trips_through_factory(tmp_path):
     assert set(model_dict["config"]) == {"head", "head_scale", "hypernet", "layers", "params"}
     assert "layers_configs" not in model_dict["config"]
     assert "hypernet" in model_dict["config"]
-    assert len(model_dict["weights"]) == base_len + model._hypernet.param_count()
+    assert len(model_dict["weights"]) == base_len + model._hypernet.state_count()
     assert end == len(model_dict["weights"])
+    for (model_name, model_tensor), (round_trip_name, round_trip_tensor) in zip(
+        model._hypernet.state_dict().items(),
+        round_tripped._hypernet.state_dict().items(),
+    ):
+        assert model_name == round_trip_name
+        assert _torch.equal(model_tensor, round_trip_tensor)
     assert _torch.allclose(
         round_tripped(x, params, pad_start=False),
         model(x, params, pad_start=False),

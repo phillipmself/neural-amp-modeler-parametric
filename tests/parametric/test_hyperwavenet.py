@@ -4,6 +4,7 @@ from collections.abc import Mapping as _Mapping
 from contextlib import contextmanager as _contextmanager
 from copy import deepcopy as _deepcopy
 from functools import lru_cache as _lru_cache
+from typing import cast as _cast
 
 import numpy as _np
 import torch as _torch
@@ -230,16 +231,16 @@ def test_import_weights_accepts_stock_wavenet_blob_for_base_seed_only():
     stock = _InnerWaveNet.init_from_config(_channels_8_wavenet_config())
     stock_weights = stock.export_weights()
     hypernet_before = {
-        name: parameter.detach().clone()
-        for name, parameter in model._hypernet.named_parameters()
+        name: tensor.detach().clone()
+        for name, tensor in model._hypernet.state_dict().items()
     }
 
     end = model.import_weights(stock_weights)
 
     assert end == len(stock_weights)
     assert _np.allclose(model._template.export_weights(), stock_weights)
-    for name, parameter in model._hypernet.named_parameters():
-        assert _torch.equal(parameter, hypernet_before[name])
+    for name, tensor in model._hypernet.state_dict().items():
+        assert _torch.equal(tensor, hypernet_before[name])
 
 
 def test_imported_stock_head_scale_stays_in_sync_for_export():
@@ -260,15 +261,17 @@ def test_export_weights_round_trip_restores_base_and_hypernetwork():
     config = _hyperwavenet_config(hypernet={"hidden_sizes": [5]})
     first = _HyperWaveNet.init_from_config(config)
     second = _HyperWaveNet.init_from_config(config)
+    with _torch.no_grad():
+        _cast(_torch.Tensor, first._hypernet._low_rank_anchor).add_(0.125)
     first_weights = first._export_weights()
 
     end = second.import_weights(first_weights)
 
     assert end == len(first_weights)
     assert _np.allclose(second._template.export_weights(), first._template.export_weights())
-    for (first_name, first_parameter), (second_name, second_parameter) in zip(
-        first._hypernet.named_parameters(),
-        second._hypernet.named_parameters(),
+    for (first_name, first_tensor), (second_name, second_tensor) in zip(
+        first._hypernet.state_dict().items(),
+        second._hypernet.state_dict().items(),
     ):
         assert first_name == second_name
-        assert _torch.equal(first_parameter, second_parameter)
+        assert _torch.equal(first_tensor, second_tensor)
