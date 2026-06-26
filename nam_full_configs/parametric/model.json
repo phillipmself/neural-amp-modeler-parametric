@@ -1,11 +1,77 @@
 {
     "_notes": [
-        "Example parametric model config fragment containing only parameter definitions.",
-        "Later HyperWaveNet examples can extend this with the actual WaveNet and hypernetwork settings."
+        "Parametric HyperWaveNet training config based on the packed channels_8 WaveNet.",
+        "The inner WaveNet stays frozen as a class definition; HyperWaveNet runs it through",
+        "torch.func.functional_call with generated deltas for a cheap subset of the weights."
     ],
     "net": {
         "name": "HyperWaveNet",
         "config": {
+            "layers_configs": [
+                {
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "channels": 8,
+                    "kernel_sizes": [
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        15,
+                        15,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6,
+                        6
+                    ],
+                    "dilations": [
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239,
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239,
+                        1,
+                        13,
+                        1,
+                        3,
+                        7,
+                        17,
+                        41,
+                        101,
+                        239
+                    ],
+                    "activation": "LeakyReLU",
+                    "gated": false,
+                    "head": {
+                        "out_channels": 1,
+                        "kernel_size": 16,
+                        "bias": true
+                    }
+                }
+            ],
+            "head_scale": 0.01,
             "params": [
                 {
                     "name": "gain",
@@ -26,7 +92,22 @@
                         "lead"
                     ]
                 }
-            ]
+            ],
+            "hypernet": {}
+        }
+    },
+    "loss": {
+        "val_loss": "esr",
+        "mrstft_weight": 0.0005
+    },
+    "optimizer": {
+        "lr": 0.004,
+        "weight_decay": 3.17e-07
+    },
+    "lr_scheduler": {
+        "class": "ExponentialLR",
+        "kwargs": {
+            "gamma": 0.994
         }
     }
 }

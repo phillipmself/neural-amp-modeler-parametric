@@ -1,0 +1,23 @@
+{
+    "_notes": [
+        "Mirrors the standard demo learning config for parametric training.",
+        "Best-checkpoint selection monitors the held-out",
+        "(unseen-audio/unseen-param) validation val_loss.",
+        "Optional threshold_esr early stopping uses the held-out ESR metric."
+    ],
+    "train_dataloader": {
+        "batch_size": 16,
+        "shuffle": true,
+        "pin_memory": true,
+        "drop_last": true,
+        "num_workers": 0
+    },
+    "val_dataloader": {},
+    "trainer": {
+        "accelerator": "gpu",
+        "devices": 1,
+        "max_epochs": 10
+    },
+    "threshold_esr": null,
+    "trainer_fit_kwargs": {}
+}
