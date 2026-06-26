@@ -193,6 +193,36 @@ def test_backward_reaches_base_template_and_hypernetwork():
     )
 
 
+def test_batched_duplicate_params_share_conditioned_forward_calls():
+    model = _HyperWaveNet.init_from_config(_hyperwavenet_config())
+    x = _torch.randn(5, model.receptive_field + 8)
+    params = _torch.tensor(
+        [
+            [4.0, 0.0],
+            [4.0, 0.0],
+            [7.0, 2.0],
+            [1.0, 1.0],
+            [7.0, 2.0],
+        ],
+        dtype=_torch.float32,
+    )
+    batch_sizes = []
+    real_apply = model._apply_conditioned_weights
+
+    def _counting_apply(
+        x: _torch.Tensor, weight_dict: dict[str, _torch.Tensor]
+    ) -> _torch.Tensor:
+        batch_sizes.append(x.shape[0])
+        return real_apply(x, weight_dict)
+
+    setattr(model, "_apply_conditioned_weights", _counting_apply)
+
+    y = model(x, params, pad_start=False)
+
+    assert y.shape == (5, 9)
+    assert sorted(batch_sizes) == [1, 2, 2]
+
+
 def test_slimmable_batch_draws_one_random_width_per_forward():
     model = _HyperWaveNet.init_from_config(_hyperwavenet_config(slimmable=True))
     x = _torch.randn(3, model.receptive_field + 8)

@@ -123,28 +123,31 @@ class HyperWaveNet(_ParametricNet):
                 self._assemble_weight_dict(self._hypernet.generate(p)),
             )
 
-        # Per-sample weights => one functional_call per sample. Deliberately a Python loop,
-        # not vmap over functional_call: (1) the slimmable path mutates module state
-        # (`_slimming_value`) once per forward (set in `_forward_mps_safe`) and a single width
-        # must span the batch, and (2) vmap over the dilated Conv1d is problematic. The cost
-        # is bounded -- `generate` is batched (called once) and the shared dilated convs (~82%
-        # of the params) are passed by reference, so the loop only re-adds the cheap subset.
-        deltas = self._hypernet.generate(p)
         if x.shape[0] != p.shape[0]:
             raise ValueError(
                 f"Input batch size {x.shape[0]} must match encoded params batch size {p.shape[0]}"
             )
-        outputs = []
-        for i in range(x.shape[0]):
-            outputs.append(
-                self._apply_conditioned_weights(
-                    x[i : i + 1].contiguous(),
-                    self._assemble_weight_dict(
-                        {name: delta[i] for name, delta in deltas.items()}
-                    ),
-                )[0]
+
+        # Batched parametric training often repeats the same control setting across many
+        # windows from one capture. Group those rows so each unique setting runs one
+        # functional_call over a real mini-batch instead of one call per sample.
+        unique_p, inverse = _torch.unique(p, dim=0, return_inverse=True)
+        deltas = self._hypernet.generate(unique_p)
+        outputs = None
+        for i in range(unique_p.shape[0]):
+            mask = inverse == i
+            y_group = self._apply_conditioned_weights(
+                x[mask].contiguous(),
+                self._assemble_weight_dict(
+                    {name: delta[i] for name, delta in deltas.items()}
+                ),
             )
-        return _torch.stack(outputs, dim=0)
+            if outputs is None:
+                outputs = y_group.new_empty((x.shape[0], y_group.shape[1]))
+            outputs[mask] = y_group
+        if outputs is None:
+            raise RuntimeError("Expected at least one unique parameter row")
+        return outputs
 
     def _assemble_weight_dict(
         self, deltas: _Mapping[str, _torch.Tensor]

@@ -10,12 +10,21 @@
         "shuffle": true,
         "pin_memory": true,
         "drop_last": true,
-        "num_workers": 0
+        "num_workers": 2,
+        "persistent_workers": true,
+        "prefetch_factor": 2
     },
-    "val_dataloader": {},
+    "val_dataloader": {
+        "batch_size": 16,
+        "num_workers": 2,
+        "persistent_workers": true,
+        "prefetch_factor": 2
+    },
     "trainer": {
         "accelerator": "gpu",
         "devices": 1,
+        "precision": "16-mixed",
+        "benchmark": true,
         "max_epochs": 10
     },
     "threshold_esr": null,
