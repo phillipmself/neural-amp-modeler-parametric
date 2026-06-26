@@ -7,10 +7,13 @@ from functools import lru_cache as _lru_cache
 from typing import cast as _cast
 
 import numpy as _np
+import pytest as _pytest
 import torch as _torch
 
 from nam.models import factory as _factory
+from nam.models.parametric import Hypernetwork as _Hypernetwork
 from nam.models.parametric import HyperWaveNet as _HyperWaveNet
+from nam.models.parametric import ParamSpec as _ParamSpec
 from nam.models.wavenet._wavenet import WaveNet as _InnerWaveNet
 
 
@@ -77,6 +80,34 @@ def _hyperwavenet_config(
     return config
 
 
+def _tiny_wavenet_internal_config() -> dict:
+    return {
+        "layers_configs": [
+            {
+                "input_size": 1,
+                "condition_size": 1,
+                "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
+                "channels": 2,
+                "kernel_size": 2,
+                "dilations": [1],
+                "activation": "Tanh",
+            }
+        ],
+        "head_scale": 1.0,
+    }
+
+
+def _hyperwavenet_config_with_condition_dsp() -> dict:
+    condition_dsp = _InnerWaveNet.init_from_config(_tiny_wavenet_internal_config())
+    config = _hyperwavenet_config()
+    config["condition_dsp"] = {
+        "architecture": "WaveNet",
+        "config": condition_dsp.export_config(),
+        "weights": condition_dsp.export_weights().tolist(),
+    }
+    return config
+
+
 def test_factory_init_registers_hyperwavenet_and_injects_default_selector():
     model = _factory.init("HyperWaveNet", args=(_hyperwavenet_config(),))
 
@@ -84,6 +115,41 @@ def test_factory_init_registers_hyperwavenet_and_injects_default_selector():
     assert model.receptive_field == 6347
     assert model._hypernet.config["selector"] == {"exclude_suffixes": ["_conv.weight"]}
     assert len(model._hypernet.target_names) == 95
+
+
+def test_condition_dsp_config_is_rejected():
+    with _pytest.raises(NotImplementedError, match="condition_dsp"):
+        _HyperWaveNet.init_from_config(_hyperwavenet_config_with_condition_dsp())
+
+
+def test_condition_dsp_template_is_rejected():
+    template = _InnerWaveNet.init_from_config(
+        {
+            **_tiny_wavenet_internal_config(),
+            "condition_dsp": {
+                "name": "WaveNet",
+                "config": _tiny_wavenet_internal_config(),
+            },
+        }
+    )
+    param_specs = tuple(
+        _ParamSpec.from_dict(spec) for spec in _hyperwavenet_config()["params"]
+    )
+    hypernet = _Hypernetwork.from_config(
+        input_dim=sum(spec.num_inputs for spec in param_specs),
+        named_shapes={
+            name: parameter.shape for name, parameter in template.named_parameters()
+        },
+        config={"selector": {"exclude_suffixes": ["_conv.weight"]}},
+    )
+
+    with _pytest.raises(NotImplementedError, match="condition_dsp"):
+        _HyperWaveNet(
+            template=template,
+            hypernet=hypernet,
+            param_specs=param_specs,
+            sample_rate=48_000.0,
+        )
 
 
 def test_zero_init_matches_bare_template_for_shared_and_batched_params():

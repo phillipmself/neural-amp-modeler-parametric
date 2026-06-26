@@ -62,6 +62,53 @@ def _make_parametric_dataset(*, y_scale):
     )
 
 
+def _template_export_offsets(model: _HyperWaveNet) -> dict[str, int]:
+    offsets = {}
+    offset = 0
+
+    def add_conv(prefix: str, conv) -> None:
+        nonlocal offset
+        if conv.weight is not None:
+            offsets[f"{prefix}.weight"] = offset
+            offset += conv.weight.numel()
+        if conv.bias is not None:
+            offsets[f"{prefix}.bias"] = offset
+            offset += conv.bias.numel()
+
+    for layer_array_i, layer_array in enumerate(model._template._layer_arrays):
+        prefix = f"_layer_arrays.{layer_array_i}"
+        add_conv(f"{prefix}._rechannel", layer_array._rechannel)
+        for layer_i, layer in enumerate(_cast(_Sequence, layer_array._layers)):
+            layer_prefix = f"{prefix}._layers.{layer_i}"
+            add_conv(f"{layer_prefix}._conv", layer._conv)
+            add_conv(f"{layer_prefix}._input_mixer", layer._input_mixer)
+            if layer._layer1x1 is not None:
+                add_conv(f"{layer_prefix}._layer1x1", layer._layer1x1)
+            if layer.head1x1 is not None:
+                add_conv(f"{layer_prefix}._head1x1", layer.head1x1)
+            for film_name in (
+                "_conv_pre_film",
+                "_conv_post_film",
+                "_input_mixin_pre_film",
+                "_input_mixin_post_film",
+                "_activation_pre_film",
+                "_activation_post_film",
+                "_layer1x1_post_film",
+                "_head1x1_post_film",
+            ):
+                film = getattr(layer, film_name)
+                if film is not None:
+                    add_conv(f"{layer_prefix}.{film_name}._film", film._film)
+        add_conv(f"{prefix}._head_rechannel", layer_array._head_rechannel)
+
+    if model._template._head is not None:
+        for layer_i, layer in enumerate(_cast(_Sequence, model._template._head._layers)):
+            add_conv(f"_head._layers.layer_{layer_i}.1", _cast(_Sequence, layer)[1])
+
+    assert offset + 1 == len(model._template.export_weights())
+    return offsets
+
+
 def test_bake_matches_hyperwavenet_forward_for_named_settings():
     model = _make_nonzero_model()
     params = {"gain": 8.0, "mode": "crunch"}
@@ -238,6 +285,25 @@ def test_export_parametric_round_trips_through_factory(tmp_path):
     assert set(model_dict["config"]) == {"head", "head_scale", "hypernet", "layers", "params"}
     assert "layers_configs" not in model_dict["config"]
     assert "hypernet" in model_dict["config"]
+    delta_map = model_dict["config"]["hypernet"]["delta_map"]
+    expected_offsets = _template_export_offsets(model)
+    assert [entry["name"] for entry in delta_map] == list(model._hypernet.target_names)
+    for entry in delta_map:
+        name = entry["name"]
+        assert entry["export_offset"] == expected_offsets[name]
+        assert entry["numel"] == model._template.get_parameter(name).numel()
+        if entry["mode"] == "low_rank":
+            assert set(entry) == {
+                "export_offset",
+                "mode",
+                "name",
+                "numel",
+                "out_features",
+                "rank",
+                "rest_features",
+            }
+        else:
+            assert set(entry) == {"export_offset", "mode", "name", "numel"}
     assert len(model_dict["weights"]) == base_len + model._hypernet.state_count()
     assert end == len(model_dict["weights"])
     for (model_name, model_tensor), (round_trip_name, round_trip_tensor) in zip(

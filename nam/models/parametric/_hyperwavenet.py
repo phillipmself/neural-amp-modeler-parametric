@@ -25,6 +25,7 @@ from ._hypernet import Hypernetwork as _Hypernetwork
 from ._spec import ParamSpec as _ParamSpec
 
 _DEFAULT_HYPERNET_SELECTOR = {"exclude_suffixes": ["_conv.weight"]}
+_DELTA_MAP_KEY = "delta_map"
 _WeightsLike = _Sequence[float] | _np.ndarray | _torch.Tensor
 
 
@@ -38,6 +39,7 @@ class HyperWaveNet(_ParametricNet):
         sample_rate: _Optional[float] = None,
     ):
         super().__init__(param_specs=param_specs, sample_rate=sample_rate)
+        self._validate_supported_template(template)
         self._template = template
         self._hypernet = hypernet
 
@@ -51,8 +53,19 @@ class HyperWaveNet(_ParametricNet):
         param_specs = tuple(_ParamSpec.from_dict(spec) for spec in raw_params)
         if len(param_specs) == 0:
             raise ValueError("HyperWaveNet config must define at least one ParamSpec")
+        if "condition_dsp" in config:
+            # Block this until HyperWaveNet has an end-to-end nested-DSP story. WaveNet
+            # exports condition_dsp weights inside config["condition_dsp"]["weights"],
+            # but HyperWaveNet rebuilds its template from config only via
+            # convert_nam_wavenet_config()->WaveNet.init_from_config(), which would
+            # silently drop those nested weights and leave the condition DSP random.
+            raise NotImplementedError(
+                "HyperWaveNet does not support condition_dsp because nested WaveNet "
+                "condition_dsp weights are not copied into the parametric template"
+            )
 
         hypernet_config = dict(config.pop("hypernet", {}))
+        hypernet_config.pop(_DELTA_MAP_KEY, None)
         if "selector" not in hypernet_config:
             hypernet_config["selector"] = dict(_DEFAULT_HYPERNET_SELECTOR)
 
@@ -72,6 +85,13 @@ class HyperWaveNet(_ParametricNet):
             "param_specs": param_specs,
             "sample_rate": sample_rate,
         }
+
+    @staticmethod
+    def _validate_supported_template(template: _WaveNet) -> None:
+        if template._condition_dsp is not None:
+            raise NotImplementedError(
+                "HyperWaveNet does not support WaveNet templates with condition_dsp"
+            )
 
     @property
     def pad_start_default(self) -> bool:
@@ -149,8 +169,29 @@ class HyperWaveNet(_ParametricNet):
 
     def _export_inner_config(self) -> dict[str, _Any]:
         config = self._template.export_config(sample_rate=self.sample_rate)
-        config["hypernet"] = dict(self._hypernet.config)
+        hypernet_config = dict(self._hypernet.config)
+        hypernet_config[_DELTA_MAP_KEY] = self._export_delta_map()
+        config["hypernet"] = hypernet_config
         return config
+
+    def _export_delta_map(self) -> list[dict[str, _Any]]:
+        export_offsets = {}
+        offset = 0
+        for name, parameter in self._template.named_parameters():
+            export_offsets[name] = offset
+            offset += parameter.numel()
+
+        delta_map = []
+        for target in self._hypernet.export_target_metadata():
+            name = _cast(str, target["name"])
+            if name not in export_offsets:
+                raise RuntimeError(
+                    f"Hypernetwork target {name!r} is missing from the template export order"
+                )
+            entry = dict(target)
+            entry["export_offset"] = export_offsets[name]
+            delta_map.append(entry)
+        return delta_map
 
     def _export_weights(self) -> _np.ndarray:
         tensors = [

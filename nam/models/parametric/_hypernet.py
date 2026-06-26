@@ -478,6 +478,29 @@ class Hypernetwork(_nn.Module):
             for layout, chunk, anchor in zip(self._target_layouts, chunks, anchors)
         }
 
+    def export_target_metadata(self) -> list[dict[str, _Any]]:
+        metadata = []
+        for layout in self._target_layouts:
+            target: dict[str, _Any] = {
+                "name": layout.name,
+                "mode": layout.mode,
+                "numel": layout.shape.numel(),
+            }
+            if layout.is_low_rank:
+                if (
+                    layout.rank is None
+                    or layout.out_features is None
+                    or layout.rest_features is None
+                ):
+                    raise RuntimeError(
+                        f"Low-rank target layout for {layout.name!r} is incomplete"
+                    )
+                target["rank"] = layout.rank
+                target["out_features"] = layout.out_features
+                target["rest_features"] = layout.rest_features
+            metadata.append(target)
+        return metadata
+
     def param_count(self) -> int:
         return sum(
             parameter.numel()
