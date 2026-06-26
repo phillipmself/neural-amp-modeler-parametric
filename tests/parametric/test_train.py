@@ -28,7 +28,7 @@ def _tiny_model_config() -> dict:
         "net": {
             "name": "HyperWaveNet",
             "config": {
-                "layers_configs": [
+                "layers": [
                     {
                         "input_size": 1,
                         "condition_size": 1,
@@ -51,11 +51,12 @@ def _tiny_model_config() -> dict:
                             "kernel_size": 1,
                             "bias": True,
                         },
-                        "kernel_size": 3,
+                        "kernel_sizes": [3, 3],
                         "dilations": [1, 2],
                         "activation": "Tanh",
                     },
                 ],
+                "head": None,
                 "head_scale": 0.02,
                 "params": [
                     {

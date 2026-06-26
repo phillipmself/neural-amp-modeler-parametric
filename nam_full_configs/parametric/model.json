@@ -7,7 +7,7 @@
     "net": {
         "name": "HyperWaveNet",
         "config": {
-            "layers_configs": [
+            "layers": [
                 {
                     "input_size": 1,
                     "condition_size": 1,
@@ -71,6 +71,7 @@
                     }
                 }
             ],
+            "head": null,
             "head_scale": 0.01,
             "params": [
                 {

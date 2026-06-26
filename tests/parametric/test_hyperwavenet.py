@@ -31,23 +31,28 @@ def _hyperwavenet_config(
     hypernet: _Mapping[str, object] | None = None,
     slimmable: bool = False,
 ) -> dict:
-    config = _channels_8_wavenet_config()
+    config = _InnerWaveNet.init_from_config(_channels_8_wavenet_config()).export_config()
     if slimmable:
-        config = {
-            "layers_configs": [
-                {
-                    "input_size": 1,
-                    "condition_size": 1,
-                    "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
-                    "channels": 4,
-                    "kernel_size": 2,
-                    "dilations": [1, 2],
-                    "activation": "Tanh",
-                    "slimmable": {"method": "slice_channels_uniform", "kwargs": {}},
-                }
-            ],
-            "head_scale": 1.0,
-        }
+        config = _InnerWaveNet.init_from_config(
+            {
+                "layers_configs": [
+                    {
+                        "input_size": 1,
+                        "condition_size": 1,
+                        "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
+                        "channels": 4,
+                        "kernel_size": 2,
+                        "dilations": [1, 2],
+                        "activation": "Tanh",
+                        "slimmable": {
+                            "method": "slice_channels_uniform",
+                            "kwargs": {},
+                        },
+                    }
+                ],
+                "head_scale": 1.0,
+            }
+        ).export_config()
     config["sample_rate"] = 48_000.0
     config["params"] = [
         {
@@ -205,13 +210,13 @@ def test_slimmable_draws_one_width_across_mps_fallback_segments():
         entered += 1
         yield
 
-    def _counting_forward(xi, **kwargs):
+    def _counting_forward(x: _torch.Tensor, *, params: _torch.Tensor) -> _torch.Tensor:
         nonlocal forward_calls
         forward_calls += 1
-        return real_forward(xi, **kwargs)
+        return real_forward(x, params=params)
 
     model._template.context_adjust_to_random = _counting_context
-    model._forward = _counting_forward
+    setattr(model, "_forward", _counting_forward)
 
     y = model(x, params, pad_start=False)
 

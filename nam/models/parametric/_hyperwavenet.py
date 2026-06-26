@@ -9,7 +9,6 @@ Exported weight layout:
 from collections.abc import Mapping as _Mapping
 from collections.abc import Sequence as _Sequence
 from contextlib import nullcontext as _nullcontext
-from copy import deepcopy as _deepcopy
 from typing import Any as _Any
 from typing import Optional as _Optional
 from typing import cast as _cast
@@ -18,6 +17,7 @@ import numpy as _np
 import torch as _torch
 from torch.func import functional_call as _functional_call
 
+from .._from_nam import convert_nam_wavenet_config as _convert_nam_wavenet_config
 from ..wavenet._wavenet import WaveNet as _WaveNet
 from ._base import ParametricNet as _ParametricNet
 from ._hypernet import Hypernetwork as _Hypernetwork
@@ -34,14 +34,11 @@ class HyperWaveNet(_ParametricNet):
         template: _WaveNet,
         hypernet: _Hypernetwork,
         param_specs: _Sequence[_ParamSpec],
-        wavenet_config: _Mapping[str, _Any],
         sample_rate: _Optional[float] = None,
     ):
         super().__init__(param_specs=param_specs, sample_rate=sample_rate)
         self._template = template
         self._hypernet = hypernet
-        self._wavenet_config = _deepcopy(dict(wavenet_config))
-        self._sync_wavenet_config_state()
 
     @classmethod
     def parse_config(cls, config: dict[str, _Any]) -> dict[str, _Any]:
@@ -56,10 +53,10 @@ class HyperWaveNet(_ParametricNet):
 
         hypernet_config = dict(config.pop("hypernet", {}))
         if "selector" not in hypernet_config:
-            hypernet_config["selector"] = _deepcopy(_DEFAULT_HYPERNET_SELECTOR)
+            hypernet_config["selector"] = dict(_DEFAULT_HYPERNET_SELECTOR)
 
-        wavenet_config = _deepcopy(config)
-        template = _WaveNet.init_from_config(config)
+        wavenet_config = _convert_nam_wavenet_config(config, sample_rate=sample_rate)
+        template = _WaveNet.init_from_config(wavenet_config)
         hypernet = _Hypernetwork.from_config(
             input_dim=sum(spec.num_inputs for spec in param_specs),
             named_shapes={
@@ -73,7 +70,6 @@ class HyperWaveNet(_ParametricNet):
             "hypernet": hypernet,
             "param_specs": param_specs,
             "sample_rate": sample_rate,
-            "wavenet_config": wavenet_config,
         }
 
     @property
@@ -150,24 +146,9 @@ class HyperWaveNet(_ParametricNet):
             )
         return y[:, 0, :]
 
-    def _sync_wavenet_config_state(self) -> None:
-        self._wavenet_config["head_scale"] = float(self._template._head_scale)
-
     def _export_inner_config(self) -> dict[str, _Any]:
-        # NOTE ON SCHEMA: the parametric `.nam` stores the base WaveNet config in the
-        # *init/parse* layout (`layers_configs`, raw layer keys), NOT the canonical stock
-        # export layout (`layers` + `head1x1`/`layer1x1`/flat-FiLM keys that `init_from_nam`
-        # produces). This is deliberate: HyperWaveNet has a single construction entry point
-        # (`parse_config` -> `WaveNet.init_from_config`), so reusing the init layout lets the
-        # exact same path reconstruct both a training config and a reloaded `.nam` with no
-        # export->init conversion step. The trade-off is that the base sub-config does not
-        # byte-match a stock WaveNet `.nam`'s config (the *weights* still use stock export
-        # order). The bake path (arch "WaveNet") is the one that must be stock-compatible, and
-        # it is; the parametric file targets a future HyperWaveNet-aware runtime that parses
-        # this self-consistent layout directly.
-        self._sync_wavenet_config_state()
-        config = _deepcopy(self._wavenet_config)
-        config["hypernet"] = _deepcopy(self._hypernet.config)
+        config = self._template.export_config(sample_rate=self.sample_rate)
+        config["hypernet"] = dict(self._hypernet.config)
         return config
 
     def _export_weights(self) -> _np.ndarray:
@@ -191,7 +172,6 @@ class HyperWaveNet(_ParametricNet):
             )
 
         i = self._template.import_weights(weights_tensor, i)
-        self._sync_wavenet_config_state()
         hypernet_parameters = tuple(self._hypernet.named_parameters())
         # Tail-ownership assumption: the hypernet weights are expected to run to the END of
         # the blob, so `remaining` is everything after the base. `remaining == 0` seeds the

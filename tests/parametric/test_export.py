@@ -230,6 +230,8 @@ def test_export_parametric_round_trips_through_factory(tmp_path):
     assert model_dict["config"]["params"] == [
         spec.to_dict() for spec in model.param_specs
     ]
+    assert set(model_dict["config"]) == {"head", "head_scale", "hypernet", "layers", "params"}
+    assert "layers_configs" not in model_dict["config"]
     assert "hypernet" in model_dict["config"]
     assert len(model_dict["weights"]) == base_len + model._hypernet.param_count()
     assert end == len(model_dict["weights"])
