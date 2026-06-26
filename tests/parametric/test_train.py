@@ -9,7 +9,9 @@ from nam.data import np_to_wav as _np_to_wav
 from nam.models._from_nam import init_from_nam as _init_from_nam
 from nam.models.wavenet import WaveNet as _WaveNet
 from nam.train.core import _ValidationStopping as _ValidationStopping
+from nam.train.parametric import _CaptureBatchSampler as _CaptureBatchSampler
 from nam.train.parametric import _create_parametric_callbacks as _create_parametric_callbacks
+from nam.train.parametric import _make_parametric_dataloader as _make_parametric_dataloader
 from nam.train.parametric import main as _main
 
 
@@ -271,3 +273,60 @@ def test_parametric_callbacks_include_validation_stopping():
     ]
     assert len(validation_stopping) == 1
     assert validation_stopping[0].monitor == "ESR"
+
+
+def test_capture_batch_sampler_keeps_batches_within_one_capture():
+    capture_lengths = [5, 3, 4]
+    sampler = _CaptureBatchSampler(
+        capture_lengths, batch_size=2, shuffle=False, drop_last=False
+    )
+    offsets = [0, 5, 8]
+    ranges = [range(o, o + n) for o, n in zip(offsets, capture_lengths)]
+
+    batches = list(sampler)
+    # Every batch's indices must come from a single capture range.
+    for batch in batches:
+        owners = {
+            next(i for i, r in enumerate(ranges) if idx in r) for idx in batch
+        }
+        assert len(owners) == 1, f"batch {batch} mixed captures {owners}"
+
+    # ceil(5/2)+ceil(3/2)+ceil(4/2) = 3+2+2 = 7 batches, covering every index once.
+    assert len(batches) == len(sampler) == 7
+    assert sorted(idx for batch in batches for idx in batch) == list(range(12))
+
+
+def test_capture_batch_sampler_drop_last_drops_partial_per_capture():
+    sampler = _CaptureBatchSampler(
+        [5, 3], batch_size=2, shuffle=False, drop_last=True
+    )
+    batches = list(sampler)
+    # floor(5/2)+floor(3/2) = 2+1 = 3 full batches; the partial tail of each capture is gone.
+    assert len(batches) == len(sampler) == 3
+    assert all(len(batch) == 2 for batch in batches)
+
+
+def test_capture_batch_sampler_shuffle_is_reproducible_and_varies_by_epoch():
+    sampler = _CaptureBatchSampler(
+        [4, 4], batch_size=2, shuffle=True, drop_last=False
+    )
+    _torch.manual_seed(0)
+    epoch0 = list(sampler)
+    epoch1 = list(sampler)
+    _torch.manual_seed(0)
+    rerun0 = list(sampler)
+    assert epoch0 == rerun0  # same global seed -> same stream
+    assert epoch0 != epoch1  # advancing the RNG reshuffles each epoch
+
+
+def test_make_parametric_dataloader_can_opt_out_of_capture_grouping():
+    dataset = list(range(6))
+    grouped = _make_parametric_dataloader(
+        dataset, {"batch_size": 2, "shuffle": False}
+    )
+    assert isinstance(grouped.batch_sampler, _CaptureBatchSampler)
+
+    ungrouped = _make_parametric_dataloader(
+        dataset, {"batch_size": 2, "shuffle": False, "capture_grouped_batches": False}
+    )
+    assert not isinstance(ungrouped.batch_sampler, _CaptureBatchSampler)

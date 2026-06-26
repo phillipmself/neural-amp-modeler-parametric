@@ -1,6 +1,7 @@
 import json as _json
 from pathlib import Path as _Path
 from time import time as _time
+from collections.abc import Sequence as _Sequence
 from typing import Optional as _Optional
 from warnings import warn as _warn
 
@@ -10,6 +11,7 @@ import torch as _torch
 from lightning_fabric.utilities.warnings import PossibleUserWarning as _PossibleUserWarning
 from pytorch_lightning.callbacks import ModelCheckpoint as _ModelCheckpoint
 from torch.utils.data import DataLoader as _DataLoader
+from torch.utils.data import Sampler as _Sampler
 
 from nam.data import ConcatDataset as _ConcatDataset
 from nam.data import Dataset as _Dataset
@@ -48,6 +50,101 @@ def _iter_inner_datasets(dataset) -> tuple[_Dataset, ...]:
         "Expected a Dataset, ParametricDataset, or ConcatDataset; "
         f"got {type(dataset).__name__}"
     )
+
+
+# Default-on. Each capture pairs one control setting with many audio windows, and the train
+# ConcatDataset lays the captures out in contiguous index ranges. HyperWaveNet._run_conditioned
+# groups a batch by unique control setting and runs one functional_call per group, so a batch
+# that mixes captures fans out into several tiny GPU passes. Keeping every batch inside one
+# capture collapses that to a single full-batch functional_call per step.
+_CAPTURE_GROUPED_KEY = "capture_grouped_batches"
+
+
+class _CaptureBatchSampler(_Sampler):
+    """
+    Yield batches whose sample indices all fall inside one capture's contiguous range, so a
+    HyperWaveNet step sees a single control setting and runs one functional_call over the
+    whole batch instead of one per unique setting.
+
+    Trade-off vs. global shuffling: rows are shuffled *within* a capture and the batch order
+    is shuffled across captures, but a batch never mixes captures. Uses the global torch RNG
+    (seeded once by ``nam.train.full``) so the order is reproducible yet varies per epoch.
+    """
+
+    def __init__(
+        self,
+        capture_lengths: _Sequence[int],
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+    ):
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive; got {batch_size}")
+        self._capture_lengths = tuple(int(length) for length in capture_lengths)
+        self._batch_size = int(batch_size)
+        self._shuffle = bool(shuffle)
+        self._drop_last = bool(drop_last)
+
+    def _capture_offsets(self) -> tuple[int, ...]:
+        offsets = []
+        offset = 0
+        for length in self._capture_lengths:
+            offsets.append(offset)
+            offset += length
+        return tuple(offsets)
+
+    def __iter__(self):
+        batches: list[list[int]] = []
+        for offset, length in zip(self._capture_offsets(), self._capture_lengths):
+            if length == 0:
+                continue
+            if self._shuffle:
+                order = [offset + i for i in _torch.randperm(length).tolist()]
+            else:
+                order = list(range(offset, offset + length))
+            for start in range(0, length, self._batch_size):
+                batch = order[start : start + self._batch_size]
+                if self._drop_last and len(batch) < self._batch_size:
+                    continue
+                batches.append(batch)
+        if self._shuffle:
+            batches = [batches[i] for i in _torch.randperm(len(batches)).tolist()]
+        yield from batches
+
+    def __len__(self) -> int:
+        total = 0
+        for length in self._capture_lengths:
+            if self._drop_last:
+                total += length // self._batch_size
+            else:
+                total += (length + self._batch_size - 1) // self._batch_size
+        return total
+
+
+def _capture_lengths(dataset) -> tuple[int, ...]:
+    if isinstance(dataset, _ConcatDataset):
+        return tuple(len(child) for child in dataset.datasets)
+    return (len(dataset),)
+
+
+def _make_parametric_dataloader(dataset, loader_config: dict) -> _DataLoader:
+    loader_config = dict(loader_config)
+    capture_grouped = loader_config.pop(_CAPTURE_GROUPED_KEY, True)
+    if not capture_grouped:
+        return _DataLoader(dataset, **loader_config)
+
+    # batch_sampler is mutually exclusive with these DataLoader args, so the sampler owns them.
+    batch_size = loader_config.pop("batch_size", 1)
+    shuffle = loader_config.pop("shuffle", False)
+    drop_last = loader_config.pop("drop_last", False)
+    loader_config.pop("sampler", None)
+    batch_sampler = _CaptureBatchSampler(
+        _capture_lengths(dataset),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+    )
+    return _DataLoader(dataset, batch_sampler=batch_sampler, **loader_config)
 
 
 def _get_hyperwavenet_net(model: _LightningModule) -> _HyperWaveNet:
@@ -179,9 +276,11 @@ def main(
     net.sample_rate = getattr(dataset_train, "sample_rate", None)
     _handshake_datasets(model, dataset_train, dataset_validation)
 
-    train_dataloader = _DataLoader(dataset_train, **learning_config["train_dataloader"])
-    val_dataloader = _DataLoader(
-        dataset_validation, **learning_config["val_dataloader"]
+    train_dataloader = _make_parametric_dataloader(
+        dataset_train, learning_config["train_dataloader"]
+    )
+    val_dataloader = _make_parametric_dataloader(
+        dataset_validation, learning_config["val_dataloader"]
     )
     callbacks = _create_parametric_callbacks(learning_config)
     trainer = _pl.Trainer(
