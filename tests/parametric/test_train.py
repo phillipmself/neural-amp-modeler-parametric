@@ -1,4 +1,5 @@
 import json as _json
+import math as _math
 from pathlib import Path as _Path
 from typing import Any as _Any
 from typing import cast as _cast
@@ -15,8 +16,8 @@ from nam.models.wavenet import WaveNet as _WaveNet
 from nam.train.core import _ValidationStopping as _ValidationStopping
 from nam.train.parametric import _CaptureBatchSampler as _CaptureBatchSampler
 from nam.train.parametric import _ParametricLightningModule as _ParametricLightningModule
-from nam.train.parametric import _TRAIN_ESR_BUCKET as _TRAIN_ESR_BUCKET
-from nam.train.parametric import _VALIDATION_ESR_BUCKET as _VALIDATION_ESR_BUCKET
+from nam.train.parametric import _TRAIN_BUCKET as _TRAIN_BUCKET
+from nam.train.parametric import _VALIDATION_BUCKET as _VALIDATION_BUCKET
 from nam.train.parametric import _create_parametric_callbacks as _create_parametric_callbacks
 from nam.train.parametric import _make_parametric_dataloader as _make_parametric_dataloader
 from nam.train.parametric import _parametric_plot_label as _parametric_plot_label
@@ -304,56 +305,78 @@ def test_parametric_plot_label_falls_back_to_params():
     assert _parametric_plot_label(ds) == "params=[3, -3]"
 
 
-def test_parametric_lightning_training_logs_seen_audio_seen_params_esr(monkeypatch):
+def test_parametric_lightning_training_logs_seen_audio_seen_params_bucket(monkeypatch):
     module = _ParametricLightningModule(_MockBaseNet(1.0))
     captured: dict[str, _Any] = {}
 
     def capture(dictionary, **kwargs):
         captured.update(dictionary)
-        captured["kwargs"] = kwargs
 
     monkeypatch.setattr(module, "log_dict", capture)
     x = _torch.randn(3, 9)
     targets = _torch.randn(3, 9)
 
+    module.on_train_epoch_start()
     loss = module.training_step((x, targets), 0)
-    logged_esr = _cast(_torch.Tensor, captured[_TRAIN_ESR_BUCKET])
+    # Metrics are reduced once at epoch end, not logged per step.
+    assert captured == {}
+    module.on_train_epoch_end()
 
-    assert _TRAIN_ESR_BUCKET in captured
-    assert _torch.allclose(logged_esr, module._esr_loss(x, targets))
-    assert captured["kwargs"]["on_epoch"] is True
-    assert captured["kwargs"]["on_step"] is False
-    assert captured["kwargs"]["batch_size"] == targets.shape[0]
+    esr_key = f"ESR/{_TRAIN_BUCKET}"
+    assert esr_key in captured
+    # The bucket reduces ESR as a global energy ratio (summed squared error over
+    # summed squared target), which is robust to silent windows.
+    preds = module(x, pad_start=False)
+    expected_esr = float(_torch.sum((preds - targets) ** 2) / _torch.sum(targets ** 2))
+    assert captured[esr_key] == _pytest.approx(expected_esr)
+    # MSE is tracked per bucket alongside ESR.
+    assert f"MSE/{_TRAIN_BUCKET}" in captured
     assert _torch.allclose(
         loss,
         _cast(_torch.Tensor, module._get_loss_dict(x, targets)["MSE"].value),
     )
 
 
-def test_parametric_lightning_validation_logs_unseen_audio_unseen_params_esr(monkeypatch):
+def test_parametric_lightning_training_esr_survives_a_silent_batch(monkeypatch):
+    """A near-silent batch must not poison the epoch's ESR with a divide-by-zero."""
+    module = _ParametricLightningModule(_MockBaseNet(1.0))
+    captured: dict[str, _Any] = {}
+    monkeypatch.setattr(module, "log_dict", lambda d, **k: captured.update(d))
+
+    module.on_train_epoch_start()
+    module.training_step((_torch.randn(3, 9), _torch.randn(3, 9)), 0)
+    # Silent target -> zero energy; a per-batch ESR mean would go inf here.
+    module.training_step((_torch.randn(3, 9), _torch.zeros(3, 9)), 1)
+    module.on_train_epoch_end()
+
+    assert _math.isfinite(captured[f"ESR/{_TRAIN_BUCKET}"])
+
+
+def test_parametric_lightning_validation_logs_unseen_audio_unseen_params_bucket(monkeypatch):
     module = _ParametricLightningModule(_MockBaseNet(1.0))
     captured: dict[str, _Any] = {}
 
     def capture(dictionary, **kwargs):
         captured.update(dictionary)
-        captured["kwargs"] = kwargs
 
     monkeypatch.setattr(module, "log_dict", capture)
     x = _torch.randn(2, 7)
     targets = _torch.randn(2, 7)
 
-    val_loss = module.validation_step((x, targets), 0)
-    logged_bucket_esr = _cast(_torch.Tensor, captured[_VALIDATION_ESR_BUCKET])
-    logged_esr = _cast(_torch.Tensor, captured["ESR"])
+    module.on_validation_epoch_start()
+    assert module.validation_step((x, targets), 0) is None
+    assert captured == {}
+    module.on_validation_epoch_end()
 
+    bucket_key = f"ESR/{_VALIDATION_BUCKET}"
+    preds = module(x, pad_start=False)
+    expected_esr = float(_torch.sum((preds - targets) ** 2) / _torch.sum(targets ** 2))
+    assert captured[bucket_key] == _pytest.approx(expected_esr)
+    # Bare keys back the checkpoint monitor and filename.
+    assert captured["ESR"] == _pytest.approx(expected_esr)
     assert "val_loss" in captured
-    assert "ESR" in captured
-    assert _VALIDATION_ESR_BUCKET in captured
-    assert _torch.allclose(logged_bucket_esr, logged_esr)
-    assert _torch.allclose(_cast(_torch.Tensor, captured["val_loss"]), val_loss)
-    assert captured["kwargs"]["on_epoch"] is True
-    assert captured["kwargs"]["on_step"] is False
-    assert captured["kwargs"]["batch_size"] == targets.shape[0]
+    assert captured["val_loss"] == _pytest.approx(captured[module._val_loss_key()])
+    assert f"MSE/{_VALIDATION_BUCKET}" in captured
 
 
 def test_capture_batch_sampler_keeps_batches_within_one_capture():

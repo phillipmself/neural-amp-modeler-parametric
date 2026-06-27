@@ -30,7 +30,6 @@ from nam.train.full import _create_callbacks
 from nam.train.full import _handshake_datasets
 from nam.train.full import _rms as _rms
 from nam.train.lightning_module import LightningModule as _LightningModule
-from nam.train.lightning_module import _LossItem
 from nam.util import filter_warnings as _filter_warnings
 
 # NB: the global RNG seed is set once by `nam.train.full` (imported above); no need to
@@ -59,8 +58,13 @@ def _iter_inner_datasets(dataset) -> tuple[_Dataset, ...]:
 # that mixes captures fans out into several tiny GPU passes. Keeping every batch inside one
 # capture collapses that to a single full-batch functional_call per step.
 _CAPTURE_GROUPED_KEY = "capture_grouped_batches"
-_TRAIN_ESR_BUCKET = "ESR/seen_audio_seen_params"
-_VALIDATION_ESR_BUCKET = "ESR/unseen_audio_unseen_params"
+# Metrics are tracked per data bucket: the training split is audio and control
+# settings the model fit on; the validation split is held out on both axes.
+_TRAIN_BUCKET = "seen_audio_seen_params"
+_VALIDATION_BUCKET = "unseen_audio_unseen_params"
+# Means reduced as sample-weighted averages across the epoch. ESR is handled
+# separately because it is a ratio of energies, not a mean.
+_BUCKET_MEAN_METRICS = ("MSE", "MRSTFT")
 
 
 class _CaptureBatchSampler(_Sampler):
@@ -160,7 +164,67 @@ def _get_hyperwavenet_net(model: _LightningModule) -> _HyperWaveNet:
     return net
 
 
+class _EpochMetrics:
+    """Accumulate per-batch metrics across an epoch and reduce them once at the end.
+
+    ESR is summed as energies -- the squared error and squared target are summed
+    separately and divided only at the end -- so a near-silent batch cannot divide
+    by ~zero and poison the whole epoch the way a per-batch ESR average does. MSE
+    and MRSTFT are reduced as sample-weighted means over the same batches.
+    """
+
+    def __init__(self) -> None:
+        self._err_sq: _Optional[_torch.Tensor] = None
+        self._tgt_sq: _Optional[_torch.Tensor] = None
+        self._weighted: dict[str, _torch.Tensor] = {}
+        self._rows = 0
+
+    def update(
+        self,
+        preds: _torch.Tensor,
+        targets: _torch.Tensor,
+        means: dict[str, _torch.Tensor],
+    ) -> None:
+        preds = preds.detach()
+        targets = targets.detach()
+        err_sq = _torch.sum(_torch.square(preds - targets))
+        tgt_sq = _torch.sum(_torch.square(targets))
+        self._err_sq = err_sq if self._err_sq is None else self._err_sq + err_sq
+        self._tgt_sq = tgt_sq if self._tgt_sq is None else self._tgt_sq + tgt_sq
+        rows = targets.shape[0]
+        self._rows += rows
+        for key, value in means.items():
+            # Equal-length windows make a row-count weighting exact for per-element
+            # means like MSE and consistent for MRSTFT.
+            contrib = value.detach() * rows
+            self._weighted[key] = (
+                contrib if key not in self._weighted else self._weighted[key] + contrib
+            )
+
+    def compute(self) -> dict[str, float]:
+        if self._rows == 0:
+            return {}
+        tgt_sq = float(self._tgt_sq)
+        out: dict[str, float] = {
+            "ESR": float(self._err_sq) / tgt_sq if tgt_sq > 0.0 else float("inf")
+        }
+        for key, total in self._weighted.items():
+            out[key] = float(total) / self._rows
+        return out
+
+
+def _bucket_means(loss_dict: dict) -> dict[str, _torch.Tensor]:
+    return {
+        key: loss_dict[key].value
+        for key in _BUCKET_MEAN_METRICS
+        if key in loss_dict and loss_dict[key].value is not None
+    }
+
+
 class _ParametricLightningModule(_LightningModule):
+    def on_train_epoch_start(self):
+        self._train_metrics = _EpochMetrics()
+
     def training_step(self, batch, batch_idx):
         preds, targets, loss_dict = self._shared_step(batch)
         loss = _torch.zeros((), device=preds.device)
@@ -169,49 +233,46 @@ class _ParametricLightningModule(_LightningModule):
                 if v.value is None:
                     raise RuntimeError("Weighted training losses must define a tensor value")
                 loss = loss + v.weight * v.value
-        self.log_dict(
-            {_TRAIN_ESR_BUCKET: self._esr_loss(preds, targets)},
-            on_step=False,
-            on_epoch=True,
-            batch_size=targets.shape[0],
-        )
+        self._train_metrics.update(preds, targets, _bucket_means(loss_dict))
         return loss
+
+    def on_train_epoch_end(self):
+        self._log_bucket(self._train_metrics.compute(), _TRAIN_BUCKET)
+
+    def on_validation_epoch_start(self):
+        self._val_metrics = _EpochMetrics()
 
     def validation_step(self, batch, batch_idx):
         preds, targets, loss_dict = self._shared_step(batch)
-        val_loss_type = self._loss_config.val_loss
-        val_loss_key = (
-            val_loss_type
-            if isinstance(val_loss_type, str)
-            else val_loss_type.value.upper()
-        )
+        self._val_metrics.update(preds, targets, _bucket_means(loss_dict))
+        # Reduction happens once in on_validation_epoch_end; nothing to return.
 
-        loss_dict["ESR"] = _LossItem(None, self._esr_loss(preds, targets))
-        if val_loss_key not in loss_dict:
+    def on_validation_epoch_end(self):
+        metrics = self._val_metrics.compute()
+        if not metrics:
+            return
+        self._log_bucket(metrics, _VALIDATION_BUCKET)
+        val_loss_key = self._val_loss_key()
+        if val_loss_key not in metrics:
             raise RuntimeError(
-                f"Undefined validation loss routine for {self._loss_config.val_loss}"
+                f"Validation loss {val_loss_key!r} was not accumulated this epoch"
             )
-        val_loss = loss_dict[val_loss_key].value
-        if val_loss is None:
-            raise RuntimeError("Validation loss must define a tensor value")
-        esr_value = loss_dict["ESR"].value
-        if esr_value is None:
-            raise RuntimeError("Validation ESR must define a tensor value")
-        logs: dict[str, _torch.Tensor] = {
-            "val_loss": val_loss,
-            _VALIDATION_ESR_BUCKET: esr_value,
-        }
-        for key, value in loss_dict.items():
-            if value.value is None:
-                raise RuntimeError(f"Validation metric {key} must define a tensor value")
-            logs[key] = value.value
-        self.log_dict(
-            logs,
-            on_step=False,
-            on_epoch=True,
-            batch_size=targets.shape[0],
-        )
-        return val_loss
+        # Bare keys back the checkpoint monitor (val_loss), the checkpoint filename
+        # (ESR, MSE), and any threshold-ESR early stopping.
+        monitored = dict(metrics)
+        monitored["val_loss"] = metrics[val_loss_key]
+        self.log_dict(monitored)
+
+    def _val_loss_key(self) -> str:
+        val_loss_type = self._loss_config.val_loss
+        if isinstance(val_loss_type, str):
+            return val_loss_type.upper()
+        return val_loss_type.value.upper()
+
+    def _log_bucket(self, metrics: dict[str, float], bucket: str) -> None:
+        if not metrics:
+            return
+        self.log_dict({f"{name}/{bucket}": value for name, value in metrics.items()})
 
 
 def _create_parametric_callbacks(learning_config):
