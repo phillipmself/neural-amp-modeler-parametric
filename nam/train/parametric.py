@@ -30,6 +30,7 @@ from nam.train.full import _create_callbacks
 from nam.train.full import _handshake_datasets
 from nam.train.full import _rms as _rms
 from nam.train.lightning_module import LightningModule as _LightningModule
+from nam.train.lightning_module import _LossItem
 from nam.util import filter_warnings as _filter_warnings
 
 # NB: the global RNG seed is set once by `nam.train.full` (imported above); no need to
@@ -58,6 +59,8 @@ def _iter_inner_datasets(dataset) -> tuple[_Dataset, ...]:
 # that mixes captures fans out into several tiny GPU passes. Keeping every batch inside one
 # capture collapses that to a single full-batch functional_call per step.
 _CAPTURE_GROUPED_KEY = "capture_grouped_batches"
+_TRAIN_ESR_BUCKET = "ESR/seen_audio_seen_params"
+_VALIDATION_ESR_BUCKET = "ESR/unseen_audio_unseen_params"
 
 
 class _CaptureBatchSampler(_Sampler):
@@ -157,6 +160,60 @@ def _get_hyperwavenet_net(model: _LightningModule) -> _HyperWaveNet:
     return net
 
 
+class _ParametricLightningModule(_LightningModule):
+    def training_step(self, batch, batch_idx):
+        preds, targets, loss_dict = self._shared_step(batch)
+        loss = _torch.zeros((), device=preds.device)
+        for v in loss_dict.values():
+            if v.weight is not None and v.weight > 0.0:
+                if v.value is None:
+                    raise RuntimeError("Weighted training losses must define a tensor value")
+                loss = loss + v.weight * v.value
+        self.log_dict(
+            {_TRAIN_ESR_BUCKET: self._esr_loss(preds, targets)},
+            on_step=False,
+            on_epoch=True,
+            batch_size=targets.shape[0],
+        )
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        preds, targets, loss_dict = self._shared_step(batch)
+        val_loss_type = self._loss_config.val_loss
+        val_loss_key = (
+            val_loss_type
+            if isinstance(val_loss_type, str)
+            else val_loss_type.value.upper()
+        )
+
+        loss_dict["ESR"] = _LossItem(None, self._esr_loss(preds, targets))
+        if val_loss_key not in loss_dict:
+            raise RuntimeError(
+                f"Undefined validation loss routine for {self._loss_config.val_loss}"
+            )
+        val_loss = loss_dict[val_loss_key].value
+        if val_loss is None:
+            raise RuntimeError("Validation loss must define a tensor value")
+        esr_value = loss_dict["ESR"].value
+        if esr_value is None:
+            raise RuntimeError("Validation ESR must define a tensor value")
+        logs: dict[str, _torch.Tensor] = {
+            "val_loss": val_loss,
+            _VALIDATION_ESR_BUCKET: esr_value,
+        }
+        for key, value in loss_dict.items():
+            if value.value is None:
+                raise RuntimeError(f"Validation metric {key} must define a tensor value")
+            logs[key] = value.value
+        self.log_dict(
+            logs,
+            on_step=False,
+            on_epoch=True,
+            batch_size=targets.shape[0],
+        )
+        return val_loss
+
+
 def _create_parametric_callbacks(learning_config):
     callbacks = _create_callbacks(learning_config, packed=False)
     threshold_esr = learning_config.get("threshold_esr")
@@ -165,6 +222,14 @@ def _create_parametric_callbacks(learning_config):
             _ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
         )
     return callbacks
+
+
+def _parametric_plot_label(ds: _ParametricDataset) -> str:
+    y_path = getattr(ds.dataset, "_y_path", None)
+    if y_path is not None:
+        return _Path(y_path).name
+    params = ", ".join(f"{value:.3g}" for value in ds.params.detach().cpu().tolist())
+    return f"params=[{params}]"
 
 
 def _plot_parametric(
@@ -223,7 +288,7 @@ def _plot_parametric(
     _plt.plot(target[window_start:window_end], linestyle="--", label="Target")
     nrmse = _rms(_torch.tensor(output) - ds.dataset.y) / _rms(ds.dataset.y)
     esr = nrmse**2
-    _plt.title(f"ESR={esr:.3f}")
+    _plt.title(f"{_parametric_plot_label(ds)}\nESR={esr:.3f}")
     _plt.legend()
     if savefig is not None:
         _plt.savefig(savefig)
@@ -253,7 +318,7 @@ def main(
         raise ValueError("PackedWaveNet is not supported by the parametric trainer")
 
     data_config = _data_config_from_model(data_config, model_config)
-    model = _LightningModule.init_from_config(model_config)
+    model = _ParametricLightningModule.init_from_config(model_config)
     net = _get_hyperwavenet_net(model)
 
     data_config["common"] = data_config.get("common", {})
@@ -311,9 +376,9 @@ def main(
             else ""
         )
         if best_checkpoint != "":
-            model = _LightningModule.load_from_checkpoint(
+            model = _ParametricLightningModule.load_from_checkpoint(
                 best_checkpoint,
-                **_LightningModule.parse_config(model_config),
+                **_ParametricLightningModule.parse_config(model_config),
             )
         net = _get_hyperwavenet_net(model)
         model.cpu()
