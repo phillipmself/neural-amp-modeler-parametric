@@ -1,8 +1,8 @@
 {
     "_notes": [
         "Parametric HyperWaveNet training config based on the packed channels_8 WaveNet.",
-        "The inner WaveNet stays frozen as a class definition; HyperWaveNet runs it through",
-        "torch.func.functional_call with generated deltas for a cheap subset of the weights."
+        "The model architecture, loss, optimizer, and scheduler match the default parametric example.",
+        "Only the continuous parameter definitions are specialized for the Low/High dataset."
     ],
     "net": {
         "name": "HyperWaveNet",
@@ -71,30 +71,41 @@
                     }
                 }
             ],
-            "head": null,
             "head_scale": 0.01,
             "params": [
                 {
-                    "name": "gain",
-                    "min": 0.0,
-                    "max": 10.0,
+                    "name": "Gain",
+                    "min": 0,
+                    "max": 10,
+                    "default": 5,
+                    "type": "continuous"
+                },
+                {
+                    "name": "Tone",
+                    "min": 0,
+                    "max": 10,
                     "default": 5.0,
                     "type": "continuous"
                 },
                 {
-                    "name": "mode",
-                    "min": 0,
-                    "max": 2,
-                    "default": 0,
+                    "name": "Boost",
                     "type": "switch",
+                    "min": 0,
+                    "max": 1,
+                    "default": 0,
                     "enum_names": [
-                        "clean",
-                        "crunch",
-                        "lead"
+                        "Off",
+                        "On"
                     ]
                 }
             ],
-            "hypernet": {}
+            "hypernet": {
+                "selector": {
+                    "exclude_suffixes": [
+                        "_conv.weight"
+                    ]
+                }
+            }
         }
     },
     "loss": {
@@ -102,7 +113,7 @@
         "mrstft_weight": 0.0005
     },
     "optimizer": {
-        "lr": 0.004,
+        "lr": 0.002,
         "weight_decay": 3.17e-07
     },
     "lr_scheduler": {

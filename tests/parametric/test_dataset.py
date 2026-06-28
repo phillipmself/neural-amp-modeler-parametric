@@ -51,13 +51,13 @@ def test_parametric_dataset_returns_params_x_y(tmp_path):
             "ny": 4,
             "require_input_pre_silence": None,
             "param_specs": _model_config_with_param_specs()["net"]["config"]["params"],
-            "params": {"gain": 8.0, "mode": "crunch"},
+            "params": {"Gain": 8.0, "Tone": 2.0, "Boost": "On"},
         }
     )
 
     x, params, y = dataset[0]
 
-    assert _torch.equal(params, _torch.tensor([8.0, 1.0]))
+    assert _torch.equal(params, _torch.tensor([8.0, 2.0, 1.0]))
     assert x.shape == (11,)
     assert y.shape == (4,)
     assert dataset.nx == 8
@@ -94,15 +94,15 @@ def test_parametric_dataset_accepts_switch_indices(tmp_path):
     "config_updates, match",
     [
         (
-            {"params": {"gain": 8.0}},
-            "params is missing declared parameter name\\(s\\): mode",
+            {"params": {"Gain": 8.0, "Tone": 4.0}},
+            "params is missing declared parameter name\\(s\\): Boost",
         ),
         (
-            {"params": {"gain": 8.0, "mode": "clean", "depth": 2.0}},
-            "params contains unknown parameter name\\(s\\): depth",
+            {"params": {"Gain": 8.0, "Tone": 4.0, "Boost": "Off", "Depth": 2.0}},
+            "params contains unknown parameter name\\(s\\): Depth",
         ),
         (
-            {"params": {"gain": 8.0, "mode": "high-gain"}},
+            {"params": {"Gain": 8.0, "Tone": 4.0, "Boost": "high-gain"}},
             "is not a valid enum name",
         ),
         (
@@ -120,7 +120,7 @@ def test_parametric_dataset_validation_errors(tmp_path, config_updates, match):
         "ny": 4,
         "require_input_pre_silence": None,
         "param_specs": _model_config_with_param_specs()["net"]["config"]["params"],
-        "params": {"gain": 8.0, "mode": "clean"},
+        "params": {"Gain": 8.0, "Tone": 4.0, "Boost": "Off"},
     }
     config.update(config_updates)
 
@@ -135,8 +135,9 @@ def test_data_config_from_model_injects_param_specs():
 
     assert "param_specs" in config["common"]
     assert tuple(spec["name"] for spec in config["common"]["param_specs"]) == (
-        "gain",
-        "mode",
+        "Gain",
+        "Tone",
+        "Boost",
     )
     assert "param_specs" not in data_config["common"]
 
@@ -154,10 +155,13 @@ def test_parametric_list_config_builds_concat_dataset(tmp_path):
                 "require_input_pre_silence": None,
             },
             "train": [
-                {"y_path": y_path_a, "params": {"gain": 2.0, "mode": "clean"}},
-                {"y_path": y_path_b, "params": {"gain": 6.0, "mode": "crunch"}},
+                {"y_path": y_path_a, "params": {"Gain": 2.0, "Tone": 9.0, "Boost": "Off"}},
+                {"y_path": y_path_b, "params": {"Gain": 6.0, "Tone": 3.0, "Boost": "On"}},
             ],
-            "validation": {"y_path": y_path_a, "params": {"gain": 2.0, "mode": "clean"}},
+            "validation": {
+                "y_path": y_path_a,
+                "params": {"Gain": 2.0, "Tone": 9.0, "Boost": "Off"},
+            },
         },
         _model_config_with_param_specs(),
     )
@@ -168,7 +172,7 @@ def test_parametric_list_config_builds_concat_dataset(tmp_path):
     assert all(isinstance(subdataset, _ParametricDataset) for subdataset in dataset.datasets)
     subdataset = _cast(_ParametricDataset, dataset.datasets[0])
     _, params, _ = subdataset[0]
-    assert _torch.equal(params, _torch.tensor([2.0, 0.0]))
+    assert _torch.equal(params, _torch.tensor([2.0, 9.0, 0.0]))
 
 
 def test_parametric_train_and_validation_lists_use_held_out_settings(tmp_path):
@@ -185,12 +189,12 @@ def test_parametric_train_and_validation_lists_use_held_out_settings(tmp_path):
                 "require_input_pre_silence": None,
             },
             "train": [
-                {"y_path": y_path_a, "params": {"gain": 2.0, "mode": "clean"}},
-                {"y_path": y_path_b, "params": {"gain": 8.0, "mode": "crunch"}},
+                {"y_path": y_path_a, "params": {"Gain": 2.0, "Tone": 8.0, "Boost": "Off"}},
+                {"y_path": y_path_b, "params": {"Gain": 8.0, "Tone": 2.0, "Boost": "On"}},
             ],
-            # Held-out setting (gain=6, mode=lead) the model never trains on.
+            # Held-out setting the model never trains on.
             "validation": [
-                {"y_path": y_path_val, "params": {"gain": 6.0, "mode": "lead"}},
+                {"y_path": y_path_val, "params": {"Gain": 6.0, "Tone": 5.0, "Boost": "On"}},
             ],
         },
         _model_config_with_param_specs(),
@@ -204,7 +208,7 @@ def test_parametric_train_and_validation_lists_use_held_out_settings(tmp_path):
     assert len(train_dataset.datasets) == 2
     assert len(validation_dataset.datasets) == 1
     _, validation_params, _ = _cast(_ParametricDataset, validation_dataset.datasets[0])[0]
-    assert _torch.equal(validation_params, _torch.tensor([6.0, 2.0]))  # "lead" -> index 2
+    assert _torch.equal(validation_params, _torch.tensor([6.0, 5.0, 1.0]))
 
 
 def test_example_parametric_data_config_init_dataset(tmp_path):
@@ -231,7 +235,7 @@ def test_example_parametric_data_config_init_dataset(tmp_path):
     assert isinstance(train_dataset, _ConcatDataset)
     assert isinstance(validation_dataset, _ConcatDataset)
     assert len(train_dataset.datasets) == 2
-    assert len(validation_dataset.datasets) == 1
+    assert len(validation_dataset.datasets) == 2
 
 
 def test_parametric_dataset_type_registered_on_plain_import():
@@ -248,4 +252,3 @@ def test_parametric_dataset_type_registered_on_plain_import():
     )
     assert result.returncode == 0, result.stderr
     assert "REGISTERED" in result.stdout
-

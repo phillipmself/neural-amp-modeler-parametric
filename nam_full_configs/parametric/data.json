@@ -1,36 +1,33 @@
 {
     "_notes": [
         "Parametric capture layout: one shared input wav, one output wav per knob setting.",
-        "Parameter metadata (names, ranges, types, enum names) lives in the model config under",
-        "net.config.params and is injected here at train time; this file only lists per-capture",
-        "named raw values. Continuous values are user-facing (e.g. a knob from 0-10); switch",
-        "values are enum names.",
-        "train = the settings the model learns (seen audio + seen params).",
-        "validation = HELD-OUT settings the model never",
-        "trains on, scored on the held-out audio tail, so val ESR measures interpolation",
-        "(unseen audio + unseen param)."
+        "This bundle uses basename-only audio paths so the files can be moved together.",
+        "Parameter metadata lives in the model config under net.config.params.",
+        "Train captures cover two distinct settings; validation holds out two different mixed settings."
     ],
     "type": "parametric",
     "common": {
-        "x_path": "C:\\path\\to\\shared\\source.wav",
+        "x_path": "input.wav",
         "delay": 0
     },
     "train": [
         {
-            "y_path": "C:\\path\\to\\captures\\gain2_clean.wav",
+            "y_path": "gain_2_tone_8_boost_off.wav",
             "params": {
-                "gain": 2.0,
-                "mode": "clean"
+                "Gain": 2.0,
+                "Tone": 8.0,
+                "Boost": "Off"
             },
             "start_seconds": 10.0,
             "stop_seconds": -9.0,
             "ny": 8192
         },
         {
-            "y_path": "C:\\path\\to\\captures\\gain8_crunch.wav",
+            "y_path": "gain_9_tone_3_boost_on.wav",
             "params": {
-                "gain": 8.0,
-                "mode": "crunch"
+                "Gain": 9.0,
+                "Tone": 3.0,
+                "Boost": "On"
             },
             "start_seconds": 10.0,
             "stop_seconds": -9.0,
@@ -39,10 +36,22 @@
     ],
     "validation": [
         {
-            "y_path": "C:\\path\\to\\captures\\gain6_lead.wav",
+            "y_path": "gain_5_tone_6_boost_on.wav",
             "params": {
-                "gain": 6.0,
-                "mode": "lead"
+                "Gain": 5.0,
+                "Tone": 6.0,
+                "Boost": "On"
+            },
+            "start_seconds": -9.0,
+            "stop_seconds": null,
+            "ny": null
+        },
+        {
+            "y_path": "gain_7_tone_1_boost_off.wav",
+            "params": {
+                "Gain": 7.0,
+                "Tone": 1.0,
+                "Boost": "Off"
             },
             "start_seconds": -9.0,
             "stop_seconds": null,
