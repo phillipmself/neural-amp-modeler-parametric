@@ -1,0 +1,169 @@
+"""
+Parameter-space bridge for PANAMA-style active-learning capture selection.
+
+Adapted from PANAMA (Parametric Active-learning for Neural Amp Modeling Assistance),
+arXiv:2509.26564v1. The sigmoid(latent) continuous control-vector optimization and the
+switch/continuous split of the acquisition optimizer variable are due to the PANAMA authors.
+"""
+
+import functools as _functools
+import itertools as _itertools
+import math as _math
+from collections.abc import Sequence as _Sequence
+
+import torch as _torch
+
+from ._spec import ParamSpec as _ParamSpec
+
+
+def _validate_switch_index(spec: _ParamSpec, value: float) -> int:
+    """
+    Validate that ``value`` is a finite integer in ``[0, K-1]`` for the given switch spec
+    and return it as an ``int``. Mirrors the switch contract enforced by
+    ``ParametricNet._encode_params`` / ``resolve_named_params``, but in the inverse
+    (raw -> name) direction. Switch indices are always integers in this design, so a bad
+    value is rejected rather than silently coerced.
+    """
+    if not _math.isfinite(value):
+        raise ValueError(f"Switch parameter {spec.name!r} index must be finite")
+    if not float(value).is_integer():
+        raise ValueError(f"Switch parameter {spec.name!r} index must be an integer")
+    index = int(value)
+    if index < 0 or index >= spec.num_inputs:
+        raise ValueError(
+            f"Switch parameter {spec.name!r} index must be within "
+            f"[0, {spec.num_inputs - 1}]"
+        )
+    return index
+
+
+def decode_named_params(
+    raw: _torch.Tensor | _Sequence[float],
+    specs: _Sequence[_ParamSpec],
+) -> dict[str, float | str]:
+    specs = tuple(specs)
+    raw = _torch.as_tensor(raw)
+    if raw.ndim != 1:
+        raise ValueError(f"Expected raw params to have shape (P,); got {tuple(raw.shape)}")
+    if raw.shape[0] != len(specs):
+        raise ValueError(
+            f"Expected raw params length {len(specs)}; got trailing dimension {raw.shape[0]}"
+        )
+
+    decoded: dict[str, float | str] = {}
+    for i, spec in enumerate(specs):
+        value = float(raw[i])
+        if spec.type == "switch":
+            if spec.enum_names is None:
+                raise RuntimeError(
+                    f"Switch ParamSpec {spec.name!r} is missing enum_names after validation"
+                )
+            decoded[spec.name] = spec.enum_names[_validate_switch_index(spec, value)]
+            continue
+
+        # Continuous values are validated and emitted directly (no round-trip through
+        # resolve_named_params). Reject non-finite; otherwise pass the value through,
+        # rounded to a cosmetic display precision. Out-of-[min, max] values are
+        # intentionally preserved: captures may exceed the declared range, and the model
+        # linearly rescales them without clamping (see _resolve_continuous_value).
+        if not _math.isfinite(value):
+            raise ValueError(f"Continuous parameter {spec.name!r} must be finite")
+        decoded[spec.name] = round(value, 6)
+
+    return decoded
+
+
+@_functools.lru_cache(maxsize=None)
+def _split_param_indices_cached(
+    specs: tuple[_ParamSpec, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    continuous_idx = []
+    switch_idx = []
+    switch_cardinalities = []
+    for i, spec in enumerate(specs):
+        if spec.type == "switch":
+            switch_idx.append(i)
+            switch_cardinalities.append(spec.num_inputs)
+        else:
+            continuous_idx.append(i)
+    return tuple(continuous_idx), tuple(switch_idx), tuple(switch_cardinalities)
+
+
+def split_param_indices(
+    specs: _Sequence[_ParamSpec],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    # Cached on the (hashable, frozen) spec tuple so the g-opt hot loop
+    # (assemble_raw_params runs once per Adam step) does not re-walk the specs each call.
+    return _split_param_indices_cached(tuple(specs))
+
+
+def switch_combinations(specs: _Sequence[_ParamSpec]) -> list[tuple[int, ...]]:
+    _, _, switch_cardinalities = split_param_indices(specs)
+    if len(switch_cardinalities) == 0:
+        return [()]
+    return list(
+        _itertools.product(*(range(cardinality) for cardinality in switch_cardinalities))
+    )
+
+
+def assemble_raw_params(
+    z: _torch.Tensor | _Sequence[float],
+    switch_combo: tuple[int, ...],
+    specs: _Sequence[_ParamSpec],
+) -> _torch.Tensor:
+    specs = tuple(specs)
+    continuous_idx, switch_idx, _ = split_param_indices(specs)
+    z = _torch.as_tensor(z)
+    if z.ndim == 0:
+        raise ValueError(
+            f"Expected continuous latents to have shape (C,) or (..., C); got {tuple(z.shape)}"
+        )
+    if z.shape[-1] != len(continuous_idx):
+        raise ValueError(
+            f"Expected continuous latents trailing dimension {len(continuous_idx)}; "
+            f"got {z.shape[-1]}"
+        )
+    if len(switch_combo) != len(switch_idx):
+        raise ValueError(
+            f"Expected switch combination length {len(switch_idx)}; got {len(switch_combo)}"
+        )
+
+    batch_shape = tuple(z.shape[:-1])
+    continuous_col = 0
+    switch_col = 0
+    columns = []
+    for spec in specs:
+        if spec.type == "switch":
+            switch_value = switch_combo[switch_col]
+            if switch_value < 0 or switch_value >= spec.num_inputs:
+                raise ValueError(
+                    f"Switch combination index {switch_value} for {spec.name!r} must be within "
+                    f"[0, {spec.num_inputs - 1}]"
+                )
+            # Constant integer column for the swept switch state: no graph edge to z, so
+            # autograd leaves the switch dims fixed (D2).
+            columns.append(
+                _torch.full(
+                    batch_shape + (1,),
+                    float(switch_value),
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+            )
+            switch_col += 1
+            continue
+
+        # raw_i = min_i + (max_i - min_i) * sigmoid(z_i): a smooth, bounded map keeping
+        # suggestions in-range by construction (echoes PANAMA's sigmoid(latent)). NOTE the
+        # bounds form an *open* interval, approached only asymptotically as |z| -> inf where
+        # sigmoid's gradient vanishes; an Adam ascent from a near-zero init cannot practically
+        # reach the extremes. Knob extremes are often high-disagreement regions, so Task 5
+        # should compensate (e.g. large-|z| restart inits) and Task 6 may snap near-boundary
+        # suggestions to the bound when emitting user-unit proposals.
+        width = spec.max - spec.min
+        columns.append(spec.min + width * _torch.sigmoid(z[..., continuous_col : continuous_col + 1]))
+        continuous_col += 1
+
+    # Concatenate per-spec column blocks (never in-place index assignment) so autograd
+    # reaches z through the continuous columns while the switch columns stay constant.
+    return _torch.cat(columns, dim=-1)
