@@ -1,11 +1,19 @@
+import math as _math
 from copy import deepcopy as _deepcopy
 
 import numpy as _np
 import pytest as _pytest
 import torch as _torch
 
+from nam.models.parametric import assemble_raw_params as _assemble_raw_params
+from nam.models.parametric import ParamSpec as _ParamSpec
+from nam.models.parametric import split_param_indices as _split_param_indices
+from nam.models.parametric import switch_combinations as _switch_combinations
 from nam.data import np_to_wav as _np_to_wav
 from nam.train.active_learning import _clear_device_cache as _clear_device_cache
+from nam.train.active_learning import (
+    find_disagreement_settings as _find_disagreement_settings,
+)
 from nam.train.active_learning import train_ensemble as _train_ensemble
 from nam.train.parametric import _ParametricLightningModule
 
@@ -300,3 +308,173 @@ def test_clear_device_cache_calls_mps_empty_cache(monkeypatch):
     _clear_device_cache(_torch.device("mps"))
 
     assert calls == [True]
+
+
+def test_find_disagreement_settings_returns_candidates_per_restart_and_switch_combo(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    model_config = _concat_lstm_model_config()
+    checkpoint_paths = _train_ensemble(
+        _build_data_config(tmp_path),
+        model_config,
+        _learning_config(),
+        tmp_path / "run",
+        ensemble_size=2,
+        base_seed=7,
+    )
+
+    candidates = _find_disagreement_settings(
+        checkpoint_paths,
+        model_config,
+        g_opt_input_wav=tmp_path / "input.wav",
+        num_restarts=2,
+        num_steps=3,
+        g_opt_ny=32,
+        g_opt_batch_size=2,
+        seed=11,
+    )
+
+    specs = tuple(
+        _ParamSpec.from_dict(spec)
+        for spec in model_config["net"]["config"]["params"]
+    )
+    continuous_idx, switch_idx, _ = _split_param_indices(specs)
+    expected_switch_combos = set(_switch_combinations(specs))
+
+    assert len(candidates) == 2 * len(expected_switch_combos)
+    for candidate in candidates:
+        assert _math.isfinite(candidate.score)
+        assert candidate.switch_combo in expected_switch_combos
+        assert candidate.raw_params.device.type == "cpu"
+        assert not candidate.raw_params.requires_grad
+        assert candidate.raw_params.shape == (len(specs),)
+        for raw_index, combo_value in zip(switch_idx, candidate.switch_combo):
+            assert candidate.raw_params[raw_index].item() == _pytest.approx(combo_value)
+        for raw_index in continuous_idx:
+            spec = specs[raw_index]
+            value = candidate.raw_params[raw_index].item()
+            assert spec.min <= value <= spec.max
+
+
+def test_find_disagreement_settings_keeps_gradient_flow_on_continuous_latents(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    model_config = _concat_lstm_model_config()
+    checkpoint_paths = _train_ensemble(
+        _build_data_config(tmp_path),
+        model_config,
+        _learning_config(),
+        tmp_path / "run",
+        ensemble_size=1,
+        base_seed=3,
+    )
+
+    specs = tuple(
+        _ParamSpec.from_dict(spec)
+        for spec in model_config["net"]["config"]["params"]
+    )
+    module = _ParametricLightningModule.load_from_checkpoint(
+        str(checkpoint_paths[0]),
+        **_ParametricLightningModule.parse_config(model_config),
+    )
+    member = module.net
+    member.eval()
+    member.requires_grad_(False)
+
+    x_batch = _torch.stack(
+        [
+            _torch.linspace(-0.5, 0.5, 32),
+            _torch.linspace(0.5, -0.5, 32),
+        ]
+    )
+    z = _torch.tensor([0.0], dtype=_torch.float32, requires_grad=True)
+    raw_params = _assemble_raw_params(z, (1,), specs)
+    outputs = member(x_batch, raw_params)
+    score = outputs.var(dim=0, unbiased=False).mean()
+    score.backward()
+
+    assert z.grad is not None
+    assert _torch.isfinite(z.grad).all()
+    assert z.grad.shape == z.shape
+
+    z_for_switch = _torch.tensor([0.25], dtype=_torch.float32, requires_grad=True)
+    switch_grad = _torch.autograd.grad(
+        _assemble_raw_params(z_for_switch, (0,), specs)[1], z_for_switch
+    )[0]
+    assert _torch.equal(switch_grad, _torch.zeros_like(z_for_switch))
+
+
+def _all_switch_model_config() -> dict:
+    config = _deepcopy(_concat_lstm_model_config())
+    config["net"]["config"]["params"] = [
+        {
+            "name": "mode",
+            "min": 0,
+            "max": 2,
+            "default": 1,
+            "type": "switch",
+            "enum_names": ["clean", "crunch", "lead"],
+        }
+    ]
+    return config
+
+
+def _all_switch_data_config(tmp_path) -> dict:
+    data_config = _deepcopy(_build_data_config(tmp_path))
+    for entry in data_config["train"]:
+        entry["params"] = {"mode": entry["params"]["mode"]}
+    for entry in data_config["validation"]:
+        entry["params"] = {"mode": entry["params"]["mode"]}
+    return data_config
+
+
+def test_find_disagreement_settings_all_switch_evaluates_once_per_combo(
+    tmp_path, monkeypatch
+):
+    # With no continuous latents every restart/step would reproduce the identical
+    # candidate, so the search short-circuits to one evaluation per switch combo
+    # regardless of num_restarts (no duplicate candidates, no wasted no-op steps).
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    model_config = _all_switch_model_config()
+    checkpoint_paths = _train_ensemble(
+        _all_switch_data_config(tmp_path),
+        model_config,
+        _learning_config(),
+        tmp_path / "run",
+        ensemble_size=2,
+        base_seed=5,
+    )
+
+    specs = tuple(
+        _ParamSpec.from_dict(spec)
+        for spec in model_config["net"]["config"]["params"]
+    )
+    expected_switch_combos = set(_switch_combinations(specs))
+
+    candidates = _find_disagreement_settings(
+        checkpoint_paths,
+        model_config,
+        g_opt_input_wav=tmp_path / "input.wav",
+        num_restarts=4,
+        num_steps=3,
+        g_opt_ny=32,
+        g_opt_batch_size=2,
+        seed=13,
+    )
+
+    assert len(candidates) == len(expected_switch_combos)
+    assert {c.switch_combo for c in candidates} == expected_switch_combos
+    for candidate in candidates:
+        assert _math.isfinite(candidate.score)
+        assert candidate.raw_params.shape == (len(specs),)
