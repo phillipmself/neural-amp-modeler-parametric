@@ -1,3 +1,4 @@
+import json as _json
 import math as _math
 from copy import deepcopy as _deepcopy
 
@@ -9,8 +10,22 @@ from nam.models.parametric import assemble_raw_params as _assemble_raw_params
 from nam.models.parametric import ParamSpec as _ParamSpec
 from nam.models.parametric import split_param_indices as _split_param_indices
 from nam.models.parametric import switch_combinations as _switch_combinations
+from nam.data import init_dataset as _init_dataset
 from nam.data import np_to_wav as _np_to_wav
+from nam.data import Split as _Split
 from nam.train.active_learning import _clear_device_cache as _clear_device_cache
+from nam.train.active_learning import (
+    DisagreementCandidate as _DisagreementCandidate,
+)
+from nam.train.active_learning import (
+    append_to_data_config as _append_to_data_config,
+)
+from nam.train.active_learning import (
+    cluster_and_select as _cluster_and_select,
+)
+from nam.train.active_learning import (
+    emit_proposals as _emit_proposals,
+)
 from nam.train.active_learning import (
     find_disagreement_settings as _find_disagreement_settings,
 )
@@ -76,6 +91,69 @@ def _learning_config() -> dict:
         "threshold_esr": None,
         "trainer_fit_kwargs": {},
     }
+
+
+def _selection_model_config() -> dict:
+    return {
+        "net": {
+            "name": "ConcatLSTM",
+            "config": {
+                "params": [
+                    {
+                        "name": "gain",
+                        "min": 0.0,
+                        "max": 10.0,
+                        "default": 5.0,
+                        "type": "continuous",
+                    },
+                    {
+                        "name": "boost",
+                        "min": 0,
+                        "max": 1,
+                        "default": 0,
+                        "type": "switch",
+                        "enum_names": ["Off", "On"],
+                    },
+                ]
+            },
+        }
+    }
+
+
+def _candidate(gain: float, boost: int, score: float) -> _DisagreementCandidate:
+    return _DisagreementCandidate(
+        raw_params=_torch.tensor([gain, float(boost)], dtype=_torch.float32),
+        switch_combo=(boost,),
+        score=score,
+    )
+
+
+def _switch_only_model_config() -> dict:
+    return {
+        "net": {
+            "name": "ConcatLSTM",
+            "config": {
+                "params": [
+                    {
+                        "name": "boost",
+                        "min": 0,
+                        "max": 2,
+                        "default": 0,
+                        "type": "switch",
+                        "enum_names": ["Off", "Low", "High"],
+                    }
+                ]
+            },
+        }
+    }
+
+
+def _switch_only_candidate(boost: int, score: float) -> _DisagreementCandidate:
+    return _DisagreementCandidate(
+        raw_params=_torch.tensor([float(boost)], dtype=_torch.float32),
+        switch_combo=(boost,),
+        score=score,
+    )
 
 
 def _render_output(x: _np.ndarray, *, gain: float, mode_index: int) -> _np.ndarray:
@@ -478,3 +556,289 @@ def test_find_disagreement_settings_all_switch_evaluates_once_per_combo(
     for candidate in candidates:
         assert _math.isfinite(candidate.score)
         assert candidate.raw_params.shape == (len(specs),)
+
+
+def test_cluster_and_select_collapses_near_duplicates_per_switch_combo():
+    selected = _cluster_and_select(
+        [
+            _candidate(5.00, 0, 0.91),
+            _candidate(5.02, 0, 0.84),
+            _candidate(8.40, 0, 0.55),
+            _candidate(5.01, 1, 0.87),
+        ],
+        _selection_model_config(),
+        max_per_round=10,
+        cluster_threshold=0.01,
+    )
+
+    assert [(candidate.switch_combo, candidate.score) for candidate in selected] == [
+        ((0,), 0.91),
+        ((1,), 0.87),
+        ((0,), 0.55),
+    ]
+    assert [candidate.raw_params.tolist() for candidate in selected] == [
+        [5.0, 0.0],
+        [5.0, 1.0],
+        [8.5, 0.0],
+    ]
+
+
+def test_cluster_and_select_dedupes_after_quantization():
+    selected = _cluster_and_select(
+        [
+            _candidate(5.10, 0, 0.72),
+            _candidate(5.24, 0, 0.94),
+        ],
+        _selection_model_config(),
+        max_per_round=10,
+        cluster_threshold=0.01,
+    )
+
+    assert len(selected) == 1
+    assert selected[0].score == _pytest.approx(0.94)
+    assert selected[0].switch_combo == (0,)
+    assert selected[0].raw_params.tolist() == [5.0, 0.0]
+
+
+def test_cluster_and_select_limits_count_sorts_globally_and_quantizes():
+    selected = _cluster_and_select(
+        [
+            _candidate(1.10, 0, 0.20),
+            _candidate(4.26, 0, 0.80),
+            _candidate(7.74, 0, 0.50),
+            _candidate(2.24, 1, 0.90),
+        ],
+        _selection_model_config(),
+        max_per_round=3,
+        cluster_threshold=0.001,
+    )
+
+    assert [candidate.score for candidate in selected] == [0.90, 0.80, 0.50]
+    assert len(selected) == 3
+    for candidate in selected:
+        quantized_gain = float(candidate.raw_params[0])
+        assert 2.0 * quantized_gain == _pytest.approx(round(2.0 * quantized_gain))
+
+
+def test_emit_proposals_writes_json_with_decoded_named_params(tmp_path, capsys):
+    selected = [
+        _candidate(4.5, 1, 1.25),
+        _candidate(0.0, 0, 0.50),
+    ]
+
+    output_path, proposals = _emit_proposals(
+        selected,
+        _selection_model_config(),
+        round_idx=3,
+        output_dir=tmp_path,
+    )
+
+    assert output_path == tmp_path / "proposed_captures_round_3.json"
+    with output_path.open() as fp:
+        payload = _json.load(fp)
+
+    expected = [
+        {
+            "params": {"gain": 4.5, "boost": "On"},
+            "score": 1.25,
+            "y_path": "round_3_00.wav",
+        },
+        {
+            "params": {"gain": 0.0, "boost": "Off"},
+            "score": 0.5,
+            "y_path": "round_3_01.wav",
+        },
+    ]
+    assert payload == expected
+    assert proposals == expected
+    captured = capsys.readouterr()
+    assert "Capture checklist:" in captured.out
+    assert "1. round_3_00.wav -> gain=4.5, boost=On" in captured.out
+
+
+def test_append_to_data_config_preserves_splits_and_does_not_mutate_input(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    model_config = _selection_model_config()
+    selected = [
+        _candidate(4.5, 1, 1.25),
+        _candidate(8.0, 0, 0.75),
+    ]
+    x = _np.linspace(-0.5, 0.5, 64, dtype=_np.float32)
+    for filename, scale in (
+        ("input.wav", 1.0),
+        ("seed.wav", 0.8),
+        ("held_out.wav", 0.6),
+        ("round_4_00.wav", 0.7),
+        ("round_4_01.wav", 0.9),
+    ):
+        _np_to_wav(x * scale, tmp_path / filename, rate=48_000)
+    prev_data_config = {
+        "type": "parametric",
+        "common": {
+            "x_path": "input.wav",
+            "delay": 0,
+            "nx": 1,
+            "param_specs": _deepcopy(model_config["net"]["config"]["params"]),
+        },
+        "train": {
+            "y_path": "seed.wav",
+            "params": {"gain": 1.0, "boost": "Off"},
+            "start_seconds": 0.0,
+            "stop_seconds": None,
+            "ny": 16,
+        },
+        "validation": [
+            {
+                "y_path": "held_out.wav",
+                "params": {"gain": 2.0, "boost": "On"},
+            }
+        ],
+    }
+    original = _deepcopy(prev_data_config)
+    proposal_path, proposals = _emit_proposals(
+        selected,
+        model_config,
+        round_idx=4,
+        output_dir=tmp_path,
+    )
+
+    new_data_config, output_path = _append_to_data_config(
+        prev_data_config,
+        proposals,
+        model_config,
+        round_idx=4,
+        output_dir=tmp_path,
+    )
+
+    assert prev_data_config == original
+    assert proposal_path.exists()
+    assert output_path == tmp_path / "aggregated_data_config_4.json"
+    plot_path = tmp_path / "accepted_capture_distributions_round_4.png"
+    assert plot_path.exists()
+    assert new_data_config["type"] == "parametric"
+    assert new_data_config["common"] == {
+        "x_path": "input.wav",
+        "delay": 0,
+        "nx": 1,
+        "param_specs": [
+            _ParamSpec.from_dict(spec).to_dict()
+            for spec in model_config["net"]["config"]["params"]
+        ],
+    }
+    assert new_data_config["validation"] == original["validation"]
+    assert isinstance(new_data_config["train"], list)
+    assert new_data_config["train"][0] == original["train"]
+    assert new_data_config["train"][1:] == [
+        {
+            "y_path": "round_4_00.wav",
+            "params": {"gain": 4.5, "boost": "On"},
+            "start_seconds": 0.0,
+            "stop_seconds": None,
+            "ny": 16,
+        },
+        {
+            "y_path": "round_4_01.wav",
+            "params": {"gain": 8.0, "boost": "Off"},
+            "start_seconds": 0.0,
+            "stop_seconds": None,
+            "ny": 16,
+        },
+    ]
+    with proposal_path.open() as fp:
+        proposals = _json.load(fp)
+    assert [entry["y_path"] for entry in proposals] == [
+        train_entry["y_path"] for train_entry in new_data_config["train"][1:]
+    ]
+    with output_path.open() as fp:
+        persisted = _json.load(fp)
+    assert persisted == new_data_config
+    _init_dataset(new_data_config, _Split.TRAIN)
+
+
+def test_cluster_and_select_rejects_bad_arguments():
+    model_config = _selection_model_config()
+    with _pytest.raises(ValueError, match="max_per_round"):
+        _cluster_and_select([_candidate(5.0, 0, 0.5)], model_config, max_per_round=0)
+    with _pytest.raises(ValueError, match="cluster_threshold"):
+        _cluster_and_select(
+            [_candidate(5.0, 0, 0.5)],
+            model_config,
+            max_per_round=1,
+            cluster_threshold=-0.1,
+        )
+
+
+def test_cluster_and_select_empty_candidates_returns_empty():
+    assert _cluster_and_select([], _selection_model_config(), max_per_round=5) == []
+
+
+def test_cluster_and_select_switch_only_collapses_per_combo():
+    selected = _cluster_and_select(
+        [
+            _switch_only_candidate(0, 0.10),
+            _switch_only_candidate(0, 0.90),
+            _switch_only_candidate(2, 0.50),
+        ],
+        _switch_only_model_config(),
+        max_per_round=10,
+    )
+
+    assert [(candidate.switch_combo, candidate.score) for candidate in selected] == [
+        ((0,), 0.90),
+        ((2,), 0.50),
+    ]
+    assert [candidate.raw_params.tolist() for candidate in selected] == [[0.0], [2.0]]
+
+
+def test_cluster_and_select_rejects_switch_combo_raw_mismatch():
+    mismatched = _DisagreementCandidate(
+        raw_params=_torch.tensor([5.0, 1.0], dtype=_torch.float32),
+        switch_combo=(0,),
+        score=0.5,
+    )
+    with _pytest.raises(ValueError, match="switch column"):
+        _cluster_and_select(
+            [mismatched], _selection_model_config(), max_per_round=1
+        )
+
+
+def test_emit_proposals_empty_selection_writes_empty_list(tmp_path, capsys):
+    output_path, proposals = _emit_proposals(
+        [], _selection_model_config(), round_idx=2, output_dir=tmp_path
+    )
+
+    assert proposals == []
+    with output_path.open() as fp:
+        assert _json.load(fp) == []
+    assert "Capture checklist:" in capsys.readouterr().out
+
+
+def test_append_to_data_config_empty_selection_is_noop(tmp_path):
+    model_config = _selection_model_config()
+    prev_data_config = {
+        "type": "parametric",
+        "common": {"x_path": "input.wav", "delay": 0, "nx": 1},
+        "train": [
+            {"y_path": "seed.wav", "params": {"gain": 1.0, "boost": "Off"}, "ny": 16}
+        ],
+        "validation": [],
+    }
+    original = _deepcopy(prev_data_config)
+
+    new_data_config, output_path = _append_to_data_config(
+        prev_data_config,
+        [],
+        model_config,
+        round_idx=1,
+        output_dir=tmp_path,
+        plot=False,
+    )
+
+    assert prev_data_config == original
+    assert output_path == tmp_path / "aggregated_data_config_1.json"
+    # train is canonicalized to a list and param_specs injected, but no entries are added.
+    assert new_data_config["train"] == original["train"]
+    assert "param_specs" in new_data_config["common"]
+    assert not (tmp_path / "accepted_capture_distributions_round_1.png").exists()

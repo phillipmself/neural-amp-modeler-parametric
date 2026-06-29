@@ -9,6 +9,7 @@ parametric NAM training stack and runtime-selected device handling.
 import contextlib as _contextlib
 import gc as _gc
 import importlib as _importlib
+import json as _json
 import math as _math
 import shutil as _shutil
 from copy import deepcopy as _deepcopy
@@ -35,6 +36,8 @@ from nam.data import init_dataset as _init_dataset
 from nam.data import wav_to_tensor as _wav_to_tensor
 from nam.models.parametric import assemble_raw_params as _assemble_raw_params
 from nam.models.parametric import data_config_from_model as _data_config_from_model
+from nam.models.parametric import decode_named_params as _decode_named_params
+from nam.models.parametric import quantize_to_capture_grid as _quantize_to_capture_grid
 from nam.models.parametric import split_param_indices as _split_param_indices
 from nam.models.parametric import switch_combinations as _switch_combinations
 from nam.models.parametric import ParamSpec as _ParamSpec
@@ -48,9 +51,19 @@ from nam.util import filter_warnings as _filter_warnings
 
 __all__ = [
     "DisagreementCandidate",
+    "append_to_data_config",
+    "cluster_and_select",
+    "emit_proposals",
     "find_disagreement_settings",
     "train_ensemble",
 ]
+
+_DEFAULT_CLUSTER_THRESHOLD = 0.1
+_QUANTIZED_DEDUPE_DECIMALS = 8
+# Only these (windowing) keys are inherited from an existing train entry when appending a
+# proposed capture: the new captures should share the project's train windowing without
+# dragging along incidental per-entry keys (path overrides, comments, ...).
+_INHERITED_TRAIN_WINDOW_KEYS = ("start_seconds", "stop_seconds", "ny")
 
 
 @_dataclass(frozen=True)
@@ -96,6 +109,30 @@ def _canonical_param_specs(raw_param_specs: _Any) -> list[dict[str, _Any]]:
     return [spec.to_dict() for spec in _coerce_param_specs(raw_param_specs)]
 
 
+def _model_param_specs(model_config: dict) -> list[dict[str, _Any]]:
+    try:
+        return _canonical_param_specs(model_config["net"]["config"]["params"])
+    except KeyError as exc:
+        raise ValueError(
+            "Model config must define net.config.params for parametric dataset loading"
+        ) from exc
+
+
+def _validate_existing_param_specs_match(
+    common: dict,
+    model_param_specs: list[dict[str, _Any]],
+) -> None:
+    # No-op when common carries no param_specs; otherwise it must match the model's.
+    if (
+        "param_specs" in common
+        and _canonical_param_specs(common["param_specs"]) != model_param_specs
+    ):
+        raise ValueError(
+            "Data config common.param_specs does not match "
+            "model_config['net']['config']['params']"
+        )
+
+
 def _prepare_data_config(data_config: dict, model_config: dict) -> dict:
     data_config = _deepcopy(data_config)
     common = data_config.get("common", {})
@@ -106,19 +143,7 @@ def _prepare_data_config(data_config: dict, model_config: dict) -> dict:
     # param_specs. Tolerate that only when it matches the model's specs, then strip it
     # so data_config_from_model re-injects the canonical copy (it raises on duplicates).
     if "param_specs" in common:
-        try:
-            model_param_specs = _canonical_param_specs(
-                model_config["net"]["config"]["params"]
-            )
-        except KeyError as exc:
-            raise ValueError(
-                "Model config must define net.config.params for parametric dataset loading"
-            ) from exc
-        if _canonical_param_specs(common["param_specs"]) != model_param_specs:
-            raise ValueError(
-                "Data config common.param_specs does not match "
-                "model_config['net']['config']['params']"
-            )
+        _validate_existing_param_specs_match(common, _model_param_specs(model_config))
         common = dict(common)
         del common["param_specs"]
         data_config["common"] = common
@@ -257,6 +282,228 @@ def _param_specs_from_model_config(model_config: dict) -> tuple[_ParamSpec, ...]
             "Model config must define net.config.params for disagreement search"
         ) from exc
     return tuple(_coerce_param_specs(raw_specs))
+
+
+def _validate_round_idx(round_idx: int) -> None:
+    if round_idx < 0:
+        raise ValueError(f"round_idx must be non-negative; got {round_idx}")
+
+
+def _validate_candidate_raw_params(
+    candidate: DisagreementCandidate,
+    *,
+    specs: _Sequence[_ParamSpec],
+    switch_idx: tuple[int, ...],
+) -> _torch.Tensor:
+    if not _math.isfinite(candidate.score):
+        raise ValueError(f"Candidate score must be finite; got {candidate.score}")
+    if len(candidate.switch_combo) != len(switch_idx):
+        raise ValueError(
+            f"Candidate switch_combo must have length {len(switch_idx)}; "
+            f"got {len(candidate.switch_combo)}"
+        )
+    raw_params = _torch.as_tensor(candidate.raw_params).detach().cpu().to(_torch.float64)
+    if raw_params.ndim != 1:
+        raise ValueError(
+            f"Candidate raw_params must have shape (P,); got {tuple(raw_params.shape)}"
+        )
+    if raw_params.shape[0] != len(specs):
+        raise ValueError(
+            f"Candidate raw_params must have length {len(specs)}; "
+            f"got {raw_params.shape[0]}"
+        )
+    # Clustering groups by switch_combo while decode/quantize read the raw switch columns;
+    # cross-check them so an inconsistent candidate can't be grouped as one switch state and
+    # emitted as another.
+    for position, column in enumerate(switch_idx):
+        raw_switch = float(raw_params[column])
+        if not raw_switch.is_integer() or int(raw_switch) != candidate.switch_combo[position]:
+            raise ValueError(
+                f"Candidate raw_params switch column {column} (={raw_switch}) must equal "
+                f"switch_combo[{position}]={candidate.switch_combo[position]}"
+            )
+    return raw_params
+
+
+def _normalized_continuous_params(
+    raw_params: _torch.Tensor,
+    *,
+    continuous_idx: tuple[int, ...],
+    mins: _torch.Tensor,
+    widths: _torch.Tensor,
+) -> _torch.Tensor:
+    if len(continuous_idx) == 0:
+        return _torch.empty((0,), dtype=_torch.float64)
+    return ((raw_params[list(continuous_idx)] - mins) / widths) * 2.0 - 1.0
+
+
+def _quantized_dedupe_key(raw_params: _torch.Tensor) -> tuple[float, ...]:
+    return tuple(
+        round(float(value), _QUANTIZED_DEDUPE_DECIMALS)
+        for value in raw_params.detach().cpu().to(_torch.float64).tolist()
+    )
+
+
+def _make_round_y_path(
+    round_idx: int,
+    index: int,
+    total_count: int,
+    *,
+    y_path_prefix: str,
+) -> str:
+    _validate_round_idx(round_idx)
+    if total_count <= 0:
+        raise ValueError(f"total_count must be positive; got {total_count}")
+    if index < 0 or index >= total_count:
+        raise ValueError(
+            f"index must be within [0, {total_count - 1}]; got {index}"
+        )
+    width = max(2, len(str(max(total_count - 1, 0))))
+    return f"{y_path_prefix}{round_idx}_{index:0{width}d}.wav"
+
+
+def _selected_capture_records(
+    selected: _Sequence[DisagreementCandidate],
+    specs: tuple[_ParamSpec, ...],
+    *,
+    round_idx: int,
+    y_path_prefix: str,
+) -> list[dict[str, _Any]]:
+    # An empty selection is a valid no-op round (the acquisition search may exhaust the
+    # space): emit_proposals writes an empty list and append_to_data_config copies the
+    # config through unchanged, rather than crashing the round.
+    _, switch_idx, _ = _split_param_indices(specs)
+    total_count = len(selected)
+    records = []
+    for index, candidate in enumerate(selected):
+        raw_params = _validate_candidate_raw_params(
+            candidate,
+            specs=specs,
+            switch_idx=switch_idx,
+        )
+        records.append(
+            {
+                "params": _decode_named_params(raw_params, specs),
+                "score": float(candidate.score),
+                "y_path": _make_round_y_path(
+                    round_idx,
+                    index,
+                    total_count,
+                    y_path_prefix=y_path_prefix,
+                ),
+            }
+        )
+    return records
+
+
+def _inject_canonical_param_specs(
+    data_config: dict,
+    model_config: dict,
+) -> dict[str, _Any]:
+    model_param_specs = _model_param_specs(model_config)
+    common = data_config.get("common")
+    if not isinstance(common, dict):
+        raise ValueError("data_config['common'] must be a mapping")
+    common = _deepcopy(common)
+    _validate_existing_param_specs_match(common, model_param_specs)
+    common["param_specs"] = model_param_specs
+    return common
+
+
+def _make_appended_train_entry(
+    template_entry: dict[str, _Any],
+    record: dict[str, _Any],
+) -> dict[str, _Any]:
+    new_entry: dict[str, _Any] = {
+        "y_path": record["y_path"],
+        "params": _deepcopy(record["params"]),
+    }
+    for key in _INHERITED_TRAIN_WINDOW_KEYS:
+        if key in template_entry:
+            new_entry[key] = _deepcopy(template_entry[key])
+    return new_entry
+
+
+def _accepted_capture_plot_path(output_dir: _Path, round_idx: int) -> _Path:
+    return output_dir / f"accepted_capture_distributions_round_{round_idx}.png"
+
+
+def _plot_accepted_capture_distributions(
+    *,
+    train_entries: _Sequence[dict[str, _Any]],
+    specs: _Sequence[_ParamSpec],
+    round_idx: int,
+    output_dir: _Path,
+) -> _Path:
+    # Build the figure through the object-oriented API (no pyplot) so plotting never touches
+    # matplotlib's global interactive-backend state: a headless active_learn.py run can't
+    # hang or fail on GUI-backend selection, and there is no global figure registry to leak.
+    figure_module = _importlib.import_module("matplotlib.figure")
+    output_dir = _Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _accepted_capture_plot_path(output_dir, round_idx)
+
+    fig = figure_module.Figure(figsize=(8.0, 2.75 * len(specs)))
+    axes = fig.subplots(len(specs), 1)
+    axes_seq = list(axes.ravel()) if hasattr(axes, "ravel") else [axes]
+
+    for ax, spec in zip(axes_seq, specs):
+        values = [entry["params"][spec.name] for entry in train_entries]
+        if spec.type == "switch":
+            if spec.enum_names is None:
+                raise RuntimeError(
+                    f"Switch ParamSpec {spec.name!r} is missing enum_names after validation"
+                )
+            counts = {name: 0 for name in spec.enum_names}
+            for value in values:
+                if isinstance(value, str):
+                    if value not in counts:
+                        raise ValueError(
+                            f"Train entry params[{spec.name!r}] has unknown enum name {value!r}"
+                        )
+                    counts[value] += 1
+                else:
+                    index = int(float(value))
+                    if index < 0 or index >= len(spec.enum_names):
+                        raise ValueError(
+                            f"Train entry params[{spec.name!r}] index {index} is out of range"
+                        )
+                    counts[spec.enum_names[index]] += 1
+            ax.bar(list(counts.keys()), list(counts.values()))
+        else:
+            numeric_values = [float(value) for value in values]
+            if len(set(numeric_values)) == 1:
+                center = numeric_values[0]
+                half_width = max((spec.max - spec.min) / 20.0, 0.25)
+                bins = [center - half_width, center + half_width]
+            else:
+                bins = min(20, max(5, len(numeric_values)))
+            ax.hist(numeric_values, bins=bins)
+            ax.set_xlim(min(spec.min, min(numeric_values)), max(spec.max, max(numeric_values)))
+        ax.set_title(spec.name)
+        ax.set_ylabel("Count")
+    axes_seq[-1].set_xlabel("Value")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    return output_path
+
+
+def _format_capture_checklist(
+    entries: _Sequence[dict[str, _Any]],
+) -> str:
+    lines = ["Capture checklist:", "Train:"]
+    for index, entry in enumerate(entries, start=1):
+        settings = ", ".join(
+            f"{name}={value}" for name, value in entry["params"].items()
+        )
+        lines.append(f"{index}. {entry['y_path']} -> {settings}")
+    return "\n".join(lines)
+
+
+def _write_json(path: _Path, payload: _Any) -> None:
+    with path.open("w") as fp:
+        _json.dump(payload, fp, indent=2)
+        fp.write("\n")
 
 
 def _validate_g_opt_args(
@@ -659,3 +906,219 @@ def find_disagreement_settings(
         _clear_device_cache(device)
 
     return candidates
+
+
+def cluster_and_select(
+    candidates: _Sequence[DisagreementCandidate],
+    model_config: dict,
+    *,
+    max_per_round: int,
+    cluster_threshold: float = _DEFAULT_CLUSTER_THRESHOLD,
+) -> list[DisagreementCandidate]:
+    """
+    Greedily cluster high-disagreement candidates within each switch combination.
+
+    ``cluster_threshold`` is the maximum L2 distance in normalized continuous
+    ``[-1, 1]`` space for two candidates to be treated as one cluster; the default
+    ``0.1`` keeps nearby knob settings together while still allowing distinct proposals.
+
+    The clustering space is a fixed per-param ``[min, max] -> [-1, 1]`` linear map, chosen
+    deliberately so the threshold weights every continuous knob equally and stays
+    independent of each spec's model-side ``normalized_min/max`` tuning. It is *not* the
+    model's ``_encode_params`` space and is not required to match it.
+    """
+    if max_per_round <= 0:
+        raise ValueError(f"max_per_round must be positive; got {max_per_round}")
+    if not _math.isfinite(cluster_threshold) or cluster_threshold < 0.0:
+        raise ValueError(
+            "cluster_threshold must be a non-negative finite number; "
+            f"got {cluster_threshold}"
+        )
+
+    specs = _param_specs_from_model_config(model_config)
+    continuous_idx, switch_idx, _ = _split_param_indices(specs)
+    if len(candidates) == 0:
+        return []
+
+    grouped_candidates: dict[tuple[int, ...], list[DisagreementCandidate]] = {}
+    for candidate in candidates:
+        grouped_candidates.setdefault(candidate.switch_combo, []).append(candidate)
+
+    mins = _torch.tensor(
+        [specs[index].min for index in continuous_idx],
+        dtype=_torch.float64,
+    )
+    widths = _torch.tensor(
+        [specs[index].max - specs[index].min for index in continuous_idx],
+        dtype=_torch.float64,
+    )
+    if len(continuous_idx) > 0 and _torch.any(widths <= 0.0):
+        raise ValueError("Continuous ParamSpecs must satisfy max > min for clustering")
+
+    representatives: list[DisagreementCandidate] = []
+    for grouped in grouped_candidates.values():
+        sorted_group = sorted(grouped, key=lambda candidate: candidate.score, reverse=True)
+        if len(continuous_idx) == 0:
+            representatives.append(
+                DisagreementCandidate(
+                    raw_params=_validate_candidate_raw_params(
+                        sorted_group[0],
+                        specs=specs,
+                        switch_idx=switch_idx,
+                    ).to(_torch.float32),
+                    switch_combo=sorted_group[0].switch_combo,
+                    score=sorted_group[0].score,
+                )
+            )
+            continue
+
+        kept_norms: list[_torch.Tensor] = []
+        # Greedy threshold-grouping adapted from PANAMA's cluster_gs /
+        # group_similar_vectors: walk candidates best-first and keep the first
+        # representative whose normalized continuous setting is farther than the threshold.
+        for candidate in sorted_group:
+            raw_params = _validate_candidate_raw_params(
+                candidate,
+                specs=specs,
+                switch_idx=switch_idx,
+            )
+            normalized = _normalized_continuous_params(
+                raw_params,
+                continuous_idx=continuous_idx,
+                mins=mins,
+                widths=widths,
+            )
+            if any(
+                _torch.linalg.vector_norm(normalized - kept).item() <= cluster_threshold
+                for kept in kept_norms
+            ):
+                continue
+            kept_norms.append(normalized)
+            representatives.append(
+                DisagreementCandidate(
+                    raw_params=raw_params.to(_torch.float32),
+                    switch_combo=candidate.switch_combo,
+                    score=candidate.score,
+                )
+            )
+
+    deduped: dict[tuple[float, ...], DisagreementCandidate] = {}
+    for candidate in representatives:
+        quantized = _quantize_to_capture_grid(candidate.raw_params, specs).to(_torch.float32)
+        quantized_candidate = DisagreementCandidate(
+            raw_params=quantized.detach().cpu(),
+            switch_combo=candidate.switch_combo,
+            score=candidate.score,
+        )
+        dedupe_key = _quantized_dedupe_key(quantized_candidate.raw_params)
+        existing = deduped.get(dedupe_key)
+        if existing is None or quantized_candidate.score > existing.score:
+            deduped[dedupe_key] = quantized_candidate
+
+    return sorted(
+        deduped.values(),
+        key=lambda candidate: candidate.score,
+        reverse=True,
+    )[:max_per_round]
+
+
+def emit_proposals(
+    selected: _Sequence[DisagreementCandidate],
+    model_config: dict,
+    *,
+    round_idx: int,
+    output_dir: _Path,
+    y_path_prefix: str = "round_",
+) -> tuple[_Path, list[dict[str, _Any]]]:
+    """
+    Write the selected settings for one active-learning round as a human-facing proposal
+    list and print a capture checklist.
+
+    Returns ``(proposals_path, proposals)``. The returned ``proposals`` are the canonical
+    per-capture records (decoded named params + suggested ``y_path``); feed them straight
+    into :func:`append_to_data_config` so the y_paths the human is told to capture are the
+    *same* ones written into the aggregated config (rather than independently re-deriving
+    them and risking silent divergence).
+    """
+    _validate_round_idx(round_idx)
+    specs = _param_specs_from_model_config(model_config)
+    records = _selected_capture_records(
+        selected,
+        specs,
+        round_idx=round_idx,
+        y_path_prefix=y_path_prefix,
+    )
+    output_dir = _Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"proposed_captures_round_{round_idx}.json"
+    _write_json(output_path, records)
+    print(_format_capture_checklist(records))
+    return output_path, records
+
+
+def append_to_data_config(
+    prev_data_config: dict,
+    proposals: _Sequence[dict[str, _Any]],
+    model_config: dict,
+    *,
+    round_idx: int,
+    output_dir: _Path,
+    plot: bool = True,
+) -> tuple[dict, _Path]:
+    """
+    Append one training entry per emitted proposal to a parametric ``data.json`` config,
+    preserving ``common`` and ``validation`` while canonicalizing ``train`` to a list.
+
+    ``proposals`` are the records returned by :func:`emit_proposals`. Consuming them here
+    (instead of re-deriving from the candidates) makes the proposals file and the aggregated
+    config share one source of truth, so a capture's suggested ``y_path`` cannot differ
+    between what the human is told to record and what training expects.
+
+    Returns ``(new_data_config, aggregated_config_path)``. When ``plot`` is true an accepted-
+    capture distribution PNG is also written next to the config (PANAMA parity); its path is
+    deterministic (``_accepted_capture_plot_path``). Plotting is a non-load-bearing side
+    effect: a plotting failure is warned about, never raised, so it can't abort the round.
+
+    Note: ``common.nx`` is not injected here; the training pipeline
+    (``_prepare_member_data_config``) sets it from the model's receptive field at train time.
+    A standalone ``init_dataset`` on this config therefore needs ``common.nx`` supplied.
+    """
+    _validate_round_idx(round_idx)
+    if prev_data_config.get("type") != "parametric":
+        raise ValueError(
+            "prev_data_config must be a parametric data config "
+            "(type='parametric')"
+        )
+    specs = _param_specs_from_model_config(model_config)
+
+    new_data_config = _deepcopy(prev_data_config)
+    new_data_config["common"] = _inject_canonical_param_specs(new_data_config, model_config)
+
+    if "train" not in new_data_config:
+        raise ValueError("prev_data_config must define a train split")
+    train_entries = [
+        _deepcopy(entry) for _, entry in _iter_split_entries(new_data_config["train"])
+    ]
+    if len(train_entries) == 0:
+        raise ValueError("prev_data_config['train'] must contain at least one entry")
+    template_entry = train_entries[0]
+    train_entries.extend(
+        _make_appended_train_entry(template_entry, record) for record in proposals
+    )
+    new_data_config["train"] = train_entries
+
+    output_dir = _Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"aggregated_data_config_{round_idx}.json"
+    _write_json(output_path, new_data_config)
+    if plot:
+        try:
+            _plot_accepted_capture_distributions(
+                train_entries=train_entries,
+                specs=specs,
+                round_idx=round_idx,
+                output_dir=output_dir,
+            )
+        except Exception as exc:  # pragma: no cover - plotting is cosmetic parity only
+            _warn(f"Failed to plot accepted-capture distributions: {exc}")
+    return new_data_config, output_path
