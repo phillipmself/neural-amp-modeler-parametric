@@ -167,3 +167,54 @@ def assemble_raw_params(
     # Concatenate per-spec column blocks (never in-place index assignment) so autograd
     # reaches z through the continuous columns while the switch columns stay constant.
     return _torch.cat(columns, dim=-1)
+
+
+def quantize_to_capture_grid(
+    raw: _torch.Tensor | _Sequence[float],
+    specs: _Sequence[_ParamSpec],
+    *,
+    default_step: float = 0.5,
+) -> _torch.Tensor:
+    """
+    Snap each *continuous* param to the realizable capture grid (nearest ``step``,
+    clamped into ``[min, max]``); leave *switch* indices untouched.
+
+    Human knobs can only be dialed to a fixed grid, so the value recorded in
+    ``data.json`` must equal the realizable setting that was actually captured (D5). This
+    is the single shared helper used by both the LHS starter script (Task 3) and the
+    active-learning proposals (Task 6) so they emit values on the *same* grid. It is a
+    pure, idempotent, output-time function: never call it inside the g-opt loop, which
+    must stay continuous or gradients break (D5).
+
+    A per-``ParamSpec`` ``step`` (realizability metadata only; it does not affect
+    normalization or training) overrides ``default_step`` when present. The field itself
+    is Task 3.5 plumbing; this helper honors it forward-compatibly via ``getattr`` so it
+    keeps working once the field lands without re-touching this code.
+    """
+    if not _math.isfinite(default_step) or default_step <= 0.0:
+        raise ValueError(
+            f"default_step must be a positive finite number; got {default_step}"
+        )
+    specs = tuple(specs)
+    raw = _torch.as_tensor(raw)
+    if raw.shape[-1] != len(specs):
+        raise ValueError(
+            f"Expected raw params trailing dimension {len(specs)}; got {raw.shape[-1]}"
+        )
+
+    # Output-time only: detach so a stray grad tensor can't leak a graph through the
+    # in-place column writes below, and work in float so integer-typed inputs round.
+    quantized = raw.detach().to(_torch.float64).clone()
+    for i, spec in enumerate(specs):
+        if spec.type == "switch":
+            continue
+        step = getattr(spec, "step", None)
+        step = default_step if step is None else float(step)
+        if not _math.isfinite(step) or step <= 0.0:
+            raise ValueError(
+                f"Capture-grid step for {spec.name!r} must be a positive finite number; "
+                f"got {step}"
+            )
+        snapped = _torch.round(quantized[..., i] / step) * step
+        quantized[..., i] = _torch.clamp(snapped, spec.min, spec.max)
+    return quantized

@@ -6,6 +6,7 @@ import torch as _torch
 from nam.models.parametric import assemble_raw_params as _assemble_raw_params
 from nam.models.parametric import decode_named_params as _decode_named_params
 from nam.models.parametric import ParamSpec as _ParamSpec
+from nam.models.parametric import quantize_to_capture_grid as _quantize_to_capture_grid
 from nam.models.parametric import split_param_indices as _split_param_indices
 from nam.models.parametric import switch_combinations as _switch_combinations
 from nam.models.parametric._dataset import resolve_named_params as _resolve_named_params
@@ -204,3 +205,67 @@ def test_decode_named_params_validation_errors(raw, match):
 def test_assemble_raw_params_validation_errors(z, combo, match):
     with _pytest.raises(ValueError, match=match):
         _assemble_raw_params(z, combo, _mixed_specs())
+
+
+def test_quantize_to_capture_grid_snaps_continuous_and_leaves_switches():
+    specs = _mixed_specs()
+    raw = _torch.tensor([3.3, 6.74, 1.0])
+
+    quantized = _quantize_to_capture_grid(raw, specs, default_step=0.5)
+
+    assert quantized[0].item() == _pytest.approx(3.5)
+    assert quantized[1].item() == _pytest.approx(6.5)
+    # Switch index is untouched.
+    assert quantized[2].item() == _pytest.approx(1.0)
+
+
+def test_quantize_to_capture_grid_is_idempotent():
+    specs = _mixed_specs()
+    raw = _torch.tensor([3.3, 6.74, 0.0])
+
+    once = _quantize_to_capture_grid(raw, specs)
+    twice = _quantize_to_capture_grid(once, specs)
+
+    assert _torch.allclose(once, twice)
+
+
+def test_quantize_to_capture_grid_clamps_into_spec_range():
+    specs = _mixed_specs()
+    raw = _torch.tensor([-2.0, 12.4, 1.0])
+
+    quantized = _quantize_to_capture_grid(raw, specs, default_step=0.5)
+
+    assert quantized[0].item() == _pytest.approx(0.0)
+    assert quantized[1].item() == _pytest.approx(10.0)
+
+
+def test_quantize_to_capture_grid_decodes_to_grid_aligned_user_values():
+    specs = _mixed_specs()
+    raw = _torch.tensor([3.3, 6.74, 1.0])
+
+    decoded = _decode_named_params(_quantize_to_capture_grid(raw, specs), specs)
+
+    assert decoded["Gain"] == _pytest.approx(3.5)
+    assert decoded["Tone"] == _pytest.approx(6.5)
+    assert decoded["Boost"] == "On"
+
+
+def test_quantize_to_capture_grid_accepts_python_sequences():
+    specs = _mixed_specs()
+
+    quantized = _quantize_to_capture_grid([3.3, 6.74, 0.0], specs)
+
+    assert quantized[0].item() == _pytest.approx(3.5)
+
+
+@_pytest.mark.parametrize("bad_step", [0.0, -0.5, _math.inf, _math.nan])
+def test_quantize_to_capture_grid_rejects_bad_default_step(bad_step):
+    specs = _mixed_specs()
+    with _pytest.raises(ValueError):
+        _quantize_to_capture_grid(_torch.tensor([1.0, 2.0, 0.0]), specs, default_step=bad_step)
+
+
+def test_quantize_to_capture_grid_rejects_wrong_length():
+    specs = _mixed_specs()
+    with _pytest.raises(ValueError):
+        _quantize_to_capture_grid(_torch.tensor([1.0, 2.0]), specs)

@@ -1,0 +1,450 @@
+"""
+Generate a PANAMA-style starter capture set as a parametric ``data.json`` skeleton.
+
+Adapted from PANAMA (Parametric Active-learning for Neural Amp Modeling Assistance),
+arXiv:2509.26564v1. The Latin-Hypercube starter-set idea and the active-learning
+capture workflow are due to the PANAMA authors.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from nam.models.parametric import ParamSpec
+from nam.models.parametric import decode_named_params
+from nam.models.parametric import quantize_to_capture_grid
+from nam.models.parametric import switch_combinations
+
+
+_DEFAULT_OUTPUT = Path("starter_data.json")
+_DEFAULT_ROUND_TO_NEAREST = 0.5
+# Seed a small held-out validation split by default: an empty ``validation`` list is a
+# list that ``nam.data.init_dataset`` routes through ``ConcatDataset``, which raises on an
+# empty dataset list, so the generated config would not be loadable by the parametric
+# training path. A fixed starter holdout also matches the plan's default (see D-plan Open
+# Question 1). Pass ``n_validation=0`` to opt out (e.g. when merging into another config).
+_DEFAULT_N_VALIDATION = 2
+_DEFAULT_VALIDATION_Y_PATH_PREFIX = "starter_val_"
+# Validation captures are a tail of unseen audio: mirror the example bundle's windowing
+# (start near the end, run to EOF, no fixed ``ny``) rather than the train windowing.
+_DEFAULT_VALIDATION_START_SECONDS = -9.0
+_DEFAULT_VALIDATION_STOP_SECONDS: float | None = None
+_DEFAULT_VALIDATION_NY: int | None = None
+# Large, fixed offset so the validation draws are a different LHS stream than the train
+# draws (held-out settings), while staying reproducible from the same ``seed``.
+_VALIDATION_SEED_OFFSET = 2**31 - 1
+
+
+def _load_param_specs(model_config_path: Path) -> tuple[ParamSpec, ...]:
+    with model_config_path.open() as fp:
+        model_config = json.load(fp)
+    try:
+        raw_specs = model_config["net"]["config"]["params"]
+    except KeyError as exc:
+        raise ValueError(
+            "Model config must define net.config.params for starter-set generation"
+        ) from exc
+    specs = tuple(ParamSpec.from_dict(spec) for spec in raw_specs)
+    if len(specs) == 0:
+        raise ValueError("Model config net.config.params must contain at least one ParamSpec")
+    return specs
+
+
+def _latin_hypercube_unit(
+    n: int,
+    dim: int,
+    *,
+    seed: int,
+) -> np.ndarray:
+    if n <= 0:
+        raise ValueError(f"n must be positive; got {n}")
+    if dim < 0:
+        raise ValueError(f"dim must be non-negative; got {dim}")
+    if dim == 0:
+        return np.zeros((n, 0), dtype=np.float64)
+
+    try:
+        from scipy.stats import qmc
+
+        sampler = qmc.LatinHypercube(d=dim, rng=np.random.default_rng(seed))
+        return np.asarray(sampler.random(n=n), dtype=np.float64)
+    except (ImportError, TypeError):
+        # ImportError: scipy absent. TypeError: scipy < 1.15 predates the ``rng=`` kwarg
+        # (it used ``seed=``); rather than special-case the version, fall back to the
+        # stratified-numpy sampler, which needs no scipy at all.
+        rng = np.random.default_rng(seed)
+        samples = np.empty((n, dim), dtype=np.float64)
+        for i in range(dim):
+            samples[:, i] = (rng.permutation(n) + rng.random(n)) / n
+        return samples
+
+
+def _scale_continuous_samples(
+    unit_samples: np.ndarray,
+    continuous_specs: Sequence[ParamSpec],
+) -> np.ndarray:
+    if unit_samples.shape[1] != len(continuous_specs):
+        raise ValueError(
+            f"Expected {len(continuous_specs)} continuous columns; got {unit_samples.shape[1]}"
+        )
+    if len(continuous_specs) == 0:
+        return unit_samples
+
+    mins = np.asarray([spec.min for spec in continuous_specs], dtype=np.float64)
+    widths = np.asarray(
+        [spec.max - spec.min for spec in continuous_specs], dtype=np.float64
+    )
+    return mins + unit_samples * widths
+
+
+def _stratified_switch_assignments(
+    specs: Sequence[ParamSpec],
+    n: int,
+    *,
+    seed: int,
+) -> np.ndarray:
+    combos = switch_combinations(specs)
+    if len(combos) == 1 and len(combos[0]) == 0:
+        return np.zeros((n, 0), dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    combo_array = np.asarray(combos, dtype=np.int64)
+    num_combos = combo_array.shape[0]
+    assignments = np.empty((n, combo_array.shape[1]), dtype=np.int64)
+    # Deal out shuffled full cycles of every switch combination. Balance is exact only
+    # when ``n`` is a multiple of ``num_combos``; otherwise the final partial cycle skews
+    # the counts by up to one per combination.
+    for start in range(0, n, num_combos):
+        stop = min(start + num_combos, n)
+        cycle = combo_array[rng.permutation(num_combos)]
+        assignments[start:stop] = cycle[: stop - start]
+    return assignments
+
+
+def _assemble_raw_settings(
+    continuous_samples: np.ndarray,
+    switch_assignments: np.ndarray,
+    specs: Sequence[ParamSpec],
+) -> list[np.ndarray]:
+    if continuous_samples.shape[0] != switch_assignments.shape[0]:
+        raise ValueError("Continuous and switch samples must have the same row count")
+
+    raw_settings: list[np.ndarray] = []
+    for row_index in range(continuous_samples.shape[0]):
+        raw = np.empty(len(specs), dtype=np.float64)
+        continuous_col = 0
+        switch_col = 0
+        for spec_index, spec in enumerate(specs):
+            if spec.type == "switch":
+                raw[spec_index] = float(switch_assignments[row_index, switch_col])
+                switch_col += 1
+            else:
+                raw[spec_index] = float(continuous_samples[row_index, continuous_col])
+                continuous_col += 1
+        raw_settings.append(raw)
+    return raw_settings
+
+
+def sample_raw_settings(
+    specs: Sequence[ParamSpec],
+    n: int,
+    *,
+    seed: int = 0,
+    full_grid: bool = False,
+) -> list[np.ndarray]:
+    specs = tuple(specs)
+    continuous_specs = tuple(spec for spec in specs if spec.type == "continuous")
+    rng = np.random.default_rng(seed)
+    continuous_seed = int(rng.integers(0, 2**32))
+    switch_seed = int(rng.integers(0, 2**32))
+    continuous_samples = _scale_continuous_samples(
+        _latin_hypercube_unit(n, len(continuous_specs), seed=continuous_seed),
+        continuous_specs,
+    )
+
+    if not full_grid:
+        switch_assignments = _stratified_switch_assignments(specs, n, seed=switch_seed)
+        return _assemble_raw_settings(continuous_samples, switch_assignments, specs)
+
+    combos = switch_combinations(specs)
+    tiled_continuous = np.repeat(continuous_samples, len(combos), axis=0)
+    repeated_switches = np.asarray(combos, dtype=np.int64)
+    switch_assignments = np.tile(repeated_switches, (n, 1))
+    return _assemble_raw_settings(tiled_continuous, switch_assignments, specs)
+
+
+def _make_y_path(prefix: str, index: int, total_count: int) -> str:
+    width = max(2, len(str(max(total_count - 1, 0))))
+    return f"{prefix}{index:0{width}d}.wav"
+
+
+def _decode_capture_params(
+    raw: np.ndarray,
+    specs: Sequence[ParamSpec],
+    *,
+    round_to_nearest: float | None,
+) -> dict[str, Any]:
+    # Quantize continuous values to the realizable knob grid before decoding so the
+    # recorded params equal the setting a human can actually dial (D5). The grid logic
+    # lives in the shared bridge helper, so the starter (Task 3) and the AL proposals
+    # (Task 6) stay on one grid; here we only choose whether to apply it.
+    if round_to_nearest is None:
+        return decode_named_params(raw, specs)
+    return decode_named_params(
+        quantize_to_capture_grid(raw, specs, default_step=round_to_nearest),
+        specs,
+    )
+
+
+def _build_entries(
+    raw_settings: list[np.ndarray],
+    specs: Sequence[ParamSpec],
+    *,
+    y_path_prefix: str,
+    start_seconds: float,
+    stop_seconds: float | None,
+    ny: int | None,
+    round_to_nearest: float | None,
+) -> list[dict[str, Any]]:
+    total_count = len(raw_settings)
+    entries = []
+    for index, raw in enumerate(raw_settings):
+        entries.append(
+            {
+                "y_path": _make_y_path(y_path_prefix, index, total_count),
+                "params": _decode_capture_params(
+                    raw, specs, round_to_nearest=round_to_nearest
+                ),
+                "start_seconds": start_seconds,
+                "stop_seconds": stop_seconds,
+                "ny": ny,
+            }
+        )
+    return entries
+
+
+def build_starter_data(
+    specs: Sequence[ParamSpec],
+    *,
+    n: int,
+    input_wav: str = "input.wav",
+    seed: int = 0,
+    full_grid: bool = False,
+    y_path_prefix: str = "starter_",
+    round_to_nearest: float | None = _DEFAULT_ROUND_TO_NEAREST,
+    start_seconds: float = 10.0,
+    stop_seconds: float | None = -9.0,
+    ny: int | None = 8192,
+    n_validation: int = _DEFAULT_N_VALIDATION,
+    validation_y_path_prefix: str = _DEFAULT_VALIDATION_Y_PATH_PREFIX,
+    validation_start_seconds: float = _DEFAULT_VALIDATION_START_SECONDS,
+    validation_stop_seconds: float | None = _DEFAULT_VALIDATION_STOP_SECONDS,
+    validation_ny: int | None = _DEFAULT_VALIDATION_NY,
+) -> dict[str, Any]:
+    if n_validation < 0:
+        raise ValueError(f"n_validation must be non-negative; got {n_validation}")
+
+    train_settings = sample_raw_settings(specs, n, seed=seed, full_grid=full_grid)
+    train = _build_entries(
+        train_settings,
+        specs,
+        y_path_prefix=y_path_prefix,
+        start_seconds=start_seconds,
+        stop_seconds=stop_seconds,
+        ny=ny,
+        round_to_nearest=round_to_nearest,
+    )
+
+    validation: list[dict[str, Any]] = []
+    if n_validation > 0:
+        # Held-out settings: a separate, reproducible LHS stream (always stratified, never
+        # full-grid) so the validation captures are distinct from the train ones.
+        validation_seed = (seed + _VALIDATION_SEED_OFFSET) % 2**32
+        validation_settings = sample_raw_settings(
+            specs, n_validation, seed=validation_seed, full_grid=False
+        )
+        validation = _build_entries(
+            validation_settings,
+            specs,
+            y_path_prefix=validation_y_path_prefix,
+            start_seconds=validation_start_seconds,
+            stop_seconds=validation_stop_seconds,
+            ny=validation_ny,
+            round_to_nearest=round_to_nearest,
+        )
+
+    return {
+        "type": "parametric",
+        "common": {"x_path": input_wav, "delay": 0},
+        "train": train,
+        "validation": validation,
+    }
+
+
+def _format_entry_lines(entries: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    for index, entry in enumerate(entries, start=1):
+        settings = ", ".join(
+            f"{name}={value}" for name, value in entry["params"].items()
+        )
+        lines.append(f"{index}. {entry['y_path']} -> {settings}")
+    return lines
+
+
+def format_capture_checklist(data_config: dict[str, Any]) -> str:
+    lines = ["Capture checklist:", "Train:"]
+    lines.extend(_format_entry_lines(data_config["train"]))
+    if data_config["validation"]:
+        lines.append("Validation (held out):")
+        lines.extend(_format_entry_lines(data_config["validation"]))
+    return "\n".join(lines)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a PANAMA-style starter capture set as a parametric data.json skeleton."
+        )
+    )
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        required=True,
+        help="Path to a model config JSON with net.config.params.",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=10,
+        help="Number of Latin-Hypercube continuous draws to generate.",
+    )
+    parser.add_argument(
+        "--input-wav",
+        default="input.wav",
+        help="Value to write into common.x_path.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=_DEFAULT_OUTPUT,
+        help="Where to write the generated parametric data.json skeleton.",
+    )
+    parser.add_argument(
+        "--full-grid",
+        action="store_true",
+        help=(
+            "Cross each continuous draw with every switch combination instead of using "
+            "balanced per-switch assignments."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducible sampling.",
+    )
+    parser.add_argument(
+        "--y-path-prefix",
+        default="starter_",
+        help="Placeholder output filename prefix, before the zero-padded index.",
+    )
+    parser.add_argument(
+        "--no-rounding",
+        action="store_true",
+        help="Disable the default continuous-parameter rounding to the nearest 0.5.",
+    )
+    parser.add_argument(
+        "--n-validation",
+        type=int,
+        default=_DEFAULT_N_VALIDATION,
+        help=(
+            "Number of held-out validation settings to seed (a separate LHS stream). "
+            "Use 0 to emit an empty validation split (not loadable on its own)."
+        ),
+    )
+    parser.add_argument(
+        "--validation-y-path-prefix",
+        default=_DEFAULT_VALIDATION_Y_PATH_PREFIX,
+        help="Placeholder output filename prefix for validation captures.",
+    )
+    parser.add_argument(
+        "--validation-start-seconds",
+        type=float,
+        default=_DEFAULT_VALIDATION_START_SECONDS,
+        help="Default start_seconds for each emitted validation entry.",
+    )
+    parser.add_argument(
+        "--validation-stop-seconds",
+        type=float,
+        default=_DEFAULT_VALIDATION_STOP_SECONDS,
+        help="Default stop_seconds for each validation entry (omit for end-of-file).",
+    )
+    parser.add_argument(
+        "--validation-ny",
+        type=int,
+        default=_DEFAULT_VALIDATION_NY,
+        help="Default ny for each validation entry (omit for the full clip).",
+    )
+    parser.add_argument(
+        "--start-seconds",
+        type=float,
+        default=10.0,
+        help="Default start_seconds for each emitted training entry.",
+    )
+    parser.add_argument(
+        "--stop-seconds",
+        type=float,
+        default=-9.0,
+        help="Default stop_seconds for each emitted training entry.",
+    )
+    parser.add_argument(
+        "--ny",
+        type=int,
+        default=8192,
+        help="Default ny for each emitted training entry.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    specs = _load_param_specs(args.model_config)
+    data_config = build_starter_data(
+        specs,
+        n=args.n,
+        input_wav=args.input_wav,
+        seed=args.seed,
+        full_grid=args.full_grid,
+        y_path_prefix=args.y_path_prefix,
+        round_to_nearest=None if args.no_rounding else _DEFAULT_ROUND_TO_NEAREST,
+        start_seconds=args.start_seconds,
+        stop_seconds=args.stop_seconds,
+        ny=args.ny,
+        n_validation=args.n_validation,
+        validation_y_path_prefix=args.validation_y_path_prefix,
+        validation_start_seconds=args.validation_start_seconds,
+        validation_stop_seconds=args.validation_stop_seconds,
+        validation_ny=args.validation_ny,
+    )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w") as fp:
+        json.dump(data_config, fp, indent=2)
+        fp.write("\n")
+
+    print(
+        f"Wrote {len(data_config['train'])} train + "
+        f"{len(data_config['validation'])} validation starter settings to {args.output}"
+    )
+    print(format_capture_checklist(data_config))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

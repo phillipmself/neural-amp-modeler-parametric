@@ -16,6 +16,7 @@ from ._export import export_parametric
 from ._export import output_scale_from_datasets
 from ._active_learning_params import assemble_raw_params
 from ._active_learning_params import decode_named_params
+from ._active_learning_params import quantize_to_capture_grid
 from ._active_learning_params import split_param_indices
 from ._active_learning_params import switch_combinations
 from ._concat_lstm import ConcatLSTM
@@ -40,6 +41,7 @@ __all__ = [
     "data_config_from_model",
     "export_parametric",
     "output_scale_from_datasets",
+    "quantize_to_capture_grid",
     "split_param_indices",
     "switch_combinations",
 ]
