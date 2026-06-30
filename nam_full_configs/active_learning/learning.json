@@ -1,8 +1,8 @@
 {
     "_notes": [
-        "Active-learning ensemble-member learning config, matching PANAMA's",
+        "Active-learning ensemble-member learning config, adapting PANAMA's",
         "default_config_files/learning/active_learning_LSTM.json (arXiv 2509.26564v1):",
-        "batch_size 512, 50 epochs. Used by scripts/active_learn.py / nam.train.active_learning.train_ensemble",
+        "50 epochs. Used by scripts/active_learn.py / nam.train.active_learning.train_ensemble",
         "to train each of the 4 disposable ConcatLSTM members serially on one device.",
         "DEVIATIONS from PANAMA (intentional, for this single-GPU port):",
         " * trainer.accelerator is rewritten at runtime to cuda > mps > cpu, so this stays device-agnostic",
@@ -10,12 +10,16 @@
         " * PANAMA disables in-loop validation (check_val_every_n_epoch 51) and takes the last checkpoint.",
         "   Our train_ensemble selects the val_loss-monitored BEST checkpoint, so validation must run:",
         "   check_val_every_n_epoch is left at its default (1) and the data config keeps a validation split.",
-        "PRACTICAL NOTE: batch_size 512 with drop_last requires enough training windows per batch; a small",
-        "starter capture set yields far fewer windows, so lower batch_size (and/or set drop_last false) when",
-        "iterating on a small set. Plain shuffled DataLoader (no capture-grouped batch sampler) is used."
+        " * batch_size is 128, not PANAMA's 512. ConcatLSTM trains with full backprop-through-time over each",
+        "   ny-length window (train_truncate null), so peak memory scales with batch_size * ny. The starter",
+        "   windows are ny=32768 (above the loss mask_first, below one LSTM block; see the data config), and",
+        "   512 * 32768 backprop OOMs a Mac (~80 GiB); batch_size 32 peaks near 5 GiB on MPS and a batch_size",
+        "   of 128 peaks near 20GB. Raise it on a",
+        "   large-VRAM CUDA box; lower it (and/or set drop_last false) for a very small capture set.",
+        "Plain shuffled DataLoader (no capture-grouped batch sampler) is used."
     ],
     "train_dataloader": {
-        "batch_size": 512,
+        "batch_size": 128,
         "shuffle": true,
         "pin_memory": true,
         "drop_last": true,
