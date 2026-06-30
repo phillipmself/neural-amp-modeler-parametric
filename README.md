@@ -23,3 +23,10 @@ Or on Windows,
 cd docs
 make.bat html
 ```
+
+## Active-learning capture selection (parametric)
+This fork adds a PANAMA-style ([arXiv 2509.26564v1](https://arxiv.org/html/2509.26564v1))
+active-learning loop that proposes *which knob settings to capture next* for a parametric model: it
+trains a disposable ConcatLSTM ensemble and finds the control settings where the members disagree
+most. See [docs/active_learning_usage.md](docs/active_learning_usage.md) for the workflow, with
+example configs in [nam_full_configs/active_learning/](nam_full_configs/active_learning/).

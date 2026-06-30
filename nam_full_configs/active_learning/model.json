@@ -1,0 +1,69 @@
+{
+    "_notes": [
+        "Active-learning ensemble-member config: a parametric ConcatLSTM, NOT the shipped HyperWaveNet.",
+        "The active-learning workflow is adapted from PANAMA (arXiv 2509.26564v1); the ConcatLSTM",
+        "conditioning scheme (encode the control vector, tile across time, concatenate to audio) is theirs.",
+        "Architecture/loss/optimizer mirror PANAMA's default_config_files/models/lstm.json (3 layers,",
+        "hidden_size 18, train_burn_in 8192, pre-emph MRSTFT loss, lr 0.008, ExponentialLR gamma 0.995)",
+        "rather than this repo's HyperWaveNet-tuned parametric config, since ConcatLSTM is a different",
+        "architecture. Tune during testing as needed.",
+        "This LSTM is a disposable query-by-committee acquisition proxy: scripts/active_learn.py trains a",
+        "4-member ensemble from this config to find the control settings where members disagree most.",
+        "ConcatLSTM derives its conditioning width (1 + encoded_param_dim) from the params below, so there",
+        "is no PANAMA-style 'conditioning_dim' key; the params block MUST match the production parametric",
+        "model you intend to capture for (here: the Gain/Tone/Boost example).",
+        "train_truncate is null so the full window trains in one gradient-carrying pass; with no truncation",
+        "the burn-in length is informational only and the loss mask_first (8192) is what excludes the",
+        "warm-up region from the loss, so training windows (ny) must exceed 8192."
+    ],
+    "net": {
+        "name": "ConcatLSTM",
+        "config": {
+            "hidden_size": 18,
+            "num_layers": 3,
+            "train_burn_in": 8192,
+            "train_truncate": null,
+            "params": [
+                {
+                    "name": "Gain",
+                    "min": 0,
+                    "max": 10,
+                    "default": 5,
+                    "type": "continuous"
+                },
+                {
+                    "name": "Tone",
+                    "min": 0,
+                    "max": 10,
+                    "default": 5.0,
+                    "type": "continuous"
+                },
+                {
+                    "name": "Boost",
+                    "type": "switch",
+                    "min": 0,
+                    "max": 1,
+                    "default": 0,
+                    "enum_names": [
+                        "Off",
+                        "On"
+                    ]
+                }
+            ]
+        }
+    },
+    "loss": {
+        "mask_first": 8192,
+        "pre_emph_mrstft_weight": 0.002,
+        "pre_emph_mrstft_coef": 0.85
+    },
+    "optimizer": {
+        "lr": 0.008
+    },
+    "lr_scheduler": {
+        "class": "ExponentialLR",
+        "kwargs": {
+            "gamma": 0.995
+        }
+    }
+}

@@ -1,0 +1,31 @@
+{
+    "_notes": [
+        "Active-learning ensemble-member learning config, matching PANAMA's",
+        "default_config_files/learning/active_learning_LSTM.json (arXiv 2509.26564v1):",
+        "batch_size 512, 50 epochs. Used by scripts/active_learn.py / nam.train.active_learning.train_ensemble",
+        "to train each of the 4 disposable ConcatLSTM members serially on one device.",
+        "DEVIATIONS from PANAMA (intentional, for this single-GPU port):",
+        " * trainer.accelerator is rewritten at runtime to cuda > mps > cpu, so this stays device-agnostic",
+        "   regardless of the value below.",
+        " * PANAMA disables in-loop validation (check_val_every_n_epoch 51) and takes the last checkpoint.",
+        "   Our train_ensemble selects the val_loss-monitored BEST checkpoint, so validation must run:",
+        "   check_val_every_n_epoch is left at its default (1) and the data config keeps a validation split.",
+        "PRACTICAL NOTE: batch_size 512 with drop_last requires enough training windows per batch; a small",
+        "starter capture set yields far fewer windows, so lower batch_size (and/or set drop_last false) when",
+        "iterating on a small set. Plain shuffled DataLoader (no capture-grouped batch sampler) is used."
+    ],
+    "train_dataloader": {
+        "batch_size": 512,
+        "shuffle": true,
+        "pin_memory": true,
+        "drop_last": true,
+        "num_workers": 0
+    },
+    "val_dataloader": {},
+    "trainer": {
+        "accelerator": "gpu",
+        "devices": 1,
+        "max_epochs": 50
+    },
+    "trainer_fit_kwargs": {}
+}
