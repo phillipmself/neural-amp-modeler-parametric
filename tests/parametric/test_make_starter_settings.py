@@ -174,6 +174,18 @@ def test_build_starter_data_seeds_held_out_validation_by_default():
         assert 0.0 <= gain <= 10.0
 
 
+def test_default_window_lengths_stay_within_single_lstm_block():
+    # Regression: validation entries used to default to a full EOF-length window (ny None),
+    # which spans several ConcatLSTM blocks and crashes the LSTM on Apple MPS. Both ny
+    # defaults must be finite, exceed the loss mask_first (8192), and stay below one block.
+    module = _load_script_module()
+    _CONCAT_LSTM_BLOCK = 65_535
+    _MASK_FIRST = 8192
+    for default_ny in (module._DEFAULT_NY, module._DEFAULT_VALIDATION_NY):
+        assert default_ny is not None
+        assert _MASK_FIRST < default_ny < _CONCAT_LSTM_BLOCK
+
+
 def test_build_starter_data_validation_can_be_disabled():
     module = _load_script_module()
     specs = _mixed_specs()

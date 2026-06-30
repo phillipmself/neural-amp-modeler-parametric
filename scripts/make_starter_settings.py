@@ -24,6 +24,14 @@ from nam.models.parametric import switch_combinations
 
 _DEFAULT_OUTPUT = Path("starter_data.json")
 _DEFAULT_ROUND_TO_NEAREST = 0.5
+# Default window length (samples) for both train and validation entries. Two constraints
+# bound it:
+#   * It must exceed the loss ``mask_first`` (8192 in the active-learning ConcatLSTM config);
+#     otherwise the whole window is masked out of the loss and there are no loss samples.
+#   * It is kept below one ConcatLSTM processing block (65535 samples). A longer window is
+#     processed as several sequential LSTM calls, which crashes the LSTM kernel on Apple MPS
+#     during the batch-size-1 validation forward.
+_DEFAULT_NY = 32768
 # Seed a small held-out validation split by default: an empty ``validation`` list is a
 # list that ``nam.data.init_dataset`` routes through ``ConcatDataset``, which raises on an
 # empty dataset list, so the generated config would not be loadable by the parametric
@@ -31,11 +39,12 @@ _DEFAULT_ROUND_TO_NEAREST = 0.5
 # Question 1). Pass ``n_validation=0`` to opt out (e.g. when merging into another config).
 _DEFAULT_N_VALIDATION = 2
 _DEFAULT_VALIDATION_Y_PATH_PREFIX = "starter_val_"
-# Validation captures are a tail of unseen audio: mirror the example bundle's windowing
-# (start near the end, run to EOF, no fixed ``ny``) rather than the train windowing.
+# Validation captures are a tail of unseen audio: start near the end and slice that tail
+# into ``_DEFAULT_NY`` windows. A fixed ny (rather than one EOF-length window) keeps each
+# validation window to a single ConcatLSTM block; see ``_DEFAULT_NY``.
 _DEFAULT_VALIDATION_START_SECONDS = -9.0
 _DEFAULT_VALIDATION_STOP_SECONDS: float | None = None
-_DEFAULT_VALIDATION_NY: int | None = None
+_DEFAULT_VALIDATION_NY: int | None = _DEFAULT_NY
 # Large, fixed offset so the validation draws are a different LHS stream than the train
 # draws (held-out settings), while staying reproducible from the same ``seed``.
 _VALIDATION_SEED_OFFSET = 2**31 - 1
@@ -54,6 +63,12 @@ def _load_param_specs(model_config_path: Path) -> tuple[ParamSpec, ...]:
     if len(specs) == 0:
         raise ValueError("Model config net.config.params must contain at least one ParamSpec")
     return specs
+
+
+def _load_loss_mask_first(model_config_path: Path) -> int:
+    with model_config_path.open() as fp:
+        model_config = json.load(fp)
+    return int(model_config.get("loss", {}).get("mask_first", 0))
 
 
 def _latin_hypercube_unit(
@@ -274,7 +289,7 @@ def build_starter_data(
     round_to_nearest: float | None = _DEFAULT_ROUND_TO_NEAREST,
     start_seconds: float = 10.0,
     stop_seconds: float | None = -9.0,
-    ny: int | None = 8192,
+    ny: int | None = 32768,
     n_validation: int = _DEFAULT_N_VALIDATION,
     validation_y_path_prefix: str = _DEFAULT_VALIDATION_Y_PATH_PREFIX,
     validation_start_seconds: float = _DEFAULT_VALIDATION_START_SECONDS,
@@ -423,7 +438,10 @@ def _parse_args() -> argparse.Namespace:
         "--validation-ny",
         type=int,
         default=_DEFAULT_VALIDATION_NY,
-        help="Default ny for each validation entry (omit for the full clip).",
+        help=(
+            "Default ny for each validation entry. Keep it below one ConcatLSTM block "
+            "(65535) so the validation forward does not crash the LSTM on Apple MPS."
+        ),
     )
     parser.add_argument(
         "--start-seconds",
@@ -440,8 +458,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ny",
         type=int,
-        default=8192,
-        help="Default ny for each emitted training entry.",
+        default=_DEFAULT_NY,
+        help=(
+            "Default ny for each emitted training entry. Must exceed the model's loss "
+            "mask_first, or the whole window is masked from the loss."
+        ),
     )
     return parser.parse_args()
 
@@ -449,6 +470,14 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     specs = _load_param_specs(args.model_config)
+    mask_first = _load_loss_mask_first(args.model_config)
+    for flag, value in (("--ny", args.ny), ("--validation-ny", args.validation_ny)):
+        if value is not None and value <= mask_first:
+            raise SystemExit(
+                f"{flag}={value} must exceed the model's loss mask_first={mask_first}; "
+                "otherwise the whole window is masked from the loss and training has no "
+                "loss samples."
+            )
     data_config = build_starter_data(
         specs,
         n=args.n,

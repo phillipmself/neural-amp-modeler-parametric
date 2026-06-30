@@ -47,7 +47,7 @@ assignment:
 ```bash
 python scripts/make_starter_settings.py \
   --model-config nam_full_configs/active_learning/model.json \
-  --n 10 --n-validation 2 --ny 32768 \
+  --n 10 --n-validation 2 \
   --output data.json
 ```
 
@@ -56,6 +56,12 @@ every switch combination), `--seed`, `--y-path-prefix`, `--no-rounding` (skip ca
 quantization), the `--start-seconds`/`--stop-seconds`/`--ny` window controls, and their
 `--validation-*` variants. Continuous values are snapped to the realizable knob grid (default 0.5)
 so the recorded setting equals the setting a human can actually dial.
+
+Train and validation windows default to `--ny`/`--validation-ny` of 32768 samples. That value is
+deliberately above the loss `mask_first` (8192 — below it the whole window is masked from the loss)
+and below one ConcatLSTM processing block (65535 — a longer window is split into several sequential
+LSTM calls, which crashes the LSTM kernel on Apple MPS during the batch-size-1 validation forward).
+The script refuses any `--ny`/`--validation-ny` at or below the model's `mask_first`.
 
 The script prints a capture checklist. **Reamp `input.wav` at each listed setting**, save each output
 to its `y_path` wav, and you have a trainable round-0 `data.json`.
