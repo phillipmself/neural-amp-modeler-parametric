@@ -119,14 +119,13 @@ def test_build_starter_data_full_grid_covers_every_switch_state():
     assert data_config["common"] == {"x_path": "input.wav", "delay": 0}
     assert len(data_config["train"]) == 6
     assert data_config["validation"] == []
-    assert [entry["y_path"] for entry in data_config["train"]] == [
-        "starter_00.wav",
-        "starter_01.wav",
-        "starter_02.wav",
-        "starter_03.wav",
-        "starter_04.wav",
-        "starter_05.wav",
-    ]
+    # y_path now encodes the decoded params (unique-prefix abbreviation + value), so
+    # paired Off/On rows share the same Gain/Tone stem and differ only in the Boost token.
+    for entry in data_config["train"]:
+        gain = module._format_param_value(entry["params"]["Gain"])
+        tone = module._format_param_value(entry["params"]["Tone"])
+        boost = entry["params"]["Boost"]
+        assert entry["y_path"] == f"starter_G{gain}_T{tone}_B{boost}.wav"
 
     boost_values = [entry["params"]["Boost"] for entry in data_config["train"]]
     assert boost_values.count("Off") == 3

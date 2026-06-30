@@ -179,9 +179,44 @@ def sample_raw_settings(
     return _assemble_raw_settings(tiled_continuous, switch_assignments, specs)
 
 
-def _make_y_path(prefix: str, index: int, total_count: int) -> str:
-    width = max(2, len(str(max(total_count - 1, 0))))
-    return f"{prefix}{index:0{width}d}.wav"
+def _abbreviate_param_names(names: Sequence[str]) -> dict[str, str]:
+    """
+    Map each param name to the shortest leading slice that is unique among ``names``.
+
+    Comparison is case-insensitive (so ``Treble``/``Tone`` need two letters and
+    ``boost``/``Bottom`` need three), but the returned abbreviation preserves the
+    original capitalization. A name that is a case-insensitive prefix of another falls
+    back to its full spelling.
+    """
+    names = list(names)
+    abbreviations: dict[str, str] = {}
+    for index, name in enumerate(names):
+        others = [other for i, other in enumerate(names) if i != index]
+        length = 1
+        while length < len(name) and any(
+            other.lower().startswith(name[:length].lower()) for other in others
+        ):
+            length += 1
+        abbreviations[name] = name[:length]
+    return abbreviations
+
+
+def _format_param_value(value: Any) -> str:
+    # Continuous params decode to floats (e.g. 4.5 -> "4.5", 1.0 -> "1"); switch params
+    # decode to their enum-name string.
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _make_y_path(
+    prefix: str, params: dict[str, Any], abbreviations: dict[str, str]
+) -> str:
+    parts = [
+        f"{abbreviations[name]}{_format_param_value(value)}"
+        for name, value in params.items()
+    ]
+    return f"{prefix}{'_'.join(parts)}.wav"
 
 
 def _decode_capture_params(
@@ -212,15 +247,14 @@ def _build_entries(
     ny: int | None,
     round_to_nearest: float | None,
 ) -> list[dict[str, Any]]:
-    total_count = len(raw_settings)
+    abbreviations = _abbreviate_param_names([spec.name for spec in specs])
     entries = []
-    for index, raw in enumerate(raw_settings):
+    for raw in raw_settings:
+        params = _decode_capture_params(raw, specs, round_to_nearest=round_to_nearest)
         entries.append(
             {
-                "y_path": _make_y_path(y_path_prefix, index, total_count),
-                "params": _decode_capture_params(
-                    raw, specs, round_to_nearest=round_to_nearest
-                ),
+                "y_path": _make_y_path(y_path_prefix, params, abbreviations),
+                "params": params,
                 "start_seconds": start_seconds,
                 "stop_seconds": stop_seconds,
                 "ny": ny,
@@ -352,7 +386,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--y-path-prefix",
         default="starter_",
-        help="Placeholder output filename prefix, before the zero-padded index.",
+        help="Placeholder output filename prefix, before the param-encoded stem.",
     )
     parser.add_argument(
         "--no-rounding",
@@ -435,7 +469,7 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w") as fp:
-        json.dump(data_config, fp, indent=2)
+        json.dump(data_config, fp, indent=4)
         fp.write("\n")
 
     print(
