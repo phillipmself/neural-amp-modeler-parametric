@@ -14,12 +14,13 @@
         "   ny-length window (train_truncate null), so peak memory scales with batch_size * ny. The starter",
         "   windows are ny=32768 (above the loss mask_first, below one LSTM block; see the data config), and",
         "   512 * 32768 backprop OOMs a Mac (~80 GiB); batch_size 32 peaks near 5 GiB on MPS and a batch_size",
-        "   of 128 peaks near 20GB. Raise it on a",
-        "   large-VRAM CUDA box; lower it (and/or set drop_last false) for a very small capture set.",
+        "   of 128 peaks near 20GB. Raise it on a large-VRAM CUDA box; lower it (and/or set drop_last false)",
+        "   for a very small capture set. Watch the tensorboard to verify that training is converging if you",
+        "   raise the batch size.",
         "Plain shuffled DataLoader (no capture-grouped batch sampler) is used."
     ],
     "train_dataloader": {
-        "batch_size": 128,
+        "batch_size": 32,
         "shuffle": true,
         "pin_memory": true,
         "drop_last": true,

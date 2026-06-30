@@ -138,7 +138,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-per-round",
         type=int,
-        default=5,
+        default=10,
         help="Maximum number of proposed captures to emit this round.",
     )
     parser.add_argument(
