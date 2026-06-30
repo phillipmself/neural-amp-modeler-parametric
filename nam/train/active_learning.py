@@ -51,10 +51,12 @@ from nam.util import filter_warnings as _filter_warnings
 
 __all__ = [
     "DisagreementCandidate",
+    "RoundResult",
     "append_to_data_config",
     "cluster_and_select",
     "emit_proposals",
     "find_disagreement_settings",
+    "run_round",
     "train_ensemble",
 ]
 
@@ -1122,3 +1124,193 @@ def append_to_data_config(
         except Exception as exc:  # pragma: no cover - plotting is cosmetic parity only
             _warn(f"Failed to plot accepted-capture distributions: {exc}")
     return new_data_config, output_path
+
+
+@_dataclass(frozen=True)
+class RoundResult:
+    """Outcome of one active-learning round (see :func:`run_round`)."""
+
+    round_idx: int
+    checkpoint_paths: list[_Path]
+    candidates: list[DisagreementCandidate]
+    selected: list[DisagreementCandidate]
+    proposals: list[dict[str, _Any]]
+    proposals_path: _Path
+    aggregated_data_config: dict[str, _Any]
+    aggregated_config_path: _Path
+
+
+def _resolve_g_opt_input_wav(
+    g_opt_input_wav: str | _Path | None,
+    data_config: dict,
+) -> str | _Path:
+    # PANAMA reamps one fixed input clip at every proposed setting; default it to the
+    # config's own input (common.x_path) so the g-opt search runs over the same signal the
+    # captures are recorded against (plan Open Question 2 default).
+    if g_opt_input_wav is not None:
+        return g_opt_input_wav
+    common = data_config.get("common", {})
+    x_path = common.get("x_path") if isinstance(common, dict) else None
+    if not x_path:
+        raise ValueError(
+            "g_opt_input_wav was not provided and data_config['common']['x_path'] is "
+            "missing; pass an explicit g-opt input wav or set common.x_path"
+        )
+    return x_path
+
+
+def run_round(
+    *,
+    round_idx: int,
+    output_dir: str | _Path,
+    data_config: dict,
+    model_config: dict,
+    learning_config: dict,
+    g_opt_input_wav: str | _Path | None = None,
+    ensemble_size: int = 4,
+    num_restarts: int = 8,
+    num_steps: int = 200,
+    max_per_round: int = 5,
+    g_opt_ny: int = 32768,
+    g_opt_batch_size: int = 16,
+    use_mel: bool = False,
+    cluster_threshold: float = _DEFAULT_CLUSTER_THRESHOLD,
+    seed: int = 0,
+    checkpoint_paths: _Sequence[str | _Path] | None = None,
+    y_path_prefix: str = "round_",
+    plot: bool = True,
+) -> RoundResult:
+    """
+    Run one active-learning round end to end (PANAMA-style query-by-committee).
+
+    Sequences the Task 4-6 building blocks: (1) train (or reuse) a serial ConcatLSTM
+    ensemble, (2) search for high-disagreement control settings, (3) cluster/quantize/select
+    the top proposals, and (4) emit a human-facing proposal list plus an aggregated
+    ``data.json`` for the next round. One call == one round; the human then records the
+    proposed captures, fills the placeholder ``y_path``s, and reruns with ``round_idx + 1``
+    against the returned ``aggregated_data_config``.
+
+    ``seed`` drives both the ensemble member seeds (``base_seed``) and the g-opt latent
+    inits, so a round is reproducible from a single value. ``g_opt_input_wav`` defaults to
+    ``data_config['common']['x_path']``. Pass ``checkpoint_paths`` to skip retraining and
+    reuse an already-trained ensemble (e.g. resuming a round after a g-opt crash).
+
+    Quantization to the capture grid happens inside :func:`cluster_and_select`, never here or
+    in the g-opt loop (plan D5).
+    """
+    _validate_round_idx(round_idx)
+    net_name = model_config.get("net", {}).get("name") if isinstance(
+        model_config.get("net"), dict
+    ) else None
+    if net_name != "ConcatLSTM":
+        raise ValueError(
+            "run_round requires model_config['net']['name'] == 'ConcatLSTM'; "
+            f"got {net_name!r}"
+        )
+
+    output_dir = _Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-running a round regenerates placeholder y_paths; if the human has already filled
+    # them in the aggregated config, that hand-entered data is about to be overwritten.
+    aggregated_config_target = output_dir / f"aggregated_data_config_{round_idx}.json"
+    if aggregated_config_target.exists():
+        _warn(
+            f"{aggregated_config_target} already exists and will be overwritten; any "
+            "y_paths you filled in for this round will be regenerated as placeholders. "
+            "Back it up first if you have edited it."
+        )
+
+    # Snapshot the resolved inputs for provenance before anything mutates them.
+    for basename, config in (
+        ("data", data_config),
+        ("model", model_config),
+        ("learning", learning_config),
+    ):
+        _write_json(output_dir / f"round_{round_idx}_input_{basename}_config.json", config)
+
+    resolved_g_opt_wav = _resolve_g_opt_input_wav(g_opt_input_wav, data_config)
+
+    # Record the round's own knobs (not captured by the config snapshots) so a round is
+    # reproducible from this file alone. Written before training so it survives a crash.
+    _write_json(
+        output_dir / f"round_{round_idx}_run_args.json",
+        {
+            "round_idx": round_idx,
+            "g_opt_input_wav": str(resolved_g_opt_wav),
+            "ensemble_size": ensemble_size,
+            "num_restarts": num_restarts,
+            "num_steps": num_steps,
+            "max_per_round": max_per_round,
+            "g_opt_ny": g_opt_ny,
+            "g_opt_batch_size": g_opt_batch_size,
+            "use_mel": use_mel,
+            "cluster_threshold": cluster_threshold,
+            "seed": seed,
+            "y_path_prefix": y_path_prefix,
+            "reused_checkpoint_paths": (
+                None if checkpoint_paths is None else [str(p) for p in checkpoint_paths]
+            ),
+        },
+    )
+
+    if checkpoint_paths is None:
+        resolved_checkpoints = train_ensemble(
+            data_config,
+            model_config,
+            learning_config,
+            output_dir / f"ensemble_round_{round_idx}",
+            ensemble_size=ensemble_size,
+            base_seed=seed,
+        )
+    else:
+        resolved_checkpoints = [_Path(path) for path in checkpoint_paths]
+        if len(resolved_checkpoints) == 0:
+            raise ValueError("checkpoint_paths, when provided, must be non-empty")
+
+    candidates = find_disagreement_settings(
+        resolved_checkpoints,
+        model_config,
+        g_opt_input_wav=resolved_g_opt_wav,
+        num_restarts=num_restarts,
+        num_steps=num_steps,
+        g_opt_ny=g_opt_ny,
+        g_opt_batch_size=g_opt_batch_size,
+        use_mel=use_mel,
+        seed=seed,
+    )
+
+    selected = cluster_and_select(
+        candidates,
+        model_config,
+        max_per_round=max_per_round,
+        cluster_threshold=cluster_threshold,
+    )
+
+    proposals_path, proposals = emit_proposals(
+        selected,
+        model_config,
+        round_idx=round_idx,
+        output_dir=output_dir,
+        y_path_prefix=y_path_prefix,
+    )
+
+    aggregated_data_config, aggregated_config_path = append_to_data_config(
+        data_config,
+        proposals,
+        model_config,
+        round_idx=round_idx,
+        output_dir=output_dir,
+        plot=plot,
+    )
+
+    return RoundResult(
+        round_idx=round_idx,
+        checkpoint_paths=resolved_checkpoints,
+        candidates=candidates,
+        selected=selected,
+        proposals=proposals,
+        proposals_path=proposals_path,
+        aggregated_data_config=aggregated_data_config,
+        aggregated_config_path=aggregated_config_path,
+    )
