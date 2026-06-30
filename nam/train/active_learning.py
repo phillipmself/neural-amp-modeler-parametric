@@ -22,6 +22,7 @@ from warnings import warn as _warn
 
 import pytorch_lightning as _pl
 import torch as _torch
+from tqdm import tqdm as _tqdm
 from lightning_fabric.utilities.warnings import PossibleUserWarning as _PossibleUserWarning
 from pytorch_lightning.callbacks import ModelCheckpoint as _ModelCheckpoint
 from torch.utils.data import DataLoader as _DataLoader
@@ -552,14 +553,47 @@ def _load_disagreement_members(
         )
         member = module.net.to(device)
         member.requires_grad_(False)
-        # Always eval(): find_disagreement_settings runs the g-opt loop under
-        # cuDNN-disabled on cuda so the RNN backward works without train() mode. train()
-        # would otherwise divert ConcatLSTM through its truncated-BPTT path (detached
-        # burn-in + per-chunk-detached hidden state), silently changing the gradient to z
-        # on cuda relative to cpu/mps.
+        # Default to eval(); find_disagreement_settings flips members to train() only on the
+        # cuda fast path (see _g_opt_cuda_train_mode_safe), where train() is equivalent to
+        # eval() but lets cuDNN's RNN backward run. Otherwise eval() + cuDNN disabled is kept
+        # so the forward/gradient to z stay identical across devices.
         member.eval()
         members.append(member)
     return members
+
+
+def _g_opt_cuda_train_mode_safe(
+    members: _Sequence[_torch.nn.Module],
+    model_config: dict,
+) -> bool:
+    """Whether the members can run g-opt in train() mode (re-enabling cuDNN) without changing
+    results relative to the eval() + cuDNN-disabled path.
+
+    cuDNN's RNN backward refuses to run in eval() mode, so the device-agnostic path disables
+    cuDNN on cuda to keep the members in eval() -- correct, but it forces the slow native RNN
+    unroll. Running the frozen members in train() instead restores the fast cuDNN kernel, but
+    only when train() does not alter the forward/gradient:
+
+      * ``train_truncate is None`` -- ConcatLSTM takes the same full-sequence forward branch
+        in train() and eval(); a set ``train_truncate`` would divert it through truncated BPTT
+        (detached burn-in + per-chunk-detached hidden state), changing the gradient to z.
+      * no dropout / batchnorm -- train() must add no stochasticity or running-stat updates.
+    """
+    net_config = model_config.get("net", {})
+    net_config = net_config.get("config", {}) if isinstance(net_config, dict) else {}
+    if not isinstance(net_config, dict) or net_config.get("train_truncate") is not None:
+        return False
+    for member in members:
+        for submodule in member.modules():
+            if isinstance(submodule, _torch.nn.RNNBase):
+                if float(getattr(submodule, "dropout", 0.0)) > 0.0:
+                    return False
+            elif isinstance(submodule, _torch.nn.modules.dropout._DropoutNd):
+                if float(getattr(submodule, "p", 0.0)) > 0.0:
+                    return False
+            elif isinstance(submodule, _torch.nn.modules.batchnorm._BatchNorm):
+                return False
+    return True
 
 
 def _build_g_opt_batches(
@@ -838,18 +872,43 @@ def find_disagreement_settings(
     generator = _torch.Generator()
     generator.manual_seed(seed)
     n_cont = len(continuous_idx)
-    # Disable cuDNN only on cuda so the RNN backward runs with the members in eval() mode
-    # (see _load_disagreement_members); cpu/mps need nothing. This keeps the forward and
-    # the gradient to z identical across devices.
+    # On cuda, prefer the fast path: flip the (frozen) members to train() so cuDNN's RNN
+    # backward runs with cuDNN enabled -- but only when that is provably equivalent to eval()
+    # (see _g_opt_cuda_train_mode_safe). Otherwise fall back to eval() + cuDNN disabled, which
+    # is correct but runs the slow native RNN unroll. cpu/mps always use the plain eval() path.
+    use_cuda_train_mode = device.type == "cuda" and _g_opt_cuda_train_mode_safe(
+        members, model_config
+    )
+    if use_cuda_train_mode:
+        for member in members:
+            member.train()
+        print(
+            "  g-opt: using cuDNN train() fast path on cuda "
+            "(train_truncate=None, no dropout/batchnorm).",
+            flush=True,
+        )
+    elif device.type == "cuda":
+        print(
+            "  g-opt: using eval() + cuDNN-disabled path on cuda (slow native RNN unroll); "
+            "set train_truncate=None and drop dropout/batchnorm to enable the fast path.",
+            flush=True,
+        )
     cudnn_ctx = (
         _torch.backends.cudnn.flags(enabled=False)
-        if device.type == "cuda"
+        if device.type == "cuda" and not use_cuda_train_mode
         else _contextlib.nullcontext()
     )
     candidates: list[DisagreementCandidate] = []
+    switch_combos = list(_switch_combinations(specs))
+    num_combos = len(switch_combos)
     try:
         with cudnn_ctx:
-            for switch_combo in _switch_combinations(specs):
+            for combo_idx, switch_combo in enumerate(switch_combos, start=1):
+                print(
+                    f"  g-opt: switch combo {combo_idx}/{num_combos} "
+                    f"{switch_combo}",
+                    flush=True,
+                )
                 if n_cont == 0:
                     # No continuous latents to ascend: the setting is fully determined by
                     # the switch combo, so every restart/step would reproduce the identical
@@ -869,7 +928,7 @@ def find_disagreement_settings(
                         )
                     )
                     continue
-                for _ in range(num_restarts):
+                for restart_idx in range(num_restarts):
                     z = (
                         z_init_scale
                         * _torch.randn(
@@ -880,7 +939,13 @@ def find_disagreement_settings(
                     ).to(device)
                     z.requires_grad_(True)
                     optimizer = _torch.optim.Adam([z], lr=lr)
-                    for step in range(num_steps):
+                    progress = _tqdm(
+                        range(num_steps),
+                        desc=f"  combo {combo_idx}/{num_combos} restart "
+                        f"{restart_idx + 1}/{num_restarts}",
+                        leave=False,
+                    )
+                    for step in progress:
                         batch = g_opt_batches[step % len(g_opt_batches)]
                         raw_params = _assemble_raw_params(z, switch_combo, specs)
                         score = _evaluate_disagreement(
@@ -889,6 +954,7 @@ def find_disagreement_settings(
                         optimizer.zero_grad(set_to_none=True)
                         (-score).backward()
                         optimizer.step()
+                        progress.set_postfix(disagreement=f"{float(score):.4e}")
 
                     final_raw_params = _assemble_raw_params(z, switch_combo, specs)
                     candidates.append(
@@ -1173,6 +1239,7 @@ def run_round(
     max_per_round: int = 5,
     g_opt_ny: int = 32768,
     g_opt_batch_size: int = 16,
+    g_opt_lr: float = 0.05,
     use_mel: bool = False,
     cluster_threshold: float = _DEFAULT_CLUSTER_THRESHOLD,
     seed: int = 0,
@@ -1244,6 +1311,7 @@ def run_round(
             "max_per_round": max_per_round,
             "g_opt_ny": g_opt_ny,
             "g_opt_batch_size": g_opt_batch_size,
+            "g_opt_lr": g_opt_lr,
             "use_mel": use_mel,
             "cluster_threshold": cluster_threshold,
             "seed": seed,
@@ -1255,6 +1323,11 @@ def run_round(
     )
 
     if checkpoint_paths is None:
+        print(
+            f"[round {round_idx}] Training ensemble of {ensemble_size} ConcatLSTM "
+            "member(s)...",
+            flush=True,
+        )
         resolved_checkpoints = train_ensemble(
             data_config,
             model_config,
@@ -1263,11 +1336,26 @@ def run_round(
             ensemble_size=ensemble_size,
             base_seed=seed,
         )
+        print(
+            f"[round {round_idx}] Ensemble training complete "
+            f"({len(resolved_checkpoints)} checkpoint(s)).",
+            flush=True,
+        )
     else:
         resolved_checkpoints = [_Path(path) for path in checkpoint_paths]
         if len(resolved_checkpoints) == 0:
             raise ValueError("checkpoint_paths, when provided, must be non-empty")
+        print(
+            f"[round {round_idx}] Reusing {len(resolved_checkpoints)} provided "
+            "checkpoint(s); skipping training.",
+            flush=True,
+        )
 
+    print(
+        f"[round {round_idx}] Starting g-optimization (disagreement search): "
+        f"{num_restarts} restart(s) x {num_steps} step(s) per switch combo.",
+        flush=True,
+    )
     candidates = find_disagreement_settings(
         resolved_checkpoints,
         model_config,
@@ -1276,16 +1364,34 @@ def run_round(
         num_steps=num_steps,
         g_opt_ny=g_opt_ny,
         g_opt_batch_size=g_opt_batch_size,
+        lr=g_opt_lr,
         use_mel=use_mel,
         seed=seed,
     )
 
+    print(
+        f"[round {round_idx}] g-optimization complete: {len(candidates)} candidate(s). "
+        "Clustering and selecting proposals...",
+        flush=True,
+    )
     selected = cluster_and_select(
         candidates,
         model_config,
         max_per_round=max_per_round,
         cluster_threshold=cluster_threshold,
     )
+    if len(selected) < max_per_round:
+        # cluster_and_select only ever shrinks the pool (it clusters/dedupes the
+        # num_restarts x num_combos candidates and caps at max_per_round); it can never
+        # invent more. So a short round means the *candidate generation* came up short --
+        # the lever is --num-restarts (more raw candidates per switch combo), not
+        # --max-per-round (just the cap).
+        _warn(
+            f"Selected {len(selected)} proposal(s) but max_per_round={max_per_round} was "
+            f"requested. The {len(candidates)} candidate(s) from {num_restarts} restart(s) "
+            "collapsed to fewer distinct settings after clustering/dedup. Increase "
+            "--num-restarts (or --cluster-threshold) to propose more captures this round."
+        )
 
     proposals_path, proposals = emit_proposals(
         selected,

@@ -144,14 +144,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--g-opt-ny",
         type=int,
-        default=32768,
+        default=4096,
         help="g-opt window length (samples per chunk).",
     )
     parser.add_argument(
         "--g-opt-batch-size",
         type=int,
-        default=16,
+        default=64,
         help="g-opt batch size (chunks per step).",
+    )
+    parser.add_argument(
+        "--g-opt-lr",
+        type=float,
+        default=0.05,
+        help="Adam learning rate for the g-opt latent ascent (PANAMA uses 0.02).",
     )
     parser.add_argument(
         "--use-mel",
@@ -218,6 +224,7 @@ def main() -> int:
             max_per_round=args.max_per_round,
             g_opt_ny=args.g_opt_ny,
             g_opt_batch_size=args.g_opt_batch_size,
+            g_opt_lr=args.g_opt_lr,
             use_mel=args.use_mel,
             seed=args.seed,
             checkpoint_paths=args.ckpts,
