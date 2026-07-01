@@ -141,3 +141,5 @@ nam/train/gui/_resources/settings.json
 tests/resources/*.reapeaks
 
 AGENTS.md
+
+.DS_Store
