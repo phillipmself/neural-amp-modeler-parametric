@@ -81,7 +81,9 @@ python scripts/active_learn.py \
 
 Each round:
 
-1. Trains a 4-member ConcatLSTM ensemble **serially** on one device (different seed per member).
+1. Trains a 4-member ConcatLSTM ensemble on one device (different seed per member). By default the
+   members train **serially**, except on a multi-GPU CUDA box where each member gets its own GPU.
+   Pass `--max-workers N` to train `N` members concurrently — see [Parallel training](#parallel-training).
 2. Runs the disagreement g-optimizer: for every switch combination it Adam-**ascends** a latent `z`
    (mapped to in-range continuous knob values) to maximize member-output variance.
 3. Clusters the candidates per switch combination, quantizes survivors to the capture grid, dedupes,
@@ -106,9 +108,46 @@ For `--round-idx i > 0` the driver defaults `--data-config` to
 `<output-dir>/aggregated_data_config_{i-1}.json`, so you only pass `--data-config` explicitly for
 round 0.
 
-Other useful flags: `--ensemble-size` (default 4), `--num-restarts`, `--num-steps`,
-`--g-opt-ny`/`--g-opt-batch-size`, `--use-mel` (PANAMA's multi-resolution mel-variance term),
-`--seed`, `--ckpts` (reuse member checkpoints instead of retraining), `--no-plot`.
+Other useful flags: `--ensemble-size` (default 4), `--max-workers` (parallel training, below),
+`--num-restarts`, `--num-steps`, `--g-opt-ny`/`--g-opt-batch-size`, `--use-mel` (PANAMA's
+multi-resolution mel-variance term), `--seed`, `--ckpts` (reuse member checkpoints instead of
+retraining), `--no-plot`.
+
+### Parallel training
+
+Ensemble members are independent (each has its own seed and its own trainer, they never interact), so
+they can train concurrently. `--max-workers` controls this:
+
+- **Unset (default).** Serial on a single device; on a **multi-GPU CUDA** box, one member per GPU
+  (`min(ensemble_size, gpu_count)` workers). The default never over-subscribes a single device, so it
+  can't OOM by fanning out.
+- **`--max-workers N`.** Train `N` members at once (capped at `--ensemble-size`), round-robined across
+  whatever GPUs exist. On a **single GPU** this over-subscribes that one card — an explicit opt-in,
+  because peak memory scales with the number of concurrent members.
+
+Workers run as separate `spawn`ed processes; results are keyed by member index, so the per-member
+seeds and checkpoint order are identical to the serial path (reproducible either way). Dataloader
+`num_workers` is forced to 0 under parallel training (nested workers under spawned processes are
+unsafe), and the per-member progress bars are suppressed.
+
+**When over-subscribing one GPU pays off.** The ConcatLSTM is tiny, so a single member badly
+underutilizes a large-VRAM card — concurrent members fill the idle gaps. Memory is the constraint:
+peak scales with `batch_size × ny` per member (see `learning.json`). At `batch_size` 32 (~5 GiB/member)
+a 24–48 GB card fits all four members; e.g. on a single RTX 6000:
+
+```bash
+python scripts/active_learn.py \
+  --round-idx 0 --output-dir al_runs \
+  --data-config data.json \
+  --model-config nam_full_configs/active_learning/model.json \
+  --learning-config nam_full_configs/active_learning/learning.json \
+  --g-opt-input-wav input.wav \
+  --max-workers 4
+```
+
+Lower `--max-workers` (or the batch size) if you raise `batch_size`/`ny` and hit OOM. Without NVIDIA
+MPS (e.g. on Colab) the members time-slice the GPU rather than running truly simultaneously, so expect
+roughly a 2–3× speedup for four small members, not a clean 4×.
 
 ### Step 3 — Train the production model
 

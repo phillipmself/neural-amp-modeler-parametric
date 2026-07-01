@@ -30,6 +30,9 @@ from nam.train.active_learning import (
     find_disagreement_settings as _find_disagreement_settings,
 )
 from nam.train.active_learning import train_ensemble as _train_ensemble
+from nam.train.active_learning import (
+    _resolve_ensemble_parallel_plan as _resolve_ensemble_parallel_plan,
+)
 from nam.train.parametric import _ParametricLightningModule
 
 
@@ -842,3 +845,139 @@ def test_append_to_data_config_empty_selection_is_noop(tmp_path):
     assert new_data_config["train"] == original["train"]
     assert "param_specs" in new_data_config["common"]
     assert not (tmp_path / "accepted_capture_distributions_round_1.png").exists()
+
+
+def _member_state_dicts(checkpoint_paths, model_config):
+    states = []
+    for path in checkpoint_paths:
+        module = _ParametricLightningModule.load_from_checkpoint(
+            str(path),
+            **_ParametricLightningModule.parse_config(model_config),
+        )
+        states.append({k: v.detach().clone() for k, v in module.net.state_dict().items()})
+    return states
+
+
+def test_resolve_ensemble_parallel_plan_defaults_to_serial_off_multi_gpu(monkeypatch):
+    # CPU / single-GPU / MPS default to one worker so the default never over-subscribes
+    # a single device.
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    workers, devices = _resolve_ensemble_parallel_plan(4, None)
+    assert workers == 1
+    assert devices == [_torch.device("cpu")] * 4
+
+
+def test_resolve_ensemble_parallel_plan_single_gpu_defaults_serial(monkeypatch):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cuda"),
+    )
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    workers, devices = _resolve_ensemble_parallel_plan(3, None)
+    assert workers == 1
+    assert devices == [_torch.device("cuda:0")] * 3
+
+
+def test_resolve_ensemble_parallel_plan_multi_gpu_one_member_per_gpu(monkeypatch):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cuda"),
+    )
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+    workers, devices = _resolve_ensemble_parallel_plan(4, None)
+    assert workers == 2
+    assert devices == [
+        _torch.device("cuda:0"),
+        _torch.device("cuda:1"),
+        _torch.device("cuda:0"),
+        _torch.device("cuda:1"),
+    ]
+
+
+def test_resolve_ensemble_parallel_plan_explicit_max_workers_oversubscribes(monkeypatch):
+    # An explicit count over-subscribes a single GPU (round-robin collapses to cuda:0),
+    # capped at ensemble_size.
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cuda"),
+    )
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    workers, devices = _resolve_ensemble_parallel_plan(4, 3)
+    assert workers == 3
+    assert devices == [_torch.device("cuda:0")] * 4
+
+    # Capped at ensemble_size even when max_workers exceeds it.
+    workers, _ = _resolve_ensemble_parallel_plan(2, 8)
+    assert workers == 2
+
+
+def test_resolve_ensemble_parallel_plan_rejects_nonpositive_max_workers(monkeypatch):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    with _pytest.raises(ValueError):
+        _resolve_ensemble_parallel_plan(4, 0)
+
+
+def test_train_ensemble_parallel_matches_serial_members(tmp_path, monkeypatch):
+    # Parallel training must reproduce the serial per-member results (same seed per
+    # member, results keyed by member index) up to floating-point noise.
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    model_config = _concat_lstm_model_config()
+    data_config = _build_data_config(tmp_path)
+
+    serial = _train_ensemble(
+        _deepcopy(data_config),
+        model_config,
+        _learning_config(),
+        tmp_path / "serial",
+        ensemble_size=2,
+    )
+    parallel = _train_ensemble(
+        _deepcopy(data_config),
+        model_config,
+        _learning_config(),
+        tmp_path / "parallel",
+        ensemble_size=2,
+        max_workers=2,
+    )
+
+    assert len(parallel) == 2
+    assert [p.parent.name for p in parallel] == ["member_00", "member_01"]
+
+    serial_states = _member_state_dicts(serial, model_config)
+    parallel_states = _member_state_dicts(parallel, model_config)
+    for member_idx, (s_state, p_state) in enumerate(zip(serial_states, parallel_states)):
+        assert s_state.keys() == p_state.keys()
+        for key in s_state:
+            assert _torch.allclose(s_state[key], p_state[key], atol=1e-4), (
+                f"member {member_idx} weight {key} diverged between serial and parallel"
+            )
+
+
+def test_train_ensemble_parallel_propagates_member_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "nam.train.active_learning._resolve_device",
+        lambda: _torch.device("cpu"),
+    )
+    data_config = _build_data_config(tmp_path)
+    # Passes the parent-side window validation but fails in the worker when the dataset
+    # tries to load a missing capture wav.
+    data_config["train"][0]["y_path"] = str(tmp_path / "does_not_exist.wav")
+
+    with _pytest.raises(RuntimeError, match="failed during parallel training"):
+        _train_ensemble(
+            data_config,
+            _concat_lstm_model_config(),
+            _learning_config(),
+            tmp_path / "run",
+            ensemble_size=2,
+            max_workers=2,
+        )

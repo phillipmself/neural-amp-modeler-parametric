@@ -44,6 +44,13 @@ def _nonneg_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {parsed}")
+    return parsed
+
+
 def _resolve_data_config_path(args: argparse.Namespace) -> Path:
     """Round 0 reads --data-config; later rounds read the previous aggregated config."""
     if args.round_idx == 0:
@@ -121,7 +128,19 @@ def _parse_args() -> argparse.Namespace:
         "--ensemble-size",
         type=int,
         default=4,
-        help="Number of serially-trained ensemble members.",
+        help="Number of ensemble members.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Number of ensemble members to train concurrently. Default (unset) trains "
+            "serially on one device, or one member per GPU on a multi-GPU CUDA box. Pass "
+            "an explicit count to over-subscribe a single GPU (e.g. --max-workers 4 on a "
+            "large-VRAM card with a small batch size); the memory headroom is yours to "
+            "ensure."
+        ),
     )
     parser.add_argument(
         "--num-restarts",
@@ -229,6 +248,7 @@ def main() -> int:
             seed=args.seed,
             checkpoint_paths=args.ckpts,
             plot=not args.no_plot,
+            max_workers=args.max_workers,
         )
 
     _print_summary(result, data_config_path)

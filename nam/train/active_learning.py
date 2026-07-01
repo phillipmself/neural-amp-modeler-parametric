@@ -12,6 +12,8 @@ import importlib as _importlib
 import json as _json
 import math as _math
 import shutil as _shutil
+from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
+from concurrent.futures import as_completed as _as_completed
 from copy import deepcopy as _deepcopy
 from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
@@ -22,6 +24,7 @@ from warnings import warn as _warn
 
 import pytorch_lightning as _pl
 import torch as _torch
+import torch.multiprocessing as _torch_mp
 from tqdm import tqdm as _tqdm
 from lightning_fabric.utilities.warnings import PossibleUserWarning as _PossibleUserWarning
 from pytorch_lightning.callbacks import ModelCheckpoint as _ModelCheckpoint
@@ -85,8 +88,13 @@ def _resolve_device() -> _torch.device:
     return _torch.device("cpu")
 
 
-def _trainer_device_config(device: _torch.device) -> dict[str, str | int]:
+def _trainer_device_config(device: _torch.device) -> dict[str, str | int | list[int]]:
     if device.type == "cuda":
+        # Pin the exact GPU when an index is set (parallel members are round-robined
+        # across GPUs as cuda:idx); devices=[idx] targets that card, whereas devices=1
+        # would let Lightning pick cuda:0 for every worker.
+        if device.index is not None:
+            return {"accelerator": "gpu", "devices": [device.index]}
         return {"accelerator": "gpu", "devices": 1}
     if device.type == "mps":
         return {"accelerator": "mps", "devices": 1}
@@ -727,6 +735,186 @@ def _final_disagreement_score(
     return score
 
 
+def _train_single_member(
+    member_idx: int,
+    *,
+    data_config: dict,
+    model_config: dict,
+    learning_config: dict,
+    outdir: _Path,
+    base_seed: int,
+    device: _torch.device,
+    enable_progress_bar: bool = True,
+) -> _Path:
+    """Train one ensemble member and return its stabilized ``best.ckpt`` path.
+
+    Module-level (not a closure) so it is picklable for ``spawn``-based parallel
+    training. ``data_config`` must already be prepared (``_prepare_data_config``);
+    ``learning_config`` is the raw config -- device selection is applied here so each
+    worker binds its own assigned ``device`` (e.g. ``cuda:1``).
+    """
+    _torch.manual_seed(base_seed + member_idx)
+    learning_config = _prepare_learning_config(learning_config, device)
+    member_outdir = _Path(outdir) / f"member_{member_idx:02d}"
+    member_outdir.mkdir(parents=True, exist_ok=True)
+
+    dataset_train = None
+    dataset_validation = None
+    train_dataloader = None
+    val_dataloader = None
+    trainer = None
+    model = None
+    try:
+        model = _ParametricLightningModule.init_from_config(model_config)
+        (
+            dataset_train,
+            dataset_validation,
+            train_dataloader,
+            val_dataloader,
+        ) = _build_dataloaders(data_config, learning_config, model)
+
+        trainer_kwargs = dict(learning_config["trainer"])
+        if not enable_progress_bar:
+            # Concurrent workers would interleave their live progress bars into an
+            # unreadable mess; silence them in the parallel path.
+            trainer_kwargs["enable_progress_bar"] = False
+        trainer = _pl.Trainer(
+            callbacks=_create_parametric_callbacks(learning_config),
+            default_root_dir=member_outdir,
+            **trainer_kwargs,
+        )
+        with _filter_warnings("ignore", category=_PossibleUserWarning):
+            trainer.fit(
+                model,
+                train_dataloader,
+                val_dataloader,
+                **learning_config.get("trainer_fit_kwargs", {}),
+            )
+
+        checkpoint_callback = trainer.checkpoint_callback
+        best_checkpoint = (
+            checkpoint_callback.best_model_path
+            if isinstance(checkpoint_callback, _ModelCheckpoint)
+            else ""
+        )
+        return _stabilize_checkpoint_path(best_checkpoint, member_outdir)
+    finally:
+        if dataset_train is not None:
+            dataset_train.teardown()
+        if dataset_validation is not None:
+            dataset_validation.teardown()
+        del val_dataloader
+        del train_dataloader
+        del trainer
+        del model
+        _gc.collect()
+        _clear_device_cache(device)
+
+
+def _resolve_ensemble_parallel_plan(
+    ensemble_size: int,
+    max_workers: int | None,
+) -> tuple[int, list[_torch.device]]:
+    """Decide how many members train concurrently and which device each one uses.
+
+    Policy (see docs/active_learning_usage.md):
+      * ``max_workers`` given -> ``min(max_workers, ensemble_size)`` workers; members
+        are round-robined across the available GPUs (a single GPU means every worker
+        over-subscribes ``cuda:0`` -- the caller's opt-in, memory is their call).
+      * ``max_workers`` is None (default) -> parallel only on multi-GPU CUDA (one
+        member per GPU); a single GPU / MPS / CPU stays serial (1 worker) so the
+        default never risks OOM by over-subscribing one device.
+    """
+    if max_workers is not None and max_workers <= 0:
+        raise ValueError(f"max_workers must be positive when given; got {max_workers}")
+
+    base_device = _resolve_device()
+    gpu_count = _torch.cuda.device_count() if base_device.type == "cuda" else 0
+
+    if max_workers is not None:
+        worker_count = min(max_workers, ensemble_size)
+    elif base_device.type == "cuda" and gpu_count > 1:
+        worker_count = min(ensemble_size, gpu_count)
+    else:
+        worker_count = 1
+
+    member_devices: list[_torch.device] = []
+    for member_idx in range(ensemble_size):
+        if base_device.type == "cuda":
+            member_devices.append(_torch.device(f"cuda:{member_idx % max(gpu_count, 1)}"))
+        else:
+            member_devices.append(base_device)
+    return worker_count, member_devices
+
+
+def _coerce_parallel_dataloader_workers(learning_config: dict) -> dict:
+    """Force dataloader ``num_workers`` to 0 for parallel training.
+
+    Nested dataloader worker processes spawned from an already-spawned training worker
+    are fragile (re-import / start-method hazards); the ensemble members are the unit of
+    parallelism here, so collapse any per-member dataloader workers.
+    """
+    learning_config = _deepcopy(learning_config)
+    for key in ("train_dataloader", "val_dataloader"):
+        loader_config = learning_config.get(key)
+        if isinstance(loader_config, dict) and loader_config.get("num_workers", 0):
+            _warn(
+                f"Forcing {key}.num_workers=0 for parallel ensemble training "
+                "(nested dataloader workers under spawned member processes are unsafe)."
+            )
+            loader_config["num_workers"] = 0
+    return learning_config
+
+
+def _train_ensemble_parallel(
+    *,
+    worker_count: int,
+    member_devices: _Sequence[_torch.device],
+    data_config: dict,
+    model_config: dict,
+    learning_config: dict,
+    outdir: _Path,
+    ensemble_size: int,
+    base_seed: int,
+) -> list[_Path]:
+    context = _torch_mp.get_context("spawn")
+    results: dict[int, _Path] = {}
+    with _ProcessPoolExecutor(
+        max_workers=worker_count, mp_context=context
+    ) as executor:
+        futures = {
+            executor.submit(
+                _train_single_member,
+                member_idx,
+                data_config=data_config,
+                model_config=model_config,
+                learning_config=learning_config,
+                outdir=outdir,
+                base_seed=base_seed,
+                device=member_devices[member_idx],
+                enable_progress_bar=False,
+            ): member_idx
+            for member_idx in range(ensemble_size)
+        }
+        try:
+            for future in _as_completed(futures):
+                member_idx = futures[future]
+                try:
+                    results[member_idx] = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Ensemble member {member_idx} failed during parallel training: "
+                        f"{exc}"
+                    ) from exc
+        finally:
+            # A failed/interrupted member should not leave siblings running.
+            for future in futures:
+                future.cancel()
+    # Key by member_idx so the returned order (and thus each member's seed) is identical
+    # to the serial path regardless of completion order.
+    return [results[member_idx] for member_idx in range(ensemble_size)]
+
+
 def train_ensemble(
     data_config: dict,
     model_config: dict,
@@ -735,7 +923,16 @@ def train_ensemble(
     *,
     ensemble_size: int = 4,
     base_seed: int = 0,
+    max_workers: int | None = None,
 ) -> list[_Path]:
+    """Train a serial (or parallel) ConcatLSTM ensemble; return per-member checkpoints.
+
+    ``max_workers`` controls parallelism (see :func:`_resolve_ensemble_parallel_plan`):
+    ``None`` (default) trains serially on one device, or one member per GPU on a
+    multi-GPU CUDA box; pass an explicit count to over-subscribe a single GPU (opt-in,
+    memory is the caller's responsibility). Results are keyed by member index, so the
+    checkpoint order -- and each member's seed -- matches the serial path either way.
+    """
     if ensemble_size <= 0:
         raise ValueError(f"ensemble_size must be positive; got {ensemble_size}")
     if model_config["net"]["name"] != "ConcatLSTM":
@@ -746,67 +943,44 @@ def train_ensemble(
 
     outdir = _Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    device = _resolve_device()
-    learning_config = _prepare_learning_config(learning_config, device)
     data_config = _prepare_data_config(data_config, model_config)
     _validate_train_window_lengths(data_config, model_config)
 
-    checkpoint_paths: list[_Path] = []
-    for member_idx in range(ensemble_size):
-        _torch.manual_seed(base_seed + member_idx)
-        member_outdir = outdir / f"member_{member_idx:02d}"
-        member_outdir.mkdir(parents=True, exist_ok=True)
+    worker_count, member_devices = _resolve_ensemble_parallel_plan(
+        ensemble_size, max_workers
+    )
 
-        dataset_train = None
-        dataset_validation = None
-        train_dataloader = None
-        val_dataloader = None
-        trainer = None
-        model = None
-        try:
-            model = _ParametricLightningModule.init_from_config(model_config)
-            (
-                dataset_train,
-                dataset_validation,
-                train_dataloader,
-                val_dataloader,
-            ) = _build_dataloaders(data_config, learning_config, model)
+    if worker_count > 1:
+        print(
+            f"  Training {ensemble_size} member(s) with {worker_count} parallel "
+            f"worker(s) across devices "
+            f"{sorted({str(d) for d in member_devices})}.",
+            flush=True,
+        )
+        return _train_ensemble_parallel(
+            worker_count=worker_count,
+            member_devices=member_devices,
+            data_config=data_config,
+            model_config=model_config,
+            learning_config=_coerce_parallel_dataloader_workers(learning_config),
+            outdir=outdir,
+            ensemble_size=ensemble_size,
+            base_seed=base_seed,
+        )
 
-            trainer = _pl.Trainer(
-                callbacks=_create_parametric_callbacks(learning_config),
-                default_root_dir=member_outdir,
-                **learning_config["trainer"],
-            )
-            with _filter_warnings("ignore", category=_PossibleUserWarning):
-                trainer.fit(
-                    model,
-                    train_dataloader,
-                    val_dataloader,
-                    **learning_config.get("trainer_fit_kwargs", {}),
-                )
-
-            checkpoint_callback = trainer.checkpoint_callback
-            best_checkpoint = (
-                checkpoint_callback.best_model_path
-                if isinstance(checkpoint_callback, _ModelCheckpoint)
-                else ""
-            )
-            checkpoint_paths.append(
-                _stabilize_checkpoint_path(best_checkpoint, member_outdir)
-            )
-        finally:
-            if dataset_train is not None:
-                dataset_train.teardown()
-            if dataset_validation is not None:
-                dataset_validation.teardown()
-            del val_dataloader
-            del train_dataloader
-            del trainer
-            del model
-            _gc.collect()
-            _clear_device_cache(device)
-
-    return checkpoint_paths
+    return [
+        _train_single_member(
+            member_idx,
+            data_config=data_config,
+            model_config=model_config,
+            learning_config=learning_config,
+            outdir=outdir,
+            base_seed=base_seed,
+            device=member_devices[member_idx],
+            enable_progress_bar=True,
+        )
+        for member_idx in range(ensemble_size)
+    ]
 
 
 def find_disagreement_settings(
@@ -1246,6 +1420,7 @@ def run_round(
     checkpoint_paths: _Sequence[str | _Path] | None = None,
     y_path_prefix: str = "round_",
     plot: bool = True,
+    max_workers: int | None = None,
 ) -> RoundResult:
     """
     Run one active-learning round end to end (PANAMA-style query-by-committee).
@@ -1316,6 +1491,7 @@ def run_round(
             "cluster_threshold": cluster_threshold,
             "seed": seed,
             "y_path_prefix": y_path_prefix,
+            "max_workers": max_workers,
             "reused_checkpoint_paths": (
                 None if checkpoint_paths is None else [str(p) for p in checkpoint_paths]
             ),
@@ -1335,6 +1511,7 @@ def run_round(
             output_dir / f"ensemble_round_{round_idx}",
             ensemble_size=ensemble_size,
             base_seed=seed,
+            max_workers=max_workers,
         )
         print(
             f"[round {round_idx}] Ensemble training complete "
