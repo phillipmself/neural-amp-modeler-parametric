@@ -30,7 +30,8 @@
     "trainer": {
         "accelerator": "gpu",
         "devices": 1,
-        "max_epochs": 50
+        "max_epochs": 50,
+        "gradient_clip_val": 1.0
     },
     "trainer_fit_kwargs": {}
 }
