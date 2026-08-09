@@ -1,5 +1,9 @@
+import os as _os
+import sys as _sys
+
 import pytest as _pytest
 
+from nam.capture.audio import _enable_asio_on_windows
 from nam.capture.audio import _raise_on_dropout
 from nam.capture.audio import AudioDeviceError as _AudioDeviceError
 from nam.capture.audio import AudioDropoutError as _AudioDropoutError
@@ -50,6 +54,39 @@ def test_lost_audio_raises(flag):
 def test_dropout_is_an_audio_device_error():
     # SessionWorker catches AudioDeviceError to surface engine failures in the GUI.
     assert issubclass(_AudioDropoutError, _AudioDeviceError)
+
+
+def test_asio_is_enabled_on_windows(monkeypatch):
+    monkeypatch.setattr(_sys, "platform", "win32")
+    monkeypatch.delenv("SD_ENABLE_ASIO", raising=False)
+    _enable_asio_on_windows()
+    assert _os.environ["SD_ENABLE_ASIO"] == "1"
+
+
+@_pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_asio_is_not_enabled_off_windows(monkeypatch, platform):
+    """
+    ASIO is Windows-only; setting this anywhere else would at best do nothing and at
+    worst send ``sounddevice`` looking for a DLL variant that does not exist there.
+    """
+    monkeypatch.setattr(_sys, "platform", platform)
+    monkeypatch.delenv("SD_ENABLE_ASIO", raising=False)
+    _enable_asio_on_windows()
+    assert "SD_ENABLE_ASIO" not in _os.environ
+
+
+def test_an_explicit_asio_setting_is_left_alone(monkeypatch):
+    """
+    ``setdefault`` leaves a value the user set themselves untouched.
+
+    This is not an off switch, and deliberately not tested as one: ``sounddevice``
+    checks only whether ``SD_ENABLE_ASIO`` exists, never its value, so "0" still
+    selects the ASIO DLL. On Windows this app is ASIO or nothing.
+    """
+    monkeypatch.setattr(_sys, "platform", "win32")
+    monkeypatch.setenv("SD_ENABLE_ASIO", "0")
+    _enable_asio_on_windows()
+    assert _os.environ["SD_ENABLE_ASIO"] == "0"
 
 
 def test_latency_choices_run_from_safest_to_tightest():

@@ -9,6 +9,8 @@ user action, and the GUI must be able to start even if PortAudio is unhappy.
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
 import time as _time
 from dataclasses import dataclass as _dataclass
 from typing import Callable as _Callable
@@ -19,6 +21,37 @@ from typing import Tuple as _Tuple
 from typing import Union as _Union
 
 import numpy as _np
+
+
+def _enable_asio_on_windows() -> None:
+    """
+    Ask ``sounddevice`` for its ASIO-enabled PortAudio build, on Windows only.
+
+    ASIO is the only Windows backend this app supports, because it is the only one
+    with DAW-comparable round-trip latency -- which is the entire premise of the
+    latency settings -- and the only one that presents an interface as a single
+    *duplex* device. MME, DirectSound, WASAPI and WDM-KS all split an interface into
+    separate capture and render devices, so none of them survive the duplex filter the
+    device picker already applies; enabling ASIO is therefore the whole of Windows
+    support, and the other backends are excluded for free rather than by code.
+
+    ``sounddevice`` chooses which PortAudio DLL to load the first time it is imported,
+    and reads this variable at that moment, so this has to run before any
+    ``import sounddevice``. That is why it sits at module scope: every other reference
+    to ``sounddevice`` in this module is deliberately lazy (see the module docstring),
+    which is exactly what makes a module-scope env var here safe and sufficient.
+
+    Note that ``sounddevice`` tests only whether this variable is *present*, not what
+    it is set to, so ``SD_ENABLE_ASIO=0`` still selects the ASIO build: on Windows
+    this app is ASIO or nothing, which is the intended product decision rather than an
+    oversight. ``setdefault`` is used anyway so an explicit setting is left as the user
+    wrote it, but it is not an off switch and there is no value that acts as one.
+    """
+    if _sys.platform == "win32":
+        _os.environ.setdefault("SD_ENABLE_ASIO", "1")
+
+
+_enable_asio_on_windows()
 
 
 # Suggested stream latency: seconds, or one of PortAudio's per-device presets.
@@ -151,8 +184,6 @@ def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
     Returns an empty dict when it cannot produce live values; callers then fall back to
     :attr:`DeviceInfo.default_samplerate`.
     """
-    import sys as _sys
-
     if _sys.platform == "darwin":
         try:
             return _coreaudio_sample_rates()
