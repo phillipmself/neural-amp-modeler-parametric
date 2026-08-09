@@ -1490,9 +1490,13 @@ class MainWindow(_QMainWindow):
 
     def _update_live_device_rates(self) -> None:
         now = _time.monotonic()
-        # Off macOS a refresh reinitialises PortAudio (disruptive and noisy), so
-        # throttle it and never run it while a capture or route test holds a stream.
-        # macOS ignores the flag: its CoreAudio read is cheap and stream-safe.
+        # ``allow_reinit`` states when a refresh would be safe to attempt: not while a
+        # worker holds a stream, and not more than once every couple of seconds. It is
+        # no longer a request for one. macOS ignores it (its CoreAudio read is cheap and
+        # stream-safe) and off macOS ``current_device_sample_rates`` refuses it outright,
+        # because reinitialising PortAudio there loads every installed ASIO driver --
+        # see the comment in that function. Off macOS this poll now just keeps the last
+        # known rates, and the rates fall back to PortAudio's cached defaults.
         allow_reinit = self._worker is None and (now - self._last_rate_reinit) >= 2.5
         rates = _current_device_sample_rates(allow_reinit=allow_reinit)
         if allow_reinit:

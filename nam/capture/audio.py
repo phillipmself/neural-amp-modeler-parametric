@@ -174,12 +174,11 @@ def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
     cannot see a rate changed in the OS while the app is running.
 
     - On macOS this reads CoreAudio's nominal sample rate, which always reflects the
-      current hardware setting and is cheap enough to poll.
-    - On other platforms there is no comparably cheap always-live query, so the only
-      way to re-read the current rates is to reinitialise PortAudio. That must never
-      happen while a stream is open, so it is done only when ``allow_reinit`` is True;
-      the refreshed rates still come straight from PortAudio, so they are never wrong,
-      at worst merely not refreshed.
+      current hardware setting and is cheap enough to poll. ``allow_reinit`` is
+      irrelevant there and always has been -- this path returns first.
+    - On other platforms there is no comparably cheap always-live query. The only way
+      to re-read the rates would be to reinitialise PortAudio, and this function
+      refuses to do that no matter what ``allow_reinit`` says. See below.
 
     Returns an empty dict when it cannot produce live values; callers then fall back to
     :attr:`DeviceInfo.default_samplerate`.
@@ -190,16 +189,25 @@ def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
         except Exception:
             return {}
 
-    if not allow_reinit:
-        return {}
-    import sounddevice as sd
-
-    try:
-        sd._terminate()
-        sd._initialize()
-        return {device.name: device.default_samplerate for device in list_devices()}
-    except Exception:
-        return {}
+    # Off macOS, refuse -- and note that the caller polls this on a timer.
+    #
+    # PortAudio enumerates ASIO by *loading every installed ASIO driver*, so
+    # reinitialising is not the cheap table re-read it looks like: it loads and unloads
+    # the user's interface driver every time. Measured on Windows with an Audient iD44,
+    # one reinit costs ~90 ms of blocked GUI thread (~54 ms before ASIO was enabled),
+    # and the rate poll was running it every three seconds for as long as a project was
+    # open. That is a driver load/unload cycle roughly 1200 times an hour, racing
+    # whatever the capture thread is doing with the same driver.
+    #
+    # Reinitialisation is not gone, only off the timer: the explicit "Refresh devices"
+    # button still re-reads the table through ``list_devices(refresh=True)``, which is
+    # a user action, cannot overlap a capture, and is where someone who just changed
+    # their interface's rate would look anyway.
+    #
+    # ``allow_reinit`` is kept because it is the API the caller is written against and
+    # states the caller's intent (it is False whenever a worker holds a stream); this
+    # function simply no longer has a use for permission it should not act on.
+    return {}
 
 
 def _coreaudio_sample_rates() -> dict[str, float]:

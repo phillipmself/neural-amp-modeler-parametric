@@ -5,6 +5,7 @@ import pytest as _pytest
 
 from nam.capture.audio import _enable_asio_on_windows
 from nam.capture.audio import _raise_on_dropout
+from nam.capture.audio import current_device_sample_rates as _current_device_sample_rates
 from nam.capture.audio import AudioDeviceError as _AudioDeviceError
 from nam.capture.audio import AudioDropoutError as _AudioDropoutError
 from nam.capture.audio import LATENCY_CHOICES as _LATENCY_CHOICES
@@ -87,6 +88,58 @@ def test_an_explicit_asio_setting_is_left_alone(monkeypatch):
     monkeypatch.setenv("SD_ENABLE_ASIO", "0")
     _enable_asio_on_windows()
     assert _os.environ["SD_ENABLE_ASIO"] == "0"
+
+
+@_pytest.mark.parametrize("platform", ["win32", "linux"])
+@_pytest.mark.parametrize("allow_reinit", [True, False])
+def test_sample_rate_poll_never_reinitialises_portaudio(
+    monkeypatch, platform, allow_reinit
+):
+    """
+    The rate poll runs on a timer, and off macOS a PortAudio reinit loads every
+    installed ASIO driver. Even asked directly for one, this must not do it.
+    """
+    import sounddevice as _sd
+
+    monkeypatch.setattr(_sys, "platform", platform)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("PortAudio was reinitialised on the rate poll path")
+
+    monkeypatch.setattr(_sd, "_terminate", _explode)
+    monkeypatch.setattr(_sd, "_initialize", _explode)
+
+    # Empty, so callers fall back to the cached DeviceInfo.default_samplerate.
+    assert _current_device_sample_rates(allow_reinit=allow_reinit) == {}
+
+
+@_pytest.mark.parametrize("allow_reinit", [True, False])
+def test_darwin_still_reads_coreaudio_and_ignores_the_flag(monkeypatch, allow_reinit):
+    """
+    macOS must keep its live CoreAudio read, which is what makes the sample-rate
+    warning work there, and must keep ignoring ``allow_reinit`` as it always has.
+    """
+    import nam.capture.audio as _audio
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _audio, "_coreaudio_sample_rates", lambda: {"Audient iD44": 96000.0}
+    )
+    assert _current_device_sample_rates(allow_reinit=allow_reinit) == {
+        "Audient iD44": 96000.0
+    }
+
+
+def test_darwin_falls_back_to_empty_when_coreaudio_fails(monkeypatch):
+    import nam.capture.audio as _audio
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+
+    def _boom():
+        raise OSError("CoreAudio unavailable")
+
+    monkeypatch.setattr(_audio, "_coreaudio_sample_rates", _boom)
+    assert _current_device_sample_rates(allow_reinit=True) == {}
 
 
 def test_latency_choices_run_from_safest_to_tightest():
