@@ -230,6 +230,30 @@ def list_devices(refresh: bool = False) -> list[DeviceInfo]:
     return devices
 
 
+def reports_current_sample_rate(device: DeviceInfo) -> bool:
+    """
+    Whether ``device.default_samplerate`` means "the rate this hardware is running at".
+
+    For most host APIs it does: the device is locked to a rate chosen in the OS, and a
+    capture at a different rate would be resampled or refused, which is worth warning
+    about.
+
+    ASIO is the exception, in two ways that both point the same direction. PortAudio
+    does not ask an ASIO driver what rate it is running at; it walks a fixed list of
+    standard rates, starting at 44100, and reports the first the driver says it
+    supports. An Audient iD44 running at 48 kHz reports 44100 from a cold process, and
+    keeps reporting it however many times PortAudio is reinitialised, because nothing
+    is being re-read -- the number never described the hardware in the first place.
+
+    And there would be nothing to warn about even if it did: an ASIO driver switches
+    the hardware to whatever rate the client asks for when the stream is opened, so a
+    "mismatch" resolves itself. The same iD44 reports 44100 and accepts 44100, 48000,
+    88200 and 96000. A rate it genuinely cannot do fails loudly at stream open, which
+    is a better signal than a warning derived from a number that means something else.
+    """
+    return device.host_api != "ASIO"
+
+
 def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
     """
     Map device name -> its *current* nominal sample rate in Hz, read live.

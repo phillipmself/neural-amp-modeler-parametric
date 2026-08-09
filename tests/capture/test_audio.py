@@ -9,7 +9,9 @@ from nam.capture.audio import asio_com_apartment as _asio_com_apartment
 from nam.capture.audio import current_device_sample_rates as _current_device_sample_rates
 from nam.capture.audio import AudioDeviceError as _AudioDeviceError
 from nam.capture.audio import AudioDropoutError as _AudioDropoutError
+from nam.capture.audio import DeviceInfo as _DeviceInfo
 from nam.capture.audio import LATENCY_CHOICES as _LATENCY_CHOICES
+from nam.capture.audio import reports_current_sample_rate as _reports_current_sample_rate
 
 
 class _Status:
@@ -259,6 +261,34 @@ def test_missing_ole32_does_not_take_down_a_capture(monkeypatch):
     with _asio_com_apartment():
         ran = True
     assert ran
+
+
+def _rate_device(host_api):
+    return _DeviceInfo(
+        index=0,
+        name="Interface",
+        host_api=host_api,
+        max_input_channels=20,
+        max_output_channels=24,
+        default_samplerate=44100.0,
+    )
+
+
+@_pytest.mark.parametrize(
+    "host_api", ["Core Audio", "MME", "Windows WASAPI", "Windows WDM-KS", "ALSA"]
+)
+def test_most_host_apis_report_the_rate_the_hardware_is_running_at(host_api):
+    assert _reports_current_sample_rate(_rate_device(host_api))
+
+
+def test_asio_does_not_report_a_meaningful_current_rate():
+    """
+    PortAudio reports the first rate from a fixed search order for ASIO, not the rate
+    the hardware is on: an iD44 at 48 kHz reports 44100 from a cold process and keeps
+    reporting it across reinitialisations. Treating that as the live rate raises a
+    permanent false mismatch against a 48 kHz input file, which blocks capture.
+    """
+    assert not _reports_current_sample_rate(_rate_device("ASIO"))
 
 
 def test_latency_choices_run_from_safest_to_tightest():

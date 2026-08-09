@@ -49,6 +49,7 @@ from ..audio import current_device_sample_rates as _current_device_sample_rates
 from ..audio import DeviceInfo as _DeviceInfo
 from ..audio import LATENCY_CHOICES as _LATENCY_CHOICES
 from ..audio import list_devices as _list_devices
+from ..audio import reports_current_sample_rate as _reports_current_sample_rate
 from ..export import write_concat_training_configs as _write_concat_training_configs
 from ..export import write_hyper_training_configs as _write_hyper_training_configs
 from ..params import KnobSpec as _KnobSpec
@@ -1480,11 +1481,21 @@ class MainWindow(_QMainWindow):
     def _device_rate(
         self, device: _Optional[_DeviceInfo], live: dict[str, float]
     ) -> _Optional[int]:
-        """Current hardware rate for ``device``: live if known, else its PortAudio default."""
+        """
+        Current hardware rate for ``device``: live if known, else its PortAudio default,
+        else ``None`` when the device does not report one that means anything.
+
+        ``None`` is not an error -- ``sample_rate_warnings`` skips a device whose rate is
+        unknown rather than warning about it, which is what an ASIO device needs: its
+        reported rate is not the rate it is running at, and it retunes to whatever the
+        stream asks for. See :func:`reports_current_sample_rate`.
+        """
         if device is None:
             return None
         rate = live.get(device.name)
         if rate is None:
+            if not _reports_current_sample_rate(device):
+                return None
             rate = device.default_samplerate
         return int(round(rate))
 

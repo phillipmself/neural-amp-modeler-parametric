@@ -194,6 +194,40 @@ def test_off_windows_message_does_not_mention_asio(platform):
     assert "ASIO" not in message
 
 
+def test_asio_device_rate_is_unknown_rather_than_wrong(_qapp):
+    """
+    An ASIO device's reported rate is not the rate it is running at, so it must come
+    back as None -- sample_rate_warnings skips an unknown rate, where a wrong one would
+    warn forever and leave the capture buttons disabled.
+    """
+    window = _MainWindow()
+    asio = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
+    assert window._device_rate(asio, {}) is None
+    # A live reading, if one ever existed, is still believed over the default.
+    assert window._device_rate(asio, {asio.name: 48000.0}) == 48000
+    window.close()
+
+
+def test_non_asio_device_rate_still_uses_the_portaudio_default(_qapp):
+    window = _MainWindow()
+    coreaudio = _device("Audient iD44", "Core Audio", 4, 4)
+    assert window._device_rate(coreaudio, {}) == 48000
+    window.close()
+
+
+def test_asio_rate_mismatch_does_not_block_capture(_qapp):
+    """
+    The regression this guards: a 48 kHz input file against an ASIO device reporting
+    44100 produced a permanent 'device rate differs' warning, and the warning disables
+    the capture buttons.
+    """
+    asio = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
+    window = _MainWindow()
+    rate = window._device_rate(asio, {})
+    window.close()
+    assert _MainWindow_module.sample_rate_warnings(48000, 48000, rate, rate) == []
+
+
 def test_session_worker_runs_the_capture_inside_a_com_apartment(_qapp):
     """
     The apartment has to be entered on the worker thread itself, and be open for the
