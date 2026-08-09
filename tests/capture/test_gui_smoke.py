@@ -228,6 +228,85 @@ def test_asio_rate_mismatch_does_not_block_capture(_qapp):
     assert _MainWindow_module.sample_rate_warnings(48000, 48000, rate, rate) == []
 
 
+def test_route_test_without_a_project_still_gets_a_usable_rate(_qapp, monkeypatch):
+    """
+    With no project there is no WAV to infer a rate from, so the route test is handed
+    the device's rate explicitly. ASIO reports no meaningful *current* rate, but
+    default_samplerate is still a rate the driver said it supports -- which is all
+    this needs. Falling through to None makes the session try to load input WAVs that
+    do not exist.
+    """
+    asio = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
+    window = _MainWindow()
+    monkeypatch.setattr(_MainWindow_module, "_list_devices", lambda refresh=False: [asio])
+    window._refresh_devices()
+    window.project = None
+    window.session = None
+
+    session, rate = window._route_test_session_and_rate()
+    window.close()
+    assert session is not None
+    assert rate == 48000  # the DeviceInfo's default_samplerate, not None
+
+
+def test_refreshing_devices_cancels_an_operation_instead_of_killing_it(
+    _qapp, monkeypatch
+):
+    """
+    Reinitialising PortAudio under an open stream killed the route test with
+    "PortAudio not initialized". The refresh has to cancel first, so the operation
+    closes its stream and reports itself cancelled.
+    """
+    import threading
+    import time
+
+    from nam.capture.audio import CaptureCancelled
+
+    window = _MainWindow()
+    # No hardware in the test: only the cancellation handshake is under test here.
+    monkeypatch.setattr(_MainWindow_module, "_list_devices", lambda refresh=False: [])
+
+    running = threading.Event()
+    outcome = []
+
+    def slow_operation(progress, cancel):
+        running.set()
+        while not cancel():
+            time.sleep(0.01)
+        raise CaptureCancelled()
+
+    window._run_worker(
+        slow_operation,
+        on_success=lambda result: outcome.append("succeeded"),
+        on_failure=lambda message: outcome.append(f"failed: {message}"),
+        on_cancelled=lambda: outcome.append("cancelled"),
+    )
+    assert running.wait(5.0), "worker never started"
+
+    assert window._stop_worker_before_reinit() is True
+    assert not window._worker.isRunning()
+
+    # The cancelled signal is queued; deliver it the way the event loop would.
+    _qapp.processEvents()
+    assert outcome == ["cancelled"]
+    window.close()
+
+
+def test_refresh_reinitialises_when_nothing_is_running(_qapp, monkeypatch):
+    """The safe case must keep doing the full re-enumeration, or the button stops
+    doing the one job it exists for -- picking up a rate changed in the OS."""
+    window = _MainWindow()
+    calls = []
+    monkeypatch.setattr(
+        _MainWindow_module,
+        "_list_devices",
+        lambda refresh=False: calls.append(refresh) or [],
+    )
+    window._refresh_devices()
+    assert calls == [True]
+    window.close()
+
+
 def test_session_worker_runs_the_capture_inside_a_com_apartment(_qapp):
     """
     The apartment has to be entered on the worker thread itself, and be open for the

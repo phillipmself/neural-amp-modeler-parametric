@@ -1373,9 +1373,48 @@ class MainWindow(_QMainWindow):
 
     # -- audio -----------------------------------------------------------
 
+    # How long to give a cancelled operation to close its stream before re-enumerating.
+    # The recorder polls the cancel flag every 50 ms and closes the stream on its way
+    # out, so this is many times longer than it should ever need.
+    _REINIT_WAIT_MS = 2000
+
+    def _stop_worker_before_reinit(self) -> bool:
+        """
+        Stop any in-flight capture or route test so the device table can be rebuilt,
+        and report whether it is now safe to reinitialise PortAudio.
+
+        Re-enumerating tears PortAudio down and builds it back up, which is not
+        allowed while a stream is open -- the running operation loses PortAudio
+        underneath it and dies with "PortAudio not initialized", an error about our
+        own bookkeeping that says nothing to the user. Cancelling first goes through
+        exactly the same path as the Cancel button, so the operation closes its stream
+        and reports itself cancelled like any other cancellation.
+
+        The refresh button is deliberately left enabled during an operation: asking to
+        re-read the devices is a reasonable thing to want mid-route-test, and losing
+        the test is a fair and legible price for it.
+        """
+        worker = self._worker
+        if worker is None or not worker.isRunning():
+            return True
+        if self._cancel_token is not None:
+            self._cancel_token.cancel()
+        # Only the thread finishing is waited on here. The ``cancelled`` signal is
+        # queued and will not be delivered until this returns to the event loop, which
+        # is what eventually puts "cancelled" on the label.
+        return bool(worker.wait(self._REINIT_WAIT_MS))
+
     def _refresh_devices(self) -> None:
+        safe_to_reinit = self._stop_worker_before_reinit()
+        if not safe_to_reinit:
+            # Never reinitialise on the off-chance: a stream may still be open, and
+            # the cached table is merely stale where that would be undefined behaviour.
+            self.project_log.appendPlainText(
+                "An audio operation would not stop, so the device list was re-read "
+                "without reinitialising the audio system; sample rates may be stale."
+            )
         try:
-            self._devices = _list_devices(refresh=True)
+            self._devices = _list_devices(refresh=safe_to_reinit)
         except Exception as exc:
             self._devices = []
             self.project_log.appendPlainText(f"Could not list audio devices: {exc}")
@@ -1609,6 +1648,13 @@ class MainWindow(_QMainWindow):
             return None, None
         self._update_live_device_rates()
         rate = self._device_rate(device, self._live_device_rates)
+        if rate is None:
+            # ``_device_rate`` says None when the device publishes no meaningful
+            # current rate, which is always true of ASIO. That is the right answer for
+            # the mismatch warning, but the wrong one here: this needs *a* rate the
+            # device will accept, not the one it is supposedly on, and PortAudio chose
+            # ``default_samplerate`` precisely because the driver said it supports it.
+            rate = int(round(device.default_samplerate))
         project = _CaptureProject(knobs=[], audio=self._audio_settings)
         session = _CaptureSession(project, self.project_dir or _Path("."))
         return session, rate
