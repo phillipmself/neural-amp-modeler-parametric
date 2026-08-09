@@ -1,5 +1,6 @@
 import os as _os
 import sys as _sys
+from types import ModuleType as _ModuleType
 
 import pytest as _pytest
 
@@ -82,16 +83,19 @@ def test_sample_rate_poll_never_reinitialises_portaudio(monkeypatch):
     """
     The rate poll runs on a timer, and off macOS a PortAudio reinit loads every
     installed ASIO driver.
-    """
-    import sounddevice as _sd
 
-    monkeypatch.setattr(_sys, "platform", "win32")
+    The stand-in avoids importing the real ``sounddevice``, which needs a PortAudio
+    library CI has no reason to have; anything reaching for PortAudio gets this.
+    """
+    fake_sounddevice = _ModuleType("sounddevice")
 
     def _explode(*args, **kwargs):
         raise AssertionError("PortAudio was reinitialised on the rate poll path")
 
-    monkeypatch.setattr(_sd, "_terminate", _explode)
-    monkeypatch.setattr(_sd, "_initialize", _explode)
+    fake_sounddevice._terminate = _explode
+    fake_sounddevice._initialize = _explode
+    monkeypatch.setitem(_sys.modules, "sounddevice", fake_sounddevice)
+    monkeypatch.setattr(_sys, "platform", "win32")
 
     # Empty, so callers fall back to the cached DeviceInfo.default_samplerate.
     assert _current_device_sample_rates() == {}
