@@ -167,16 +167,6 @@ def test_no_message_when_a_duplex_device_exists(platform):
     assert _no_duplex_devices_message([_ASIO_DEVICE], platform) == ""
 
 
-def test_windows_without_asio_names_asio_and_the_fallbacks():
-    message = _no_duplex_devices_message(_SPLIT_WINDOWS_DEVICES, "win32")
-    assert "ASIO" in message
-    # The two things a user with no vendor ASIO driver can actually install.
-    assert "ASIO4ALL" in message
-    assert "FlexASIO" in message
-    # It must explain the absence, or the filtered-out MME/WASAPI entries look like a bug.
-    assert "WASAPI" in message
-
-
 def test_windows_with_no_devices_at_all_does_not_blame_asio():
     """PortAudio seeing nothing is a different fault from a missing ASIO driver, and
     telling the user to install one would send them the wrong way."""

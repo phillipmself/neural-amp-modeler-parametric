@@ -94,13 +94,10 @@ def test_an_explicit_asio_setting_is_left_alone(monkeypatch):
 
 
 @_pytest.mark.parametrize("platform", ["win32", "linux"])
-@_pytest.mark.parametrize("allow_reinit", [True, False])
-def test_sample_rate_poll_never_reinitialises_portaudio(
-    monkeypatch, platform, allow_reinit
-):
+def test_sample_rate_poll_never_reinitialises_portaudio(monkeypatch, platform):
     """
     The rate poll runs on a timer, and off macOS a PortAudio reinit loads every
-    installed ASIO driver. Even asked directly for one, this must not do it.
+    installed ASIO driver.
     """
     import sounddevice as _sd
 
@@ -113,14 +110,13 @@ def test_sample_rate_poll_never_reinitialises_portaudio(
     monkeypatch.setattr(_sd, "_initialize", _explode)
 
     # Empty, so callers fall back to the cached DeviceInfo.default_samplerate.
-    assert _current_device_sample_rates(allow_reinit=allow_reinit) == {}
+    assert _current_device_sample_rates() == {}
 
 
-@_pytest.mark.parametrize("allow_reinit", [True, False])
-def test_darwin_still_reads_coreaudio_and_ignores_the_flag(monkeypatch, allow_reinit):
+def test_darwin_still_reads_coreaudio(monkeypatch):
     """
     macOS must keep its live CoreAudio read, which is what makes the sample-rate
-    warning work there, and must keep ignoring ``allow_reinit`` as it always has.
+    warning work there.
     """
     import nam.capture.audio as _audio
 
@@ -128,9 +124,7 @@ def test_darwin_still_reads_coreaudio_and_ignores_the_flag(monkeypatch, allow_re
     monkeypatch.setattr(
         _audio, "_coreaudio_sample_rates", lambda: {"Audient iD44": 96000.0}
     )
-    assert _current_device_sample_rates(allow_reinit=allow_reinit) == {
-        "Audient iD44": 96000.0
-    }
+    assert _current_device_sample_rates() == {"Audient iD44": 96000.0}
 
 
 def test_darwin_falls_back_to_empty_when_coreaudio_fails(monkeypatch):
@@ -142,16 +136,16 @@ def test_darwin_falls_back_to_empty_when_coreaudio_fails(monkeypatch):
         raise OSError("CoreAudio unavailable")
 
     monkeypatch.setattr(_audio, "_coreaudio_sample_rates", _boom)
-    assert _current_device_sample_rates(allow_reinit=True) == {}
+    assert _current_device_sample_rates() == {}
 
 
 class _FakeOle32:
     """Stands in for ``ctypes.windll.ole32`` so both branches run on any platform."""
 
-    # CoInitializeEx hands back an *unsigned* HRESULT through ctypes.
+    # ctypes' default restype is signed, so an HRESULT arrives the way it does here.
     S_OK = 0
     S_FALSE = 1
-    RPC_E_CHANGED_MODE = 0x80010106
+    RPC_E_CHANGED_MODE = -2147417850
 
     def __init__(self, result=S_OK):
         self._result = result
@@ -212,6 +206,25 @@ def test_apartment_is_left_even_if_the_capture_raises(monkeypatch):
             raise RuntimeError("capture blew up")
 
     assert ole32.calls[-1] == ("CoUninitialize",)
+
+
+def test_a_failing_coinitializeex_does_not_take_down_a_capture(monkeypatch):
+    """
+    Entering the apartment is a precondition, not the job -- the same reasoning that
+    covers a missing ole32 covers the call itself failing.
+    """
+
+    class _BrokenOle32(_FakeOle32):
+        def CoInitializeEx(self, reserved, flags):
+            raise OSError("ole32 is unhappy")
+
+    monkeypatch.setattr(_sys, "platform", "win32")
+    _install_fake_windll(monkeypatch, _BrokenOle32())
+
+    ran = False
+    with _asio_com_apartment():
+        ran = True
+    assert ran
 
 
 def test_an_existing_mta_is_not_torn_down(monkeypatch):

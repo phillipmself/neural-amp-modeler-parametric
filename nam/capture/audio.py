@@ -55,14 +55,13 @@ def _enable_asio_on_windows() -> None:
 _enable_asio_on_windows()
 
 
-# CoInitializeEx apartment flag and the HRESULTs it can return. S_OK means this call
-# created the apartment, S_FALSE that the thread was already in one -- both are
-# successes that own a matching CoUninitialize. RPC_E_CHANGED_MODE means the thread is
-# already in a *different* apartment model, which is not ours to undo.
+# CoInitializeEx apartment flag, and the two HRESULTs that own a matching
+# CoUninitialize: S_OK means this call created the apartment, S_FALSE that the thread
+# was already in one. Anything else -- RPC_E_CHANGED_MODE above all, meaning the thread
+# is already in a different apartment model -- is not ours to undo.
 _COINIT_APARTMENTTHREADED = 0x2
 _S_OK = 0
 _S_FALSE = 1
-_RPC_E_CHANGED_MODE = -2147417850
 
 
 @_contextlib.contextmanager
@@ -99,21 +98,18 @@ def asio_com_apartment():
 
     try:
         ole32 = ctypes.windll.ole32
+        # ctypes defaults restype to c_int, so the HRESULT arrives already signed.
+        result = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
     except (AttributeError, OSError):
-        # No ole32 to talk to: nothing to set up, and failing here would take down a
-        # capture over what is only a best-effort precondition.
+        # COM could not be reached at all. The apartment is a precondition, not the
+        # job, so let the capture be attempted rather than failing before it starts.
         yield
         return
 
-    result = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
-    # ctypes hands back an unsigned int; the failure constants are signed HRESULTs.
-    if result >= 0x80000000:
-        result -= 0x100000000
     try:
         yield
     finally:
-        # Only unwind an apartment this call actually entered. RPC_E_CHANGED_MODE means
-        # someone else put the thread in an MTA and still owns it.
+        # Only unwind an apartment this call actually entered.
         if result in (_S_OK, _S_FALSE):
             ole32.CoUninitialize()
 
@@ -254,19 +250,13 @@ def reports_current_sample_rate(device: DeviceInfo) -> bool:
     return device.host_api != "ASIO"
 
 
-def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
+def current_device_sample_rates() -> dict[str, float]:
     """
     Map device name -> its *current* nominal sample rate in Hz, read live.
 
     PortAudio latches each device's ``default_samplerate`` when it initialises, so it
-    cannot see a rate changed in the OS while the app is running.
-
-    - On macOS this reads CoreAudio's nominal sample rate, which always reflects the
-      current hardware setting and is cheap enough to poll. ``allow_reinit`` is
-      irrelevant there and always has been -- this path returns first.
-    - On other platforms there is no comparably cheap always-live query. The only way
-      to re-read the rates would be to reinitialise PortAudio, and this function
-      refuses to do that no matter what ``allow_reinit`` says. See below.
+    cannot see a rate changed in the OS while the app is running. macOS can be asked
+    for the real thing cheaply; nowhere else can, so nowhere else gets live rates.
 
     Returns an empty dict when it cannot produce live values; callers then fall back to
     :attr:`DeviceInfo.default_samplerate`.
@@ -277,24 +267,13 @@ def current_device_sample_rates(allow_reinit: bool = False) -> dict[str, float]:
         except Exception:
             return {}
 
-    # Off macOS, refuse -- and note that the caller polls this on a timer.
-    #
-    # PortAudio enumerates ASIO by *loading every installed ASIO driver*, so
-    # reinitialising is not the cheap table re-read it looks like: it loads and unloads
-    # the user's interface driver every time. Measured on Windows with an Audient iD44,
-    # one reinit costs ~90 ms of blocked GUI thread (~54 ms before ASIO was enabled),
-    # and the rate poll was running it every three seconds for as long as a project was
-    # open. That is a driver load/unload cycle roughly 1200 times an hour, racing
-    # whatever the capture thread is doing with the same driver.
-    #
-    # Reinitialisation is not gone, only off the timer: the explicit "Refresh devices"
-    # button still re-reads the table through ``list_devices(refresh=True)``, which is
-    # a user action, cannot overlap a capture, and is where someone who just changed
-    # their interface's rate would look anyway.
-    #
-    # ``allow_reinit`` is kept because it is the API the caller is written against and
-    # states the caller's intent (it is False whenever a worker holds a stream); this
-    # function simply no longer has a use for permission it should not act on.
+    # Off macOS the only way to re-read the rates is to reinitialise PortAudio, and
+    # this is called from a timer. PortAudio enumerates ASIO by loading every installed
+    # ASIO driver, so a reinit is not the cheap table re-read it looks like: measured on
+    # Windows with an Audient iD44 it costs ~90 ms of blocked GUI thread (~54 ms before
+    # ASIO), and it raced the capture thread for the same driver. The explicit "Refresh
+    # devices" button still reinitialises through ``list_devices(refresh=True)``, which
+    # is where someone who just changed their interface's rate would look anyway.
     return {}
 
 

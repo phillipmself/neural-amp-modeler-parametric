@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import shutil as _shutil
 import sys as _sys
-import time as _time
 from pathlib import Path as _Path
 from typing import Any as _Any
 from typing import Callable as _Callable
@@ -408,10 +407,9 @@ class MainWindow(_QMainWindow):
         self._validation_input_name: str = "input_validation.wav"
         self._devices: list[_DeviceInfo] = []
         # Last known live device sample rates (name -> Hz), refreshed by the poll. Held
-        # so non-macOS polls that skip the throttled PortAudio reinit reuse the last
-        # reading instead of falling back and flickering.
+        # so a poll that comes back empty reuses the last reading instead of falling
+        # back and flickering.
         self._live_device_rates: dict[str, float] = {}
-        self._last_rate_reinit: float = 0.0
         self._worker: _Optional[_SessionWorker] = None
         # Workers are retained here until their ``finished`` signal fires so the
         # underlying QThread is never garbage-collected (and destroyed) while its
@@ -1384,9 +1382,11 @@ class MainWindow(_QMainWindow):
         exactly the same path as the Cancel button, so the operation closes its stream
         and reports itself cancelled like any other cancellation.
 
-        The refresh button is deliberately left enabled during an operation: asking to
-        re-read the devices is a reasonable thing to want mid-route-test, and losing
-        the test is a fair and legible price for it.
+        Losing the operation is the right trade at every caller. The refresh button is
+        deliberately left enabled during one, because asking to re-read the devices is
+        a reasonable thing to want mid-route-test; opening or creating a project
+        refreshes too, and while a capture should not be running then, cancelling it is
+        still better than the "PortAudio not initialized" it would otherwise die of.
         """
         worker = self._worker
         if worker is None or not worker.isRunning():
@@ -1533,18 +1533,10 @@ class MainWindow(_QMainWindow):
         return int(round(rate))
 
     def _update_live_device_rates(self) -> None:
-        now = _time.monotonic()
-        # ``allow_reinit`` states when a refresh would be safe to attempt: not while a
-        # worker holds a stream, and not more than once every couple of seconds. It is
-        # no longer a request for one. macOS ignores it (its CoreAudio read is cheap and
-        # stream-safe) and off macOS ``current_device_sample_rates`` refuses it outright,
-        # because reinitialising PortAudio there loads every installed ASIO driver --
-        # see the comment in that function. Off macOS this poll now just keeps the last
-        # known rates, and the rates fall back to PortAudio's cached defaults.
-        allow_reinit = self._worker is None and (now - self._last_rate_reinit) >= 2.5
-        rates = _current_device_sample_rates(allow_reinit=allow_reinit)
-        if allow_reinit:
-            self._last_rate_reinit = now
+        # Live rates exist on macOS only; off it this returns nothing and the rates fall
+        # back to PortAudio's cached defaults. Nothing here reinitialises PortAudio, so
+        # it is safe to call while a worker holds a stream.
+        rates = _current_device_sample_rates()
         if rates:
             self._live_device_rates = rates
 
