@@ -312,13 +312,7 @@ def no_duplex_devices_message(
                 "Windows' own sound settings, then press Refresh devices."
             )
         return (
-            "No ASIO device found. This app uses ASIO on Windows, because it is the "
-            "only Windows backend that presents an interface as a single device doing "
-            "both input and output, and the only one whose round-trip latency is close "
-            "to what the same hardware manages in a DAW. Windows' other backends (MME, "
-            "DirectSound, WASAPI, WDM-KS) split an interface into separate recording "
-            "and playback devices and cannot drive a capture, which is why none of them "
-            "are listed. Install your interface's own ASIO driver from the "
+            "No ASIO device found. Install your interface's own ASIO driver from the "
             "manufacturer, then press Refresh devices. If it has no ASIO driver of its "
             "own, ASIO4ALL or FlexASIO work as a generic substitute."
         )
