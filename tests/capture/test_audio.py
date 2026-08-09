@@ -5,6 +5,7 @@ import pytest as _pytest
 
 from nam.capture.audio import _enable_asio_on_windows
 from nam.capture.audio import _raise_on_dropout
+from nam.capture.audio import asio_com_apartment as _asio_com_apartment
 from nam.capture.audio import current_device_sample_rates as _current_device_sample_rates
 from nam.capture.audio import AudioDeviceError as _AudioDeviceError
 from nam.capture.audio import AudioDropoutError as _AudioDropoutError
@@ -140,6 +141,124 @@ def test_darwin_falls_back_to_empty_when_coreaudio_fails(monkeypatch):
 
     monkeypatch.setattr(_audio, "_coreaudio_sample_rates", _boom)
     assert _current_device_sample_rates(allow_reinit=True) == {}
+
+
+class _FakeOle32:
+    """Stands in for ``ctypes.windll.ole32`` so both branches run on any platform."""
+
+    # CoInitializeEx hands back an *unsigned* HRESULT through ctypes.
+    S_OK = 0
+    S_FALSE = 1
+    RPC_E_CHANGED_MODE = 0x80010106
+
+    def __init__(self, result=S_OK):
+        self._result = result
+        self.calls = []
+
+    def CoInitializeEx(self, reserved, flags):
+        self.calls.append(("CoInitializeEx", reserved, flags))
+        return self._result
+
+    def CoUninitialize(self):
+        self.calls.append(("CoUninitialize",))
+
+
+class _ExplodingWindll:
+    def __getattr__(self, name):
+        raise AssertionError(f"COM was touched off Windows (windll.{name})")
+
+
+def _install_fake_windll(monkeypatch, ole32):
+    import ctypes
+
+    class _Windll:
+        pass
+
+    windll = _Windll()
+    windll.ole32 = ole32
+    # raising=False: there is no ctypes.windll at all on macOS or Linux.
+    monkeypatch.setattr(ctypes, "windll", windll, raising=False)
+
+
+@_pytest.mark.parametrize("result", [_FakeOle32.S_OK, _FakeOle32.S_FALSE])
+def test_worker_thread_enters_a_single_threaded_apartment_on_windows(
+    monkeypatch, result
+):
+    """
+    ASIO drivers are in-process COM servers loaded on whichever thread opens the
+    stream, so the capture worker has to be in an apartment or the open fails with
+    "Failed to load ASIO driver".
+    """
+    ole32 = _FakeOle32(result)
+    monkeypatch.setattr(_sys, "platform", "win32")
+    _install_fake_windll(monkeypatch, ole32)
+
+    with _asio_com_apartment():
+        assert ole32.calls == [("CoInitializeEx", None, 0x2)]
+
+    # Whatever we entered, we leave -- a leaked apartment outlives the QThread.
+    assert ole32.calls[-1] == ("CoUninitialize",)
+
+
+def test_apartment_is_left_even_if_the_capture_raises(monkeypatch):
+    ole32 = _FakeOle32()
+    monkeypatch.setattr(_sys, "platform", "win32")
+    _install_fake_windll(monkeypatch, ole32)
+
+    with _pytest.raises(RuntimeError):
+        with _asio_com_apartment():
+            raise RuntimeError("capture blew up")
+
+    assert ole32.calls[-1] == ("CoUninitialize",)
+
+
+def test_an_existing_mta_is_not_torn_down(monkeypatch):
+    """
+    RPC_E_CHANGED_MODE means someone else put this thread in a different apartment and
+    still owns it; calling CoUninitialize against a apartment we never entered would
+    unbalance their refcount.
+    """
+    ole32 = _FakeOle32(_FakeOle32.RPC_E_CHANGED_MODE)
+    monkeypatch.setattr(_sys, "platform", "win32")
+    _install_fake_windll(monkeypatch, ole32)
+
+    with _asio_com_apartment():
+        pass
+
+    assert ("CoUninitialize",) not in ole32.calls
+
+
+@_pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_no_com_anywhere_but_windows(monkeypatch, platform):
+    """
+    macOS has no COM and no ASIO; this must stay a plain pass-through there.
+    """
+    import ctypes
+
+    monkeypatch.setattr(_sys, "platform", platform)
+    monkeypatch.setattr(ctypes, "windll", _ExplodingWindll(), raising=False)
+
+    ran = False
+    with _asio_com_apartment():
+        ran = True
+    assert ran
+
+
+def test_missing_ole32_does_not_take_down_a_capture(monkeypatch):
+    """
+    The apartment is a precondition, not the job. If COM cannot be reached at all the
+    capture should still be attempted rather than failing before it starts.
+    """
+    import ctypes
+
+    monkeypatch.setattr(_sys, "platform", "win32")
+    # A bare object has no ``.ole32``, which is the AttributeError the code guards on.
+    monkeypatch.setattr(ctypes, "windll", object(), raising=False)
+
+    ran = False
+    with _asio_com_apartment():
+        ran = True
+    assert ran
 
 
 def test_latency_choices_run_from_safest_to_tightest():

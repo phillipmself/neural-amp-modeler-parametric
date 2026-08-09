@@ -194,6 +194,40 @@ def test_off_windows_message_does_not_mention_asio(platform):
     assert "ASIO" not in message
 
 
+def test_session_worker_runs_the_capture_inside_a_com_apartment(_qapp):
+    """
+    The apartment has to be entered on the worker thread itself, and be open for the
+    whole engine call -- the stream is opened partway through it, not before it.
+    """
+    import contextlib
+
+    from nam.capture.gui import workers as _workers
+
+    events = []
+
+    @contextlib.contextmanager
+    def _tracking_apartment():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    monkeypatch = _pytest.MonkeyPatch()
+    monkeypatch.setattr(_workers, "_asio_com_apartment", _tracking_apartment)
+    try:
+        worker = _workers.SessionWorker(
+            lambda progress, cancel: events.append("call") or "done",
+            _workers.CancelToken(),
+        )
+        worker.start()
+        worker.wait()
+    finally:
+        monkeypatch.undo()
+
+    assert events == ["enter", "call", "exit"]
+
+
 def test_format_device_label_includes_host_api():
     device = _DeviceInfo(
         index=0,

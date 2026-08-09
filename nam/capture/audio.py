@@ -9,6 +9,7 @@ user action, and the GUI must be able to start even if PortAudio is unhappy.
 
 from __future__ import annotations
 
+import contextlib as _contextlib
 import os as _os
 import sys as _sys
 import time as _time
@@ -52,6 +53,69 @@ def _enable_asio_on_windows() -> None:
 
 
 _enable_asio_on_windows()
+
+
+# CoInitializeEx apartment flag and the HRESULTs it can return. S_OK means this call
+# created the apartment, S_FALSE that the thread was already in one -- both are
+# successes that own a matching CoUninitialize. RPC_E_CHANGED_MODE means the thread is
+# already in a *different* apartment model, which is not ours to undo.
+_COINIT_APARTMENTTHREADED = 0x2
+_S_OK = 0
+_S_FALSE = 1
+_RPC_E_CHANGED_MODE = -2147417850
+
+
+@_contextlib.contextmanager
+def asio_com_apartment():
+    """
+    Put the calling thread in a single-threaded COM apartment for as long as the block
+    runs, on Windows. A no-op everywhere else.
+
+    ASIO drivers are in-process COM servers, and PortAudio loads one when a stream is
+    *opened*, on whichever thread opens it. A thread with no COM apartment cannot load
+    it, and PortAudio surfaces that as a bare
+    ``Unanticipated host error ... 'Failed to load ASIO driver'``. Python's main thread
+    ends up in an apartment as a side effect of other initialisation, so this only
+    bites on the capture worker: the GUI thread opens streams fine, the QThread that
+    actually runs a capture does not.
+
+    Measured on Windows with an Audient iD44 -- opening a duplex ASIO stream from a
+    worker thread fails with exactly that error, and succeeds with this wrapper, across
+    repeated worker lifecycles, leaving the main thread able to open streams too.
+
+    Note that the fix is *not* to reinitialise PortAudio on the worker thread, which is
+    the intuitive reading of the symptom. ``Pa_Initialize`` is reference-counted, so
+    calling it while PortAudio is already up does nothing at all; and forcing a real
+    reinitialisation there moves the ASIO driver's apartment onto a thread that dies
+    when the capture ends, after which the *main* thread can no longer open a stream.
+    It would also renumber the device table underneath callers that have already
+    resolved names to indices. This touches neither.
+    """
+    if _sys.platform != "win32":
+        yield
+        return
+
+    import ctypes
+
+    try:
+        ole32 = ctypes.windll.ole32
+    except (AttributeError, OSError):
+        # No ole32 to talk to: nothing to set up, and failing here would take down a
+        # capture over what is only a best-effort precondition.
+        yield
+        return
+
+    result = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+    # ctypes hands back an unsigned int; the failure constants are signed HRESULTs.
+    if result >= 0x80000000:
+        result -= 0x100000000
+    try:
+        yield
+    finally:
+        # Only unwind an apartment this call actually entered. RPC_E_CHANGED_MODE means
+        # someone else put the thread in an MTA and still owns it.
+        if result in (_S_OK, _S_FALSE):
+            ole32.CoUninitialize()
 
 
 # Suggested stream latency: seconds, or one of PortAudio's per-device presets.
