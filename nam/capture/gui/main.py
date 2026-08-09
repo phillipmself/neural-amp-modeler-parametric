@@ -285,6 +285,49 @@ def duplex_devices(devices: _Sequence[_DeviceInfo]) -> list[_DeviceInfo]:
     ]
 
 
+def no_duplex_devices_message(
+    devices: _Sequence[_DeviceInfo], platform: str
+) -> str:
+    """
+    What to tell the user when the device picker has nothing to offer, or "" when it
+    does. Takes the *full* device list, not just the duplex ones, because what is
+    missing is the useful part of the diagnosis.
+
+    An empty picker means different things per platform. On Windows it almost always
+    means no ASIO driver is installed: PortAudio's other Windows backends each split
+    an interface into separate recording and playback devices, so they never produce
+    a duplex device and are filtered out by design. Seeing devices but no duplex one
+    is the ordinary no-ASIO-driver case; seeing nothing at all is a different problem
+    and gets different advice. Elsewhere -- macOS, where every interface is duplex
+    through CoreAudio -- an empty picker just means nothing is plugged in.
+    """
+    if duplex_devices(devices):
+        return ""
+    if platform == "win32":
+        if not devices:
+            return (
+                "No audio devices found. PortAudio cannot see any sound hardware on "
+                "this machine — check that your interface is connected and working in "
+                "Windows' own sound settings, then press Refresh devices."
+            )
+        return (
+            "No ASIO device found. This app uses ASIO on Windows, because it is the "
+            "only Windows backend that presents an interface as a single device doing "
+            "both input and output, and the only one whose round-trip latency is close "
+            "to what the same hardware manages in a DAW. Windows' other backends (MME, "
+            "DirectSound, WASAPI, WDM-KS) split an interface into separate recording "
+            "and playback devices and cannot drive a capture, which is why none of them "
+            "are listed. Install your interface's own ASIO driver from the "
+            "manufacturer, then press Refresh devices. If it has no ASIO driver of its "
+            "own, ASIO4ALL or FlexASIO work as a generic substitute."
+        )
+    return (
+        "No audio device with both inputs and outputs was found. A capture plays and "
+        "records at the same time, so it needs one device that does both. Connect your "
+        "audio interface, then press Refresh devices."
+    )
+
+
 class InputWavDialog(_QDialog):
     """
     Collect the training and validation input WAVs with both fields labelled and
@@ -587,6 +630,14 @@ class MainWindow(_QMainWindow):
         form.addRow("Buffer size", self.buffer_size_combo)
         form.addRow("Stream latency", self.latency_combo)
         layout.addLayout(form)
+
+        # Sits directly under the picker it explains: an empty combo cannot be opened,
+        # so without this the tab gives no hint that anything is wrong.
+        self.no_devices_label = _QLabel("")
+        self.no_devices_label.setWordWrap(True)
+        self.no_devices_label.setStyleSheet("color: #b36b00;")
+        self.no_devices_label.setVisible(False)
+        layout.addWidget(self.no_devices_label)
 
         self.routing_note_label = _QLabel(
             "The loopback only tracks latency on the path it actually travels. "
@@ -1330,6 +1381,9 @@ class MainWindow(_QMainWindow):
         self._populate_device_combo(
             self.device_combo, duplex_devices(self._devices)
         )
+        message = no_duplex_devices_message(self._devices, _sys.platform)
+        self.no_devices_label.setText(message)
+        self.no_devices_label.setVisible(bool(message))
         self._load_audio_settings_into_ui()
         self._refresh_sample_rate_warning()
 

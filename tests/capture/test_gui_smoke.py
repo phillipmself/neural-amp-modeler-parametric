@@ -19,6 +19,7 @@ from nam.capture.gui.main import format_entry_row as _format_entry_row
 from nam.capture.gui.main import format_params as _format_params
 from nam.capture.gui.main import format_qa_summary as _format_qa_summary
 from nam.capture.gui.main import knob_rows_to_specs as _knob_rows_to_specs
+from nam.capture.gui.main import no_duplex_devices_message as _no_duplex_devices_message
 from nam.capture.gui.main import sort_entries as _sort_entries
 from nam.capture.gui.main import SORT_MODES as _SORT_MODES
 from nam.capture.gui.main import _latency_index
@@ -133,6 +134,64 @@ def test_duplex_devices_keeps_only_full_io_devices():
         ),
     ]
     assert [d.name for d in _duplex_devices(devices)] == ["Duplex Interface"]
+
+
+def _device(name, host_api, max_input_channels, max_output_channels):
+    return _DeviceInfo(
+        index=0,
+        name=name,
+        host_api=host_api,
+        max_input_channels=max_input_channels,
+        max_output_channels=max_output_channels,
+        default_samplerate=48000.0,
+    )
+
+
+_ASIO_DEVICE = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
+# What Windows looks like with an interface connected but no ASIO driver: every backend
+# splits it into a separate capture and render device.
+_SPLIT_WINDOWS_DEVICES = [
+    _device("Input 1/2 (Audient iD44)", "MME", 2, 0),
+    _device("Output 1/2 (Audient iD44)", "MME", 0, 2),
+    _device("Input 1/2 (Audient iD44)", "Windows WASAPI", 2, 0),
+    _device("Output 1/2 (Audient iD44)", "Windows WASAPI", 0, 2),
+]
+
+
+@_pytest.mark.parametrize("platform", ["win32", "darwin", "linux"])
+def test_no_message_when_a_duplex_device_exists(platform):
+    """The empty-state text is the one cross-platform UI addition; it must stay hidden
+    whenever the picker has something in it, on every platform."""
+    devices = _SPLIT_WINDOWS_DEVICES + [_ASIO_DEVICE]
+    assert _no_duplex_devices_message(devices, platform) == ""
+    assert _no_duplex_devices_message([_ASIO_DEVICE], platform) == ""
+
+
+def test_windows_without_asio_names_asio_and_the_fallbacks():
+    message = _no_duplex_devices_message(_SPLIT_WINDOWS_DEVICES, "win32")
+    assert "ASIO" in message
+    # The two things a user with no vendor ASIO driver can actually install.
+    assert "ASIO4ALL" in message
+    assert "FlexASIO" in message
+    # It must explain the absence, or the filtered-out MME/WASAPI entries look like a bug.
+    assert "WASAPI" in message
+
+
+def test_windows_with_no_devices_at_all_does_not_blame_asio():
+    """PortAudio seeing nothing is a different fault from a missing ASIO driver, and
+    telling the user to install one would send them the wrong way."""
+    message = _no_duplex_devices_message([], "win32")
+    assert "ASIO4ALL" not in message
+    assert "No audio devices found" in message
+
+
+@_pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_off_windows_message_does_not_mention_asio(platform):
+    """On macOS an empty picker means no interface is connected; ASIO does not exist
+    there and naming it would be actively misleading."""
+    message = _no_duplex_devices_message([_device("Mic", "Core Audio", 1, 0)], platform)
+    assert message != ""
+    assert "ASIO" not in message
 
 
 def test_format_device_label_includes_host_api():
