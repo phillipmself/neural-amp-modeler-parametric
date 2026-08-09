@@ -65,12 +65,9 @@ class SessionWorker(_QThread):
         self._cancel_token = cancel_token
 
     def run(self) -> None:
-        # This is the thread that will open the PortAudio stream, and on Windows an
-        # ASIO driver can only be loaded from a thread in a COM apartment -- see
-        # ``asio_com_apartment``. It wraps the whole call rather than the stream open
-        # because the apartment has to outlive the stream, and it sits here, before
-        # any engine code runs, because by the time the session has resolved device
-        # names to indices it is already too late to be reaching for the driver.
+        # This thread opens the PortAudio stream, and on Windows an ASIO driver only
+        # loads from a thread in a COM apartment -- see ``asio_com_apartment``. It wraps
+        # the whole call because the apartment has to outlive the stream.
         try:
             with _asio_com_apartment():
                 result = self._call(

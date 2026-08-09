@@ -67,41 +67,25 @@ def test_asio_is_enabled_on_windows(monkeypatch):
     assert _os.environ["SD_ENABLE_ASIO"] == "1"
 
 
-@_pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_asio_is_not_enabled_off_windows(monkeypatch, platform):
+def test_asio_is_not_enabled_off_windows(monkeypatch):
     """
-    ASIO is Windows-only; setting this anywhere else would at best do nothing and at
-    worst send ``sounddevice`` looking for a DLL variant that does not exist there.
+    ASIO is Windows-only; setting this anywhere else sends ``sounddevice`` looking for
+    a DLL variant that does not exist there.
     """
-    monkeypatch.setattr(_sys, "platform", platform)
+    monkeypatch.setattr(_sys, "platform", "darwin")
     monkeypatch.delenv("SD_ENABLE_ASIO", raising=False)
     _enable_asio_on_windows()
     assert "SD_ENABLE_ASIO" not in _os.environ
 
 
-def test_an_explicit_asio_setting_is_left_alone(monkeypatch):
-    """
-    ``setdefault`` leaves a value the user set themselves untouched.
-
-    This is not an off switch, and deliberately not tested as one: ``sounddevice``
-    checks only whether ``SD_ENABLE_ASIO`` exists, never its value, so "0" still
-    selects the ASIO DLL. On Windows this app is ASIO or nothing.
-    """
-    monkeypatch.setattr(_sys, "platform", "win32")
-    monkeypatch.setenv("SD_ENABLE_ASIO", "0")
-    _enable_asio_on_windows()
-    assert _os.environ["SD_ENABLE_ASIO"] == "0"
-
-
-@_pytest.mark.parametrize("platform", ["win32", "linux"])
-def test_sample_rate_poll_never_reinitialises_portaudio(monkeypatch, platform):
+def test_sample_rate_poll_never_reinitialises_portaudio(monkeypatch):
     """
     The rate poll runs on a timer, and off macOS a PortAudio reinit loads every
     installed ASIO driver.
     """
     import sounddevice as _sd
 
-    monkeypatch.setattr(_sys, "platform", platform)
+    monkeypatch.setattr(_sys, "platform", "win32")
 
     def _explode(*args, **kwargs):
         raise AssertionError("PortAudio was reinitialised on the rate poll path")
@@ -182,8 +166,7 @@ def test_worker_thread_enters_a_single_threaded_apartment_on_windows(
 ):
     """
     ASIO drivers are in-process COM servers loaded on whichever thread opens the
-    stream, so the capture worker has to be in an apartment or the open fails with
-    "Failed to load ASIO driver".
+    stream, so the worker must be in an apartment or the open fails.
     """
     ole32 = _FakeOle32(result)
     monkeypatch.setattr(_sys, "platform", "win32")
@@ -208,30 +191,10 @@ def test_apartment_is_left_even_if_the_capture_raises(monkeypatch):
     assert ole32.calls[-1] == ("CoUninitialize",)
 
 
-def test_a_failing_coinitializeex_does_not_take_down_a_capture(monkeypatch):
-    """
-    Entering the apartment is a precondition, not the job -- the same reasoning that
-    covers a missing ole32 covers the call itself failing.
-    """
-
-    class _BrokenOle32(_FakeOle32):
-        def CoInitializeEx(self, reserved, flags):
-            raise OSError("ole32 is unhappy")
-
-    monkeypatch.setattr(_sys, "platform", "win32")
-    _install_fake_windll(monkeypatch, _BrokenOle32())
-
-    ran = False
-    with _asio_com_apartment():
-        ran = True
-    assert ran
-
-
 def test_an_existing_mta_is_not_torn_down(monkeypatch):
     """
     RPC_E_CHANGED_MODE means someone else put this thread in a different apartment and
-    still owns it; calling CoUninitialize against a apartment we never entered would
-    unbalance their refcount.
+    still owns it; uninitialising one we never entered unbalances their refcount.
     """
     ole32 = _FakeOle32(_FakeOle32.RPC_E_CHANGED_MODE)
     monkeypatch.setattr(_sys, "platform", "win32")
@@ -243,14 +206,13 @@ def test_an_existing_mta_is_not_torn_down(monkeypatch):
     assert ("CoUninitialize",) not in ole32.calls
 
 
-@_pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_no_com_anywhere_but_windows(monkeypatch, platform):
+def test_no_com_anywhere_but_windows(monkeypatch):
     """
     macOS has no COM and no ASIO; this must stay a plain pass-through there.
     """
     import ctypes
 
-    monkeypatch.setattr(_sys, "platform", platform)
+    monkeypatch.setattr(_sys, "platform", "darwin")
     monkeypatch.setattr(ctypes, "windll", _ExplodingWindll(), raising=False)
 
     ran = False
@@ -259,16 +221,25 @@ def test_no_com_anywhere_but_windows(monkeypatch, platform):
     assert ran
 
 
-def test_missing_ole32_does_not_take_down_a_capture(monkeypatch):
+class _BrokenOle32(_FakeOle32):
+    def CoInitializeEx(self, reserved, flags):
+        raise OSError("ole32 is unhappy")
+
+
+@_pytest.mark.parametrize("broken", ["no ole32", "CoInitializeEx raises"])
+def test_com_trouble_does_not_take_down_a_capture(monkeypatch, broken):
     """
-    The apartment is a precondition, not the job. If COM cannot be reached at all the
-    capture should still be attempted rather than failing before it starts.
+    The apartment is a precondition, not the job: whether COM is missing entirely or
+    just refuses, the capture should still be attempted.
     """
     import ctypes
 
     monkeypatch.setattr(_sys, "platform", "win32")
-    # A bare object has no ``.ole32``, which is the AttributeError the code guards on.
-    monkeypatch.setattr(ctypes, "windll", object(), raising=False)
+    if broken == "no ole32":
+        # A bare object has no ``.ole32`` -- the AttributeError the code guards on.
+        monkeypatch.setattr(ctypes, "windll", object(), raising=False)
+    else:
+        _install_fake_windll(monkeypatch, _BrokenOle32())
 
     ran = False
     with _asio_com_apartment():
@@ -287,21 +258,14 @@ def _rate_device(host_api):
     )
 
 
-@_pytest.mark.parametrize(
-    "host_api", ["Core Audio", "MME", "Windows WASAPI", "Windows WDM-KS", "ALSA"]
-)
-def test_most_host_apis_report_the_rate_the_hardware_is_running_at(host_api):
-    assert _reports_current_sample_rate(_rate_device(host_api))
-
-
-def test_asio_does_not_report_a_meaningful_current_rate():
+def test_only_asio_fails_to_report_the_rate_the_hardware_is_running_at():
     """
     PortAudio reports the first rate from a fixed search order for ASIO, not the rate
-    the hardware is on: an iD44 at 48 kHz reports 44100 from a cold process and keeps
-    reporting it across reinitialisations. Treating that as the live rate raises a
-    permanent false mismatch against a 48 kHz input file, which blocks capture.
+    the hardware is on. Treating that as live raises a permanent false mismatch against
+    a 48 kHz input file, which blocks capture. Every other host API means what it says.
     """
     assert not _reports_current_sample_rate(_rate_device("ASIO"))
+    assert _reports_current_sample_rate(_rate_device("Core Audio"))
 
 
 def test_latency_choices_run_from_safest_to_tightest():

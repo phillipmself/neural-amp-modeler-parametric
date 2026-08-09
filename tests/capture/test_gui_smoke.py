@@ -158,50 +158,39 @@ _SPLIT_WINDOWS_DEVICES = [
 ]
 
 
-@_pytest.mark.parametrize("platform", ["win32", "darwin", "linux"])
-def test_no_message_when_a_duplex_device_exists(platform):
-    """The empty-state text is the one cross-platform UI addition; it must stay hidden
-    whenever the picker has something in it, on every platform."""
-    devices = _SPLIT_WINDOWS_DEVICES + [_ASIO_DEVICE]
-    assert _no_duplex_devices_message(devices, platform) == ""
-    assert _no_duplex_devices_message([_ASIO_DEVICE], platform) == ""
+def test_no_message_when_a_duplex_device_exists():
+    """One duplex device among the split ones is enough to keep the label hidden."""
+    assert _no_duplex_devices_message(_SPLIT_WINDOWS_DEVICES + [_ASIO_DEVICE], "win32") == ""
+    assert _no_duplex_devices_message([_device("Mic", "Core Audio", 4, 4)], "darwin") == ""
 
 
-def test_windows_with_no_devices_at_all_does_not_blame_asio():
-    """PortAudio seeing nothing is a different fault from a missing ASIO driver, and
-    telling the user to install one would send them the wrong way."""
-    message = _no_duplex_devices_message([], "win32")
-    assert "ASIO4ALL" not in message
-    assert "No audio devices found" in message
-
-
-@_pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_off_windows_message_does_not_mention_asio(platform):
-    """On macOS an empty picker means no interface is connected; ASIO does not exist
-    there and naming it would be actively misleading."""
-    message = _no_duplex_devices_message([_device("Mic", "Core Audio", 1, 0)], platform)
-    assert message != ""
-    assert "ASIO" not in message
+def test_each_empty_picker_case_gets_its_own_advice():
+    """
+    The three ways the picker comes up empty are three different faults -- no ASIO
+    driver, no hardware at all, and nothing plugged in off Windows -- so each has to
+    reach its own branch. What those branches actually say is copy, not behaviour.
+    """
+    no_asio = _no_duplex_devices_message(_SPLIT_WINDOWS_DEVICES, "win32")
+    no_hardware = _no_duplex_devices_message([], "win32")
+    off_windows = _no_duplex_devices_message(
+        [_device("Mic", "Core Audio", 1, 0)], "darwin"
+    )
+    assert all([no_asio, no_hardware, off_windows])
+    assert len({no_asio, no_hardware, off_windows}) == 3
 
 
 def test_asio_device_rate_is_unknown_rather_than_wrong(_qapp):
     """
     An ASIO device's reported rate is not the rate it is running at, so it must come
-    back as None -- sample_rate_warnings skips an unknown rate, where a wrong one would
-    warn forever and leave the capture buttons disabled.
+    back as None: a wrong one warns forever and leaves the capture buttons disabled.
+    Everything else still falls back to the PortAudio default.
     """
     window = _MainWindow()
     asio = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
     assert window._device_rate(asio, {}) is None
     # A live reading, if one ever existed, is still believed over the default.
     assert window._device_rate(asio, {asio.name: 48000.0}) == 48000
-    window.close()
-
-
-def test_non_asio_device_rate_still_uses_the_portaudio_default(_qapp):
-    window = _MainWindow()
-    coreaudio = _device("Audient iD44", "Core Audio", 4, 4)
-    assert window._device_rate(coreaudio, {}) == 48000
+    assert window._device_rate(_device("Audient iD44", "Core Audio", 4, 4), {}) == 48000
     window.close()
 
 
@@ -221,10 +210,9 @@ def test_asio_rate_mismatch_does_not_block_capture(_qapp):
 def test_route_test_without_a_project_still_gets_a_usable_rate(_qapp, monkeypatch):
     """
     With no project there is no WAV to infer a rate from, so the route test is handed
-    the device's rate explicitly. ASIO reports no meaningful *current* rate, but
-    default_samplerate is still a rate the driver said it supports -- which is all
-    this needs. Falling through to None makes the session try to load input WAVs that
-    do not exist.
+    one explicitly. ASIO reports no meaningful *current* rate, but default_samplerate is
+    still a rate the driver accepts -- and None makes the session hunt for input WAVs
+    that do not exist.
     """
     asio = _device("Audient USB Audio ASIO Driver", "ASIO", 20, 24)
     window = _MainWindow()

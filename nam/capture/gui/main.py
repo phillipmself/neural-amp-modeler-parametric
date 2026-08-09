@@ -290,16 +290,11 @@ def no_duplex_devices_message(
 ) -> str:
     """
     What to tell the user when the device picker has nothing to offer, or "" when it
-    does. Takes the *full* device list, not just the duplex ones, because what is
-    missing is the useful part of the diagnosis.
+    does. Takes the *full* device list, because what is missing is the diagnosis.
 
-    An empty picker means different things per platform. On Windows it almost always
-    means no ASIO driver is installed: PortAudio's other Windows backends each split
-    an interface into separate recording and playback devices, so they never produce
-    a duplex device and are filtered out by design. Seeing devices but no duplex one
-    is the ordinary no-ASIO-driver case; seeing nothing at all is a different problem
-    and gets different advice. Elsewhere -- macOS, where every interface is duplex
-    through CoreAudio -- an empty picker just means nothing is plugged in.
+    On Windows, devices but no duplex one is the ordinary no-ASIO-driver case; no
+    devices at all is a different fault and gets different advice. On macOS, where
+    CoreAudio makes every interface duplex, it just means nothing is plugged in.
     """
     if duplex_devices(devices):
         return ""
@@ -1366,8 +1361,7 @@ class MainWindow(_QMainWindow):
     # -- audio -----------------------------------------------------------
 
     # How long to give a cancelled operation to close its stream before re-enumerating.
-    # The recorder polls the cancel flag every 50 ms and closes the stream on its way
-    # out, so this is many times longer than it should ever need.
+    # The recorder polls the cancel flag every 50 ms, so this is a ceiling, not a cost.
     _REINIT_WAIT_MS = 2000
 
     def _stop_worker_before_reinit(self) -> bool:
@@ -1375,34 +1369,27 @@ class MainWindow(_QMainWindow):
         Stop any in-flight capture or route test so the device table can be rebuilt,
         and report whether it is now safe to reinitialise PortAudio.
 
-        Re-enumerating tears PortAudio down and builds it back up, which is not
-        allowed while a stream is open -- the running operation loses PortAudio
-        underneath it and dies with "PortAudio not initialized", an error about our
-        own bookkeeping that says nothing to the user. Cancelling first goes through
-        exactly the same path as the Cancel button, so the operation closes its stream
-        and reports itself cancelled like any other cancellation.
+        Re-enumerating tears PortAudio down and back up, which is not allowed while a
+        stream is open: the running operation dies with "PortAudio not initialized".
+        Cancelling first takes the same path as the Cancel button, so it closes its
+        stream and reports itself cancelled.
 
-        Losing the operation is the right trade at every caller. The refresh button is
-        deliberately left enabled during one, because asking to re-read the devices is
-        a reasonable thing to want mid-route-test; opening or creating a project
-        refreshes too, and while a capture should not be running then, cancelling it is
-        still better than the "PortAudio not initialized" it would otherwise die of.
+        Losing the operation is the right trade at every caller -- the refresh button
+        (deliberately left enabled during one) and project open/create alike.
         """
         worker = self._worker
         if worker is None or not worker.isRunning():
             return True
         if self._cancel_token is not None:
             self._cancel_token.cancel()
-        # Only the thread finishing is waited on here. The ``cancelled`` signal is
-        # queued and will not be delivered until this returns to the event loop, which
-        # is what eventually puts "cancelled" on the label.
+        # Only the thread finishing is waited on. The ``cancelled`` signal is queued and
+        # arrives once this returns to the event loop.
         return bool(worker.wait(self._REINIT_WAIT_MS))
 
     def _refresh_devices(self) -> None:
         safe_to_reinit = self._stop_worker_before_reinit()
         if not safe_to_reinit:
-            # Never reinitialise on the off-chance: a stream may still be open, and
-            # the cached table is merely stale where that would be undefined behaviour.
+            # A stream may still be open. A stale table beats undefined behaviour.
             self.project_log.appendPlainText(
                 "An audio operation would not stop, so the device list was re-read "
                 "without reinitialising the audio system; sample rates may be stale."
@@ -1518,10 +1505,9 @@ class MainWindow(_QMainWindow):
         Current hardware rate for ``device``: live if known, else its PortAudio default,
         else ``None`` when the device does not report one that means anything.
 
-        ``None`` is not an error -- ``sample_rate_warnings`` skips a device whose rate is
-        unknown rather than warning about it, which is what an ASIO device needs: its
-        reported rate is not the rate it is running at, and it retunes to whatever the
-        stream asks for. See :func:`reports_current_sample_rate`.
+        ``None`` is not an error: ``sample_rate_warnings`` skips an unknown rate rather
+        than warning about it, which is what ASIO needs. See
+        :func:`reports_current_sample_rate`.
         """
         if device is None:
             return None
@@ -1533,9 +1519,9 @@ class MainWindow(_QMainWindow):
         return int(round(rate))
 
     def _update_live_device_rates(self) -> None:
-        # Live rates exist on macOS only; off it this returns nothing and the rates fall
-        # back to PortAudio's cached defaults. Nothing here reinitialises PortAudio, so
-        # it is safe to call while a worker holds a stream.
+        # Live rates exist on macOS only; elsewhere this returns nothing and callers
+        # fall back to PortAudio's cached defaults. Never reinitialises, so this is safe
+        # to call while a worker holds a stream.
         rates = _current_device_sample_rates()
         if rates:
             self._live_device_rates = rates
@@ -1635,11 +1621,9 @@ class MainWindow(_QMainWindow):
         self._update_live_device_rates()
         rate = self._device_rate(device, self._live_device_rates)
         if rate is None:
-            # ``_device_rate`` says None when the device publishes no meaningful
-            # current rate, which is always true of ASIO. That is the right answer for
-            # the mismatch warning, but the wrong one here: this needs *a* rate the
-            # device will accept, not the one it is supposedly on, and PortAudio chose
-            # ``default_samplerate`` precisely because the driver said it supports it.
+            # None means no meaningful *current* rate (always so for ASIO). Right for
+            # the mismatch warning, wrong here: this needs a rate the device accepts,
+            # and PortAudio reports ``default_samplerate`` because the driver takes it.
             rate = int(round(device.default_samplerate))
         project = _CaptureProject(knobs=[], audio=self._audio_settings)
         session = _CaptureSession(project, self.project_dir or _Path("."))

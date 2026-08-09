@@ -28,25 +28,18 @@ def _enable_asio_on_windows() -> None:
     """
     Ask ``sounddevice`` for its ASIO-enabled PortAudio build, on Windows only.
 
-    ASIO is the only Windows backend this app supports, because it is the only one
-    with DAW-comparable round-trip latency -- which is the entire premise of the
-    latency settings -- and the only one that presents an interface as a single
-    *duplex* device. MME, DirectSound, WASAPI and WDM-KS all split an interface into
-    separate capture and render devices, so none of them survive the duplex filter the
-    device picker already applies; enabling ASIO is therefore the whole of Windows
-    support, and the other backends are excluded for free rather than by code.
+    ASIO is the only Windows backend this app supports: the only one with
+    DAW-comparable round-trip latency, and the only one presenting an interface as a
+    single duplex device. The rest split it in two and so never survive the device
+    picker's duplex filter, which excludes them for free.
 
-    ``sounddevice`` chooses which PortAudio DLL to load the first time it is imported,
-    and reads this variable at that moment, so this has to run before any
-    ``import sounddevice``. That is why it sits at module scope: every other reference
-    to ``sounddevice`` in this module is deliberately lazy (see the module docstring),
-    which is exactly what makes a module-scope env var here safe and sufficient.
+    ``sounddevice`` picks its DLL when first imported and reads this variable then, so
+    this must run before any ``import sounddevice`` -- hence module scope, which every
+    other reference in this module being lazy makes sufficient.
 
-    Note that ``sounddevice`` tests only whether this variable is *present*, not what
-    it is set to, so ``SD_ENABLE_ASIO=0`` still selects the ASIO build: on Windows
-    this app is ASIO or nothing, which is the intended product decision rather than an
-    oversight. ``setdefault`` is used anyway so an explicit setting is left as the user
-    wrote it, but it is not an off switch and there is no value that acts as one.
+    ``sounddevice`` checks only that the variable exists, so ``SD_ENABLE_ASIO=0`` still
+    selects ASIO. ``setdefault`` leaves an explicit setting alone, but there is no
+    value that acts as an off switch.
     """
     if _sys.platform == "win32":
         _os.environ.setdefault("SD_ENABLE_ASIO", "1")
@@ -67,28 +60,19 @@ _S_FALSE = 1
 @_contextlib.contextmanager
 def asio_com_apartment():
     """
-    Put the calling thread in a single-threaded COM apartment for as long as the block
-    runs, on Windows. A no-op everywhere else.
+    Put the calling thread in a single-threaded COM apartment for the duration of the
+    block, on Windows. A no-op everywhere else.
 
-    ASIO drivers are in-process COM servers, and PortAudio loads one when a stream is
-    *opened*, on whichever thread opens it. A thread with no COM apartment cannot load
-    it, and PortAudio surfaces that as a bare
-    ``Unanticipated host error ... 'Failed to load ASIO driver'``. Python's main thread
-    ends up in an apartment as a side effect of other initialisation, so this only
-    bites on the capture worker: the GUI thread opens streams fine, the QThread that
-    actually runs a capture does not.
+    ASIO drivers are in-process COM servers, loaded when a stream is *opened*, on
+    whichever thread opens it. A thread with no apartment cannot load one, which
+    PortAudio surfaces as ``Unanticipated host error ... 'Failed to load ASIO
+    driver'``. Python's main thread lands in an apartment incidentally, so only the
+    capture QThread needs this.
 
-    Measured on Windows with an Audient iD44 -- opening a duplex ASIO stream from a
-    worker thread fails with exactly that error, and succeeds with this wrapper, across
-    repeated worker lifecycles, leaving the main thread able to open streams too.
-
-    Note that the fix is *not* to reinitialise PortAudio on the worker thread, which is
-    the intuitive reading of the symptom. ``Pa_Initialize`` is reference-counted, so
-    calling it while PortAudio is already up does nothing at all; and forcing a real
-    reinitialisation there moves the ASIO driver's apartment onto a thread that dies
-    when the capture ends, after which the *main* thread can no longer open a stream.
-    It would also renumber the device table underneath callers that have already
-    resolved names to indices. This touches neither.
+    Reinitialising PortAudio on the worker thread is the intuitive fix and the wrong
+    one: ``Pa_Initialize`` is reference-counted so it does nothing while PortAudio is
+    up, and forcing a real one binds the driver to a thread that dies with the capture,
+    after which the main thread can no longer open a stream.
     """
     if _sys.platform != "win32":
         yield
@@ -231,21 +215,14 @@ def reports_current_sample_rate(device: DeviceInfo) -> bool:
     Whether ``device.default_samplerate`` means "the rate this hardware is running at".
 
     For most host APIs it does: the device is locked to a rate chosen in the OS, and a
-    capture at a different rate would be resampled or refused, which is worth warning
-    about.
+    capture at a different rate would be resampled or refused -- worth warning about.
 
-    ASIO is the exception, in two ways that both point the same direction. PortAudio
-    does not ask an ASIO driver what rate it is running at; it walks a fixed list of
-    standard rates, starting at 44100, and reports the first the driver says it
-    supports. An Audient iD44 running at 48 kHz reports 44100 from a cold process, and
-    keeps reporting it however many times PortAudio is reinitialised, because nothing
-    is being re-read -- the number never described the hardware in the first place.
-
-    And there would be nothing to warn about even if it did: an ASIO driver switches
-    the hardware to whatever rate the client asks for when the stream is opened, so a
-    "mismatch" resolves itself. The same iD44 reports 44100 and accepts 44100, 48000,
-    88200 and 96000. A rate it genuinely cannot do fails loudly at stream open, which
-    is a better signal than a warning derived from a number that means something else.
+    ASIO is the exception. PortAudio never asks the driver what rate it is on; it walks
+    a fixed list starting at 44100 and reports the first the driver supports, so an
+    iD44 running at 48 kHz reports 44100 permanently. And there would be nothing to
+    warn about even if it did, because an ASIO driver retunes to whatever the stream
+    asks for. A rate it genuinely cannot do fails at stream open, which beats a warning
+    derived from a number that means something else.
     """
     return device.host_api != "ASIO"
 
@@ -267,13 +244,11 @@ def current_device_sample_rates() -> dict[str, float]:
         except Exception:
             return {}
 
-    # Off macOS the only way to re-read the rates is to reinitialise PortAudio, and
-    # this is called from a timer. PortAudio enumerates ASIO by loading every installed
-    # ASIO driver, so a reinit is not the cheap table re-read it looks like: measured on
-    # Windows with an Audient iD44 it costs ~90 ms of blocked GUI thread (~54 ms before
-    # ASIO), and it raced the capture thread for the same driver. The explicit "Refresh
-    # devices" button still reinitialises through ``list_devices(refresh=True)``, which
-    # is where someone who just changed their interface's rate would look anyway.
+    # Off macOS the only way to re-read the rates is to reinitialise PortAudio, and this
+    # is polled on a timer. PortAudio enumerates ASIO by loading every installed driver,
+    # so a reinit costs ~90 ms of blocked GUI thread and races the capture thread for
+    # the same driver. "Refresh devices" still reinitialises, which is where someone who
+    # just changed their interface's rate would look anyway.
     return {}
 
 
