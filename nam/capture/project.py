@@ -121,9 +121,10 @@ class AudioSettingsModel(_BaseModel):
     input_device: _Optional[str] = None
     output_channel: int = 1
     input_channel: int = 1
-    # Optional second I/O pair (on the same devices) wired as a direct loopback: a
-    # clean copy of the timing blips is played on ``loopback_output_channel`` and
-    # patched straight back into ``loopback_input_channel``. It stays undistorted no
+    # Optional second I/O pair (on the same devices) wired as a direct loopback: a copy
+    # of the capture playback (timing blips and input audio alike) goes out
+    # ``loopback_output_channel`` and is patched straight back into
+    # ``loopback_input_channel``. It stays undistorted no
     # matter how hard the amp is driven, so the delay is measured from it instead of the
     # (increasingly smeared) amp return. It also sees none of the amp's own knob-dependent
     # tone-stack group delay, which is real behaviour the model must learn rather than

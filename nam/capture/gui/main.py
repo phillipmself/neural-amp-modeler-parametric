@@ -587,10 +587,11 @@ class MainWindow(_QMainWindow):
             "Use a second I/O pair as a clean delay-detection loopback"
         )
         self.loopback_check.setToolTip(
-            "Play the timing blips on a second output channel patched straight back "
-            "into a second input channel. The delay is measured from that clean "
-            "loopback instead of the amp return, so it stays consistent as gain and "
-            "distortion increase."
+            "Play the capture audio, timing blips and all, on a second output channel "
+            "patched straight back into a second input channel. The delay is measured "
+            "from that clean loopback instead of the amp return, so it stays consistent "
+            "as gain and distortion increase, and the recording is kept in captures_raw "
+            "as an untouched reference for the session."
         )
         self.loopback_output_channel_spin = _QSpinBox()
         self.loopback_output_channel_spin.setRange(1, 1)
