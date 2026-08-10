@@ -50,6 +50,7 @@ from ..audio import DeviceInfo as _DeviceInfo
 from ..audio import LATENCY_CHOICES as _LATENCY_CHOICES
 from ..audio import list_devices as _list_devices
 from ..audio import reports_current_sample_rate as _reports_current_sample_rate
+from ..export import update_data_json as _update_data_json
 from ..export import write_concat_training_configs as _write_concat_training_configs
 from ..export import write_hyper_training_configs as _write_hyper_training_configs
 from ..params import KnobSpec as _KnobSpec
@@ -57,6 +58,7 @@ from ..params import validate_knobs as _validate_knobs
 from ..planner import corner_capture_count as _corner_capture_count
 from ..planner import settings_sort_key as _settings_sort_key
 from ..project import add_corner_captures as _add_corner_captures
+from ..project import clear_captures as _clear_captures
 from ..project import AudioSettingsModel as _AudioSettingsModel
 from ..project import CaptureEntryModel as _CaptureEntryModel
 from ..project import CaptureProject as _CaptureProject
@@ -68,6 +70,7 @@ from ..project import new_project as _new_project
 from ..project import PROJECT_FILENAME as _PROJECT_FILENAME
 from ..project import reconcile_with_disk as _reconcile_with_disk
 from ..project import save_project as _save_project
+from ..session import timebase_problem as _timebase_problem
 from ..project import QAModel as _QAModel
 from ..session import CaptureSession as _CaptureSession
 from ..session import LOOPBACK_CROSSCHECK_SAMPLES as _LOOPBACK_CROSSCHECK_SAMPLES
@@ -709,9 +712,12 @@ class MainWindow(_QMainWindow):
         self.cancel_button = _QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._on_cancel_capture)
+        self.clear_captures_button = _QPushButton("Clear captures")
+        self.clear_captures_button.clicked.connect(self._on_clear_captures)
         buttons.addWidget(self.capture_next_button)
         buttons.addWidget(self.capture_selected_button)
         buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.clear_captures_button)
         buttons.addWidget(self._make_sort_button())
         layout.addLayout(buttons)
 
@@ -982,8 +988,54 @@ class MainWindow(_QMainWindow):
             _QMessageBox.information(self, "Project reconciled", "\n".join(notes))
         else:
             self.project_log.appendPlainText(f"Opened project: {project_dir}")
+        self._maybe_warn_timebase()
         self._maybe_prompt_import_al_proposals()
         self._refresh_devices()
+        self._refresh_all()
+
+    def _maybe_warn_timebase(self) -> None:
+        """
+        Say on open that this project's existing captures cannot be built on, rather than
+        letting the user pick a setting, run a capture and be refused at the end of it.
+        """
+        if self.project is None or self.project_dir is None:
+            return
+        problem = _timebase_problem(self.project, self.project_dir)
+        if problem is None:
+            return
+        self.project_log.appendPlainText(problem)
+        _QMessageBox.warning(
+            self,
+            "Captures can't be timed together",
+            f"{problem}\n\nUse \u201cClear captures\u201d on the Capture tab to start "
+            "this project's captures again.",
+        )
+
+    def _on_clear_captures(self) -> None:
+        if self.project is None or self.project_dir is None:
+            _QMessageBox.warning(self, "No project", "Open or create a project first.")
+            return
+        captured = self.project.captured_entries()
+        if not captured:
+            _QMessageBox.information(
+                self, "Nothing to clear", "This project has no captures yet."
+            )
+            return
+        confirm = _QMessageBox.question(
+            self,
+            "Clear captures?",
+            f"Delete all {len(captured)} capture(s) in this project and mark them for "
+            "recapturing?\n\nThe capture WAVs are deleted and cannot be recovered. The "
+            "original recordings in captures_raw/ are kept.",
+            _QMessageBox.StandardButton.Yes | _QMessageBox.StandardButton.No,
+            _QMessageBox.StandardButton.No,
+        )
+        if confirm != _QMessageBox.StandardButton.Yes:
+            return
+        notes = _clear_captures(self.project, self.project_dir)
+        _save_project(self.project, self.project_dir)
+        _update_data_json(self.project, self.project_dir)
+        self.capture_log.appendPlainText("\n".join(notes))
         self._refresh_all()
 
     def _maybe_prompt_import_al_proposals(self) -> None:
@@ -1750,6 +1802,19 @@ class MainWindow(_QMainWindow):
         self._begin_capture(self._displayed_entries[row])
 
     def _begin_capture(self, entry: _CaptureEntryModel) -> None:
+        # Checked here rather than left to the capture: the answer does not depend on
+        # anything the recording produces, so asking first turns "Capture failed" after a
+        # full pass into a refusal before the rig is driven at all.
+        if self.project is not None and self.project_dir is not None:
+            problem = _timebase_problem(self.project, self.project_dir)
+            if problem is not None:
+                _QMessageBox.critical(
+                    self,
+                    "Captures can't be timed together",
+                    f"{problem}\n\nUse \u201cClear captures\u201d below to start this "
+                    "project's captures again.",
+                )
+                return
         warnings = self._current_sample_rate_warnings()
         if warnings:
             self._refresh_sample_rate_warning()

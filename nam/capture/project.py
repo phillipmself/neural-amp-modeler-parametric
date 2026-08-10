@@ -454,6 +454,42 @@ def reconcile_with_disk(project: CaptureProject, project_dir: _Path) -> list[str
     return notes
 
 
+def clear_captures(project: CaptureProject, project_dir: _Path) -> list[str]:
+    """
+    Put every captured entry back to pending and delete its capture WAV, so the project
+    starts its captures over. Does not save; the caller saves. Returns a note per entry.
+
+    The files have to go, not just the statuses: a pending entry whose WAV is still on
+    disk is offered back to the user as recoverable (see :func:`find_recoverable_entries`)
+    and would be marked captured again on the next open, undoing this.
+
+    ``captures_raw/`` is left alone. Those recordings are the only record of what the rig
+    actually did, which is what a timing fault has to be diagnosed from after the fact,
+    and each is overwritten when its entry is captured again.
+
+    Clears ``alignment_reference`` for the same reason the entries are cleared: it exists
+    only to describe the timebase those captures were written against, and applying it to
+    captures made after them would be applying it to captures that never used it.
+    """
+    project_dir = _Path(project_dir)
+    notes: list[str] = []
+    for entry in project.captured_entries():
+        wav_path = project_dir / entry.y_path
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError as exc:
+            notes.append(f"{entry.y_path}: could not delete ({exc}); left as captured.")
+            continue
+        entry.status = "pending"
+        entry.delay = None
+        entry.captured_at = None
+        entry.qa = None
+        entry.stream_config = None
+        notes.append(f"{entry.y_path}: cleared.")
+    project.alignment_reference = None
+    return notes
+
+
 def migrate_legacy_peak_values(project: CaptureProject, project_dir: _Path) -> list[str]:
     """
     Recompute ``qa.peak`` in dBFS for captures saved back when it was a linear 0-1

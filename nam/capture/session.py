@@ -137,6 +137,48 @@ class CaptureSessionError(RuntimeError):
     pass
 
 
+def has_captures(project: _CaptureProject, project_dir: _Path) -> bool:
+    """
+    Whether this project has captures the legacy timebase could still describe.
+
+    Deliberately not just ``captured_entries()``. An entry goes pending while its WAV
+    stays on disk -- after the plan is regenerated, until the user accepts the offer to
+    restore it (:func:`nam.capture.project.find_recoverable_entries`) -- and during that
+    window the project looks empty while being one dialog away from having every capture
+    back. Reading only the statuses there let the timebase be released and a new capture
+    made against a different one, which is the mixed set the whole thing exists to
+    prevent, so the files are what is asked.
+    """
+    project_dir = _Path(project_dir)
+    return bool(project.captured_entries()) or any(
+        (project_dir / entry.y_path).is_file() for entry in project.entries
+    )
+
+
+def timebase_problem(
+    project: _CaptureProject, project_dir: _Path
+) -> _Optional[str]:
+    """
+    Why this project cannot be captured into, or ``None`` if it can.
+
+    Split out from :meth:`CaptureSession._alignment_lead`, which refuses the capture, so
+    the GUI can ask the same question without starting one -- the answer does not depend
+    on anything a capture produces, and arriving as a failure *after* a recording is a
+    poor way to learn that the recording could never have been kept.
+    """
+    reference = project.alignment_reference
+    if reference is None or not has_captures(project, project_dir):
+        return None
+    if 0.0 < reference <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+        return None
+    return (
+        "The captures already in this project have a bad timing measurement, so new "
+        "captures can't be lined up with them. Clear the captures made so far and "
+        f"record them again. (Timing offset {reference:.0f} samples, usually caused by "
+        "an audio dropout during the first capture.)"
+    )
+
+
 def raw_paths(project_dir: _Path, y_path: str) -> tuple[_Path, _Path]:
     """
     Where a capture's untouched recordings live: ``(amp return, loopback)``, both in
@@ -515,7 +557,7 @@ class CaptureSession:
         legacy = self.project.alignment_reference
         if legacy is None:
             return ALIGNMENT_LEAD_SAMPLES
-        if not self.project.captured_entries():
+        if not has_captures(self.project, self.project_dir):
             # The reference exists only to match captures already written against it.
             # With none left there is nothing to match, so the project starts fresh --
             # and it is dropped rather than merely skipped, or capturing a few entries
@@ -526,13 +568,9 @@ class CaptureSession:
             # the reference that refuses them survives having no captures left.
             self.project.alignment_reference = None
             return ALIGNMENT_LEAD_SAMPLES
-        if not 0.0 < legacy <= MAX_LEGACY_ALIGNMENT_REFERENCE:
-            raise CaptureSessionError(
-                "The captures already in this project have a bad timing measurement, so "
-                "new captures can't be lined up with them. Delete the captures made so "
-                f"far and record them again. (Timing offset {legacy:.0f} samples, "
-                "usually caused by an audio dropout during the first capture.)"
-            )
+        problem = timebase_problem(self.project, self.project_dir)
+        if problem is not None:
+            raise CaptureSessionError(problem)
         return float(legacy)
 
     @staticmethod

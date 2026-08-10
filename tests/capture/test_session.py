@@ -11,6 +11,7 @@ from nam.capture.latency import BlipPreamble as _BlipPreamble
 from nam.capture.params import KnobSpec as _KnobSpec
 from nam.capture.planner import CAPTURES_RAW_DIRNAME as _CAPTURES_RAW_DIRNAME
 from nam.capture.planner import RAW_MANIFEST_FILENAME as _RAW_MANIFEST_FILENAME
+from nam.capture.project import clear_captures as _clear_captures
 from nam.capture.project import find_recoverable_entries as _find_recoverable_entries
 from nam.capture.project import load_project as _load_project
 from nam.capture.project import new_project as _new_project
@@ -24,6 +25,7 @@ from nam.capture.session import (
 )
 from nam.capture.session import playback_input_path as _playback_input_path
 from nam.capture.session import raw_paths as _raw_paths
+from nam.capture.session import timebase_problem as _timebase_problem
 from nam.data import np_to_wav as _np_to_wav
 from nam.data import wav_to_np as _wav_to_np
 
@@ -1079,3 +1081,94 @@ def test_clearing_a_projects_captures_releases_its_legacy_timebase(tmp_path):
     # back in force over captures that were never written against it.
     assert project.alignment_reference is None
     assert _load_project(project_dir).alignment_reference is None
+
+
+def test_a_healthy_project_reports_no_timebase_problem(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+
+    assert _timebase_problem(project, project_dir) is None
+    session.capture_entry(project.pending_entries()[0])
+    assert _timebase_problem(project, project_dir) is None
+
+    # A plausible legacy offset is a timebase to honour, not a problem to report.
+    project.alignment_reference = 11.0
+    assert _timebase_problem(project, project_dir) is None
+
+
+def test_timebase_problem_is_answerable_without_running_a_capture(tmp_path):
+    # The GUI asks this before capturing, so it must not need anything a capture
+    # produces -- and it must agree with the refusal the capture itself would raise.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+    session.capture_entry(project.pending_entries()[0])
+    project.alignment_reference = 129.0
+    recorder.calls.clear()
+
+    problem = _timebase_problem(project, project_dir)
+    assert problem is not None
+    assert recorder.calls == []
+    with _pytest.raises(_CaptureSessionError) as excinfo:
+        session.capture_entry(project.pending_entries()[0])
+    assert str(excinfo.value) == problem
+
+
+def test_clearing_captures_deletes_the_files_and_the_timebase(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    project.alignment_reference = 129.0
+    raw, raw_loopback = _raw_paths(project_dir, entry.y_path)
+    assert (project_dir / entry.y_path).is_file() and raw.is_file()
+
+    notes = _clear_captures(project, project_dir)
+
+    assert notes
+    assert entry.status == "pending"
+    assert entry.delay is None and entry.qa is None
+    # The WAV must actually go: a pending entry whose file is still there gets offered
+    # back as recoverable and would be marked captured again, undoing this.
+    assert not (project_dir / entry.y_path).exists()
+    assert not _find_recoverable_entries(project, project_dir)
+    # The raw recordings stay -- they are the only record of what the rig did.
+    assert raw.is_file() and raw_loopback.is_file()
+    # And the timebase those captures were written against goes with them.
+    assert project.alignment_reference is None
+    assert _timebase_problem(project, project_dir) is None
+
+
+def test_a_timebase_survives_its_captures_being_pending_pre_recovery(tmp_path):
+    # Regenerating the plan leaves entries pending while their WAVs stay on disk, until
+    # the user accepts the offer to restore them. Reading only the statuses in that window
+    # released the timebase and let the next capture be made against a different one --
+    # which is how a real project ended up with two captures on one timebase and a third
+    # on another, with nothing left to detect it.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    legacy = 11.0
+    project.alignment_reference = legacy
+
+    # The pre-recovery window: pending again, but the capture file is still there.
+    entry.status = "pending"
+    assert not project.captured_entries()
+    assert (project_dir / entry.y_path).is_file()
+
+    assert session._alignment_lead() == legacy
+    assert project.alignment_reference == legacy
+    # And a poisoned one is still refused rather than quietly released.
+    project.alignment_reference = 129.0
+    assert _timebase_problem(project, project_dir) is not None
+    with _pytest.raises(_CaptureSessionError):
+        session.capture_entry(project.pending_entries()[0])
