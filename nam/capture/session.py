@@ -97,16 +97,25 @@ TAIL_SECONDS = 0.5
 # project on one timebase (see :meth:`CaptureSession._alignment`) -- what matters is only
 # that it never varies between captures.
 #
-# It is not free, though, which is why it is small. The lead is the amount the trained
-# model's output lags its input, and it is baked into every model exported from the
-# project: 4 samples is 0.083 ms at 48 kHz. Erring early is still the right direction --
-# a label that lands *after* the response has started asks a causal model for output
-# before it has the input that caused it, which it can only approximate -- but the margin
-# is bought with latency, so it is spent sparingly. 4 samples is comfortably clear of the
-# 3.4-sample onset-to-peak distance measured on an iD44 and matches what the previous
-# threshold-based scheme produced there. A converter whose response spreads further needs
-# more, which ``CaptureSession._qa`` detects per capture and says so rather than leaving
-# it to be discovered in a soft-sounding model.
+# Nearly all of it is a change of reference point rather than caution. The peak is not
+# where the response begins: it is the maximum, and on an iD44 it sits 3.4 samples past
+# the first sample to clear the noise floor. NAM labels from that onset and pads it by one
+# sample (``_DELAY_CALIBRATION_SAFETY_FACTOR``), so reproducing the same instant from the
+# peak means backing off that 3.4 plus NAM's 1 -- which is this constant. It is NAM's
+# single sample of padding expressed in the peak's frame, not four samples of padding
+# stacked on top of a measurement that is already precise.
+#
+# It lands where NAM does, exactly: on an iD44 blip peak 1194.42, this labels 1190, which
+# is the same number NAM's threshold-minus-one produces. So the lead the model has to
+# learn -- and the latency baked into everything exported from the project -- is unchanged
+# from the old scheme's. What is bought with it is that the peak is stable and resolvable
+# below a sample, and a threshold crossing is neither: it moves with the response's
+# amplitude, which is what let one bad capture take a whole project's timebase with it.
+#
+# The cost is that 3.4 is a property of the converter, not a constant, so a converter
+# whose response spreads further needs more than 4 and would be labelled fractionally
+# late. ``CaptureSession._qa`` checks each capture against its own detected onset and says
+# so, rather than leaving it to be found in a model that sounds soft.
 ALIGNMENT_LEAD_SAMPLES = 4.0
 # Beyond this, a legacy ``alignment_reference`` is not a converter's timing offset but a
 # broken measurement (a first capture whose two timing blips disagreed produces exactly
@@ -508,13 +517,10 @@ class CaptureSession:
             return ALIGNMENT_LEAD_SAMPLES
         if not 0.0 < legacy <= MAX_LEGACY_ALIGNMENT_REFERENCE:
             raise CaptureSessionError(
-                f"This project's timebase ({legacy:.2f} samples) is too far from the "
-                "blip response to be a converter's timing offset, so the captures "
-                "already in it cannot be trusted or matched. This is what a capture "
-                "whose two timing blips disagreed leaves behind -- a dropout during the "
-                "count-in. The captures made so far need to be recaptured; delete them "
-                "to start the project's timebase again. Projects created from here on "
-                "measure each capture's timing independently and cannot fail this way."
+                "The captures already in this project have a bad timing measurement, so "
+                "new captures can't be lined up with them. Delete the captures made so "
+                f"far and record them again. (Timing offset {legacy:.0f} samples, "
+                "usually caused by an audio dropout during the first capture.)"
             )
         return float(legacy)
 
@@ -813,17 +819,19 @@ class CaptureSession:
             # time from the other, which means a glitch during the preamble rather than
             # anything about the rig's steady-state latency -- and the pair of numbers is
             # what makes that recognisable instead of a bare "may be unreliable".
-            blips = (
-                " and ".join(f"{d:+d}" for d in latency.blip_delays)
-                if latency.blip_delays
-                else "different amounts"
-            )
+            if latency.blip_delays:
+                gap = max(latency.blip_delays) - min(latency.blip_delays)
+                detail = (
+                    f"{gap} samples apart "
+                    f"({' and '.join(str(d) for d in latency.blip_delays)})"
+                )
+            else:
+                detail = "at different times"
             messages.append(
-                f"The two timing blips came back at different delays ({blips} samples), "
-                "so this capture's timing could not be measured reliably and its target "
-                "may be misaligned. This is a dropout during the count-in rather than a "
-                "problem with the rig; recapture this entry. Other captures are "
-                "unaffected -- each one measures its own timing."
+                "This capture's timing couldn't be measured reliably: the two timing "
+                f"blips came back {detail}. That usually means an audio dropout at the "
+                "start of the recording. Record this one again -- your other captures "
+                "aren't affected."
             )
 
         # The label is placed ALIGNMENT_LEAD_SAMPLES ahead of the blip's energy peak,
@@ -835,12 +843,10 @@ class CaptureSession:
         if loopback_used and delay is not None and latency.delay is not None:
             if delay > latency.delay:
                 messages.append(
-                    f"This capture is labelled with a delay of {delay}, which is later "
-                    f"than the {latency.delay} its blip onset was detected at, so its "
-                    "target starts slightly ahead of the input it is paired with. The "
-                    f"{ALIGNMENT_LEAD_SAMPLES:g}-sample alignment lead is too short for "
-                    "this converter -- raise ALIGNMENT_LEAD_SAMPLES and recapture the "
-                    "project."
+                    "This capture's response starts before the point it's timed from "
+                    f"({latency.delay} against {delay} samples), which can soften the "
+                    "model. Your audio interface needs a bigger timing margin than the "
+                    "app allows for -- please report this."
                 )
 
         delay_disagreement = False

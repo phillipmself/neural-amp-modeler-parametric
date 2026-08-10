@@ -953,9 +953,9 @@ def test_disagreeing_blips_are_flagged_with_both_readings(tmp_path):
     assert abs(qa.blip_delays[0] - qa.blip_delays[1]) >= 20
     # The message has to name the two readings and say which capture is at fault, since
     # the failure it describes is local to this one.
-    (message,) = [m for m in qa.messages if "came back at different delays" in m]
+    (message,) = [m for m in qa.messages if "timing blips came back" in m]
     assert all(str(d) in message for d in qa.blip_delays)
-    assert "recapture this entry" in message
+    assert "Record this one again" in message
     # The loopback cross-check is downstream of the same broken measurement, so it
     # must not also fire and send the user after a cable.
     assert not any("check the loopback patch" in m.lower() for m in qa.messages)
@@ -1029,7 +1029,7 @@ def test_a_poisoned_legacy_timebase_is_refused_before_anything_is_recorded(tmp_p
         session.capture_entry(entry)
 
     assert "129" in str(excinfo.value)
-    assert "recaptured" in str(excinfo.value)
+    assert "record them again" in str(excinfo.value)
     # Refused before the rig was driven at all, not after the user sat through a capture.
     assert recorder.calls == []
     assert entry.status == "pending"
