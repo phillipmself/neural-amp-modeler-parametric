@@ -24,9 +24,12 @@ error, and that error is not a function of the knobs, so a parametric model cann
 it as a rule -- it can only memorise a per-capture phase. Correcting it at write time
 keeps ``delay`` an integer and leaves everything downstream unchanged. Every capture
 derives its own timebase from its own loopback blip, holding nothing in common with the
-others but a constant, so no capture can put another one out. See
-:meth:`CaptureSession._alignment` for what is measured and why, and
-:mod:`nam.capture.resample` for the filter.
+others but a fixed lead, so no capture can put another one out. See
+:meth:`CaptureSession._alignment` for what is measured and why,
+:meth:`CaptureSession._alignment_lead` for the one case where that lead comes from the
+project rather than a constant (a project part-captured before this, whose existing
+captures are already written against its own offset), and :mod:`nam.capture.resample`
+for the filter.
 """
 
 from __future__ import annotations
@@ -91,11 +94,26 @@ TAIL_SECONDS = 0.5
 # The label has to sit a little before the response: a converter's anti-alias filter
 # spreads energy ahead of the peak, and a label placed on the peak itself would ask the
 # model to account for input it has not been shown yet. Any fixed value puts the whole
-# project on one timebase (see :meth:`CaptureSession._alignment`) -- what matters is that
-# it never varies between captures -- so this is chosen to land on the same delay the old
-# threshold-based measurement produced on a healthy rig, which keeps the numbers written
-# to data.json unchanged for projects that were part-captured under it.
+# project on one timebase (see :meth:`CaptureSession._alignment`) -- what matters is only
+# that it never varies between captures.
+#
+# It is not free, though, which is why it is small. The lead is the amount the trained
+# model's output lags its input, and it is baked into every model exported from the
+# project: 4 samples is 0.083 ms at 48 kHz. Erring early is still the right direction --
+# a label that lands *after* the response has started asks a causal model for output
+# before it has the input that caused it, which it can only approximate -- but the margin
+# is bought with latency, so it is spent sparingly. 4 samples is comfortably clear of the
+# 3.4-sample onset-to-peak distance measured on an iD44 and matches what the previous
+# threshold-based scheme produced there. A converter whose response spreads further needs
+# more, which ``CaptureSession._qa`` detects per capture and says so rather than leaving
+# it to be discovered in a soft-sounding model.
 ALIGNMENT_LEAD_SAMPLES = 4.0
+# Beyond this, a legacy ``alignment_reference`` is not a converter's timing offset but a
+# broken measurement (a first capture whose two timing blips disagreed produces exactly
+# that), and reproducing its timebase would mean inheriting the fault. Sized to sit above
+# any plausible converter and well below the 129-sample reference the failure that
+# prompted this actually wrote.
+MAX_LEGACY_ALIGNMENT_REFERENCE = 32.0
 # A shift is the rounding residue of the label, so it cannot leave this range. Anything
 # past it means the arithmetic below is broken rather than the rig, so it is checked
 # rather than trusted.
@@ -467,16 +485,52 @@ class CaptureSession:
             y = _apply_fractional_delay(y, fraction).astype(_np.float32)
         return y
 
+    def _alignment_lead(self) -> float:
+        """
+        How far ahead of the blip peak this project's captures are labelled.
+
+        :data:`ALIGNMENT_LEAD_SAMPLES` for any project made under the stateless timebase,
+        which is all of them from here on. A project part-captured before it has captures
+        already written against its own ``alignment_reference``, and finishing it with a
+        different lead would leave those and the new ones on timebases a fraction of a
+        sample -- or, on a rig whose response spreads further, many samples -- apart. That
+        is the per-capture phase error the alignment exists to remove, so such a project
+        keeps using its recorded offset and its captures stay mutually aligned. Nothing is
+        measured into it and nothing is written back; it is a constant read from the file.
+
+        A reference too large to be a converter's timing offset is refused rather than
+        reproduced. That is what the original fault wrote (129 samples, from a first
+        capture whose two timing blips disagreed), and honouring it would spread a bad
+        measurement into every remaining capture -- the exact failure this replaced.
+        """
+        legacy = self.project.alignment_reference
+        if legacy is None:
+            return ALIGNMENT_LEAD_SAMPLES
+        if not 0.0 < legacy <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+            raise CaptureSessionError(
+                f"This project's timebase ({legacy:.2f} samples) is too far from the "
+                "blip response to be a converter's timing offset, so the captures "
+                "already in it cannot be trusted or matched. This is what a capture "
+                "whose two timing blips disagreed leaves behind -- a dropout during the "
+                "count-in. The captures made so far need to be recaptured; delete them "
+                "to start the project's timebase again. Projects created from here on "
+                "measure each capture's timing independently and cannot fail this way."
+            )
+        return float(legacy)
+
     @staticmethod
     def _alignment(
-        latency: _LatencyResult, loopback_used: bool
+        latency: _LatencyResult, loopback_used: bool, lead: float
     ) -> tuple[_Optional[int], float]:
         """
         The delay this capture is labelled with and the shift applied to its target,
         derived from this capture alone.
 
-        Static, and deliberately so: it reads nothing from the session or the project,
-        which is the property that makes one capture unable to disturb another.
+        Static, and deliberately so: given the project's fixed ``lead`` it reads nothing
+        else from the session or the project, which is the property that makes one
+        capture unable to disturb another. See :meth:`_alignment_lead` for where ``lead``
+        comes from -- a constant for every project made under this scheme, and a legacy
+        project's own recorded offset for one part-captured before it.
 
         What has to hold for a capture set to be mutually aligned is that
 
@@ -489,11 +543,11 @@ class CaptureSession:
         ``peak_delay`` locates the blip response's energy peak to a fraction of a sample,
         so taking the label from it directly::
 
-            target = peak_delay - ALIGNMENT_LEAD_SAMPLES
+            target = peak_delay - lead
             delay  = round(target)
             shift  = delay - target
 
-        gives ``r = target - D = (peak_delay - D) - ALIGNMENT_LEAD_SAMPLES``. The first
+        gives ``r = target - D = (peak_delay - D) - lead``. The first
         term is fixed hardware -- through a loopback the round trip is LTI, so its peak
         sits the same distance past the true arrival on every capture -- and the second is
         a constant, so ``r`` is the same for every capture without anything from any other
@@ -528,7 +582,7 @@ class CaptureSession:
         if not loopback_used or latency.peak_delay is None:
             return latency.delay, 0.0
 
-        target = latency.peak_delay - ALIGNMENT_LEAD_SAMPLES
+        target = latency.peak_delay - lead
         delay = int(round(target))
         shift = float(delay - target)
         if abs(shift) > MAX_ALIGNMENT_SHIFT + 1e-9:  # pragma: no cover - invariant
@@ -593,6 +647,10 @@ class CaptureSession:
         unplugged cable). That case is not a QA flag on a saved capture: the delay
         cannot be trusted as coming from the loopback at all, so nothing is saved.
         """
+        # Resolved before anything is played: a project whose recorded timebase cannot be
+        # honoured is refused now rather than after the user has sat through a capture.
+        lead = self._alignment_lead()
+
         x, sample_rate = self._input_for_split(entry.split)
         playback, preamble = build_playback(x, sample_rate)
         loopback_playback = (
@@ -614,7 +672,7 @@ class CaptureSession:
             # fix the loopback patch or uncheck it before this entry can be captured.
             raise CaptureSessionError(LOOPBACK_NOT_DETECTED_MESSAGE)
         loopback_used = loopback is not None
-        delay, shift = self._alignment(latency, loopback_used)
+        delay, shift = self._alignment(latency, loopback_used, lead)
         y = self._aligned_target(main, preamble, len(x), shift)
 
         qa = self._qa(

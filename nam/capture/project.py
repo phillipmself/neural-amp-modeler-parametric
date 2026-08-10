@@ -258,14 +258,25 @@ class CaptureProject(_BaseModel):
     # planned LHS size drift every time the project is reopened.
     n_train_lhs: int = 0
     include_initial_corners: bool = False
-    # Note: this used to carry an ``alignment_reference`` -- a project-wide timing offset
-    # seeded from whichever capture was recorded first, which every later capture was then
-    # shifted to match. It is gone, and old projects that still have the key simply ignore
-    # it on load. Each capture now derives its timebase from its own loopback blip peak
-    # (see CaptureSession._alignment), which puts the set on one timebase without any
-    # shared state -- so a single bad measurement can no longer be inherited by every
-    # capture that follows it.
+    # Legacy only, and never written: nothing sets this any more. It survives because
+    # projects captured before the timebase became stateless have it, and their captures
+    # sit on the timebase it describes.
     #
+    # It used to be seeded from whichever capture was recorded first and every later
+    # capture was then shifted to match it -- so one bad measurement silently became the
+    # timebase for the whole project, unchecked. Captures now derive their timebase from
+    # their own loopback blip peak (see CaptureSession._alignment) and share nothing.
+    # But a project part-captured under the old scheme still has captures written against
+    # this offset, and resuming it with a different one would leave the two groups a
+    # fraction of a sample (or worse) apart -- exactly the per-capture phase error the
+    # alignment exists to remove. So for those projects it is read back, once, as the
+    # alignment lead, which reproduces their existing timebase exactly and lets them be
+    # finished without recapturing anything. It is never adopted, never updated, and
+    # never consulted for a project that does not already have one.
+    #
+    # See CaptureSession._alignment_lead, which also rejects a value too large to be a
+    # converter's timing offset -- that is what a poisoned reference looks like.
+    alignment_reference: _Optional[float] = None
     # The capture app version this project was created under, stamped once at creation and
     # carried forward unchanged (including when the plan is regenerated) -- it dates the
     # project, not the last thing to touch it. ``None`` means the project was created

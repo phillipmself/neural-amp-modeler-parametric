@@ -19,6 +19,9 @@ from nam.capture.session import CaptureSession as _CaptureSession
 from nam.capture.session import CaptureSessionError as _CaptureSessionError
 from nam.capture.session import ALIGNMENT_LEAD_SAMPLES as _LEAD
 from nam.capture.session import MAX_ALIGNMENT_SHIFT as _MAX_ALIGNMENT_SHIFT
+from nam.capture.session import (
+    MAX_LEGACY_ALIGNMENT_REFERENCE as _MAX_LEGACY_REFERENCE,
+)
 from nam.capture.session import playback_input_path as _playback_input_path
 from nam.capture.session import raw_paths as _raw_paths
 from nam.data import np_to_wav as _np_to_wav
@@ -901,9 +904,12 @@ def test_captures_share_a_timebase_without_sharing_any_state(tmp_path):
     assert _timebase(entries[1]) - _timebase(entries[0]) == _pytest.approx(
         0.3, abs=0.05
     )
-    # Nothing about the timebase is carried in the project file any more.
-    assert "alignment_reference" not in _json.loads(
-        (project_dir / "capture_project.json").read_text()
+    # Nothing measures a timebase into the project file any more.
+    assert (
+        _json.loads((project_dir / "capture_project.json").read_text())[
+            "alignment_reference"
+        ]
+        is None
     )
 
 
@@ -982,3 +988,65 @@ def test_no_correction_without_a_loopback(tmp_path):
     assert qa.subsample_shift is None
     assert qa.loopback_delay is None
     assert qa.amp_return_delay == 480 - 1
+
+
+def test_a_legacy_project_keeps_the_timebase_its_captures_were_written_against(tmp_path):
+    # A project part-captured before the timebase became stateless has captures already
+    # written against its own recorded offset. Finishing it has to reproduce that offset,
+    # or the captures made before and after the upgrade land on timebases that differ by
+    # (reference - lead) samples -- the per-capture phase error alignment exists to remove.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    legacy = 11.0
+    project.alignment_reference = legacy
+    recorder = _DriftingRecorder(480, drift=0.2)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+
+    # Labelled against the project's own offset rather than the constant, so it sits on
+    # the same timebase as whatever was captured before the upgrade.
+    assert _timebase(entry) == _pytest.approx(480.2 - legacy, abs=0.05)
+    # And it is still only ever read: nothing measures a new one in.
+    assert project.alignment_reference == legacy
+
+
+def test_a_poisoned_legacy_timebase_is_refused_before_anything_is_recorded(tmp_path):
+    # The reference the original fault wrote was 129 samples, taken from a first capture
+    # whose two timing blips disagreed. Reproducing it would spread that one bad
+    # measurement into every remaining capture, which is the failure this replaced.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    project.alignment_reference = 129.0
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+    entry = project.pending_entries()[0]
+
+    with _pytest.raises(_CaptureSessionError) as excinfo:
+        session.capture_entry(entry)
+
+    assert "129" in str(excinfo.value)
+    assert "recaptured" in str(excinfo.value)
+    # Refused before the rig was driven at all, not after the user sat through a capture.
+    assert recorder.calls == []
+    assert entry.status == "pending"
+    assert not (project_dir / entry.y_path).exists()
+
+
+def test_the_legacy_bound_is_the_boundary(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+
+    project.alignment_reference = _MAX_LEGACY_REFERENCE
+    assert session._alignment_lead() == _MAX_LEGACY_REFERENCE
+    project.alignment_reference = _MAX_LEGACY_REFERENCE + 0.01
+    with _pytest.raises(_CaptureSessionError):
+        session._alignment_lead()
+    # A project with no reference is not a legacy project; it uses the constant.
+    project.alignment_reference = None
+    assert session._alignment_lead() == _LEAD
