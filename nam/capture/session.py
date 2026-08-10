@@ -22,8 +22,10 @@ The alignment step exists because ``delay`` is an integer while the rig's latenc
 A capture set aligned only to whole samples carries up to half a sample of per-capture
 error, and that error is not a function of the knobs, so a parametric model cannot learn
 it as a rule -- it can only memorise a per-capture phase. Correcting it at write time
-keeps ``delay`` an integer and leaves everything downstream unchanged. See
-:meth:`CaptureSession._alignment_shift` for what is measured and why, and
+keeps ``delay`` an integer and leaves everything downstream unchanged. Every capture
+derives its own timebase from its own loopback blip, holding nothing in common with the
+others but a constant, so no capture can put another one out. See
+:meth:`CaptureSession._alignment` for what is measured and why, and
 :mod:`nam.capture.resample` for the filter.
 """
 
@@ -84,10 +86,20 @@ LOOPBACK_NOT_DETECTED_MESSAGE = (
 # Extra playback beyond the input audio so the delayed response tail is still inside
 # the stream when the recording stops.
 TAIL_SECONDS = 0.5
-# Alignment corrections beyond this are refused rather than applied: at that size the
-# measurement itself is suspect, and silently sliding a capture several samples is worse
-# than leaving it where it is and saying so.
-MAX_ALIGNMENT_SHIFT = 4.0
+# How far ahead of the loopback blip's energy peak a capture is labelled, in samples.
+#
+# The label has to sit a little before the response: a converter's anti-alias filter
+# spreads energy ahead of the peak, and a label placed on the peak itself would ask the
+# model to account for input it has not been shown yet. Any fixed value puts the whole
+# project on one timebase (see :meth:`CaptureSession._alignment`) -- what matters is that
+# it never varies between captures -- so this is chosen to land on the same delay the old
+# threshold-based measurement produced on a healthy rig, which keeps the numbers written
+# to data.json unchanged for projects that were part-captured under it.
+ALIGNMENT_LEAD_SAMPLES = 4.0
+# A shift is the rounding residue of the label, so it cannot leave this range. Anything
+# past it means the arithmetic below is broken rather than the rig, so it is checked
+# rather than trusted.
+MAX_ALIGNMENT_SHIFT = 0.5
 
 
 # Schema version of captures_raw/manifest.json, independent of the project file's.
@@ -455,68 +467,76 @@ class CaptureSession:
             y = _apply_fractional_delay(y, fraction).astype(_np.float32)
         return y
 
-    def _alignment_shift(
-        self, latency: _LatencyResult, loopback_used: bool
-    ) -> tuple[float, _Optional[str]]:
+    @staticmethod
+    def _alignment(
+        latency: _LatencyResult, loopback_used: bool
+    ) -> tuple[_Optional[int], float]:
         """
-        How far to shift this capture's target so it lands on the project's timebase.
-        Returns ``(shift, note)``; ``note`` is a QA message worth surfacing.
+        The delay this capture is labelled with and the shift applied to its target,
+        derived from this capture alone.
+
+        Static, and deliberately so: it reads nothing from the session or the project,
+        which is the property that makes one capture unable to disturb another.
 
         What has to hold for a capture set to be mutually aligned is that
 
             (true latency of the written target) - (delay it is labelled with)
 
-        is the same for every capture. ``latency.peak_delay`` measures the first term to a
-        fraction of a sample and ``latency.delay`` is the second, so the shift that
-        restores the invariant is ``reference + delay - peak_delay``. The first capture to
-        measure both defines ``reference``; its own shift is therefore zero.
+        is the same for every capture. Writing the target as ``y[n] = a(n - shift - D)``
+        for a true latency ``D``, and pairing it downstream as ``x[n]`` against
+        ``y[n + delay]``, that quantity is ``r = delay - shift - D``.
 
-        Both terms are needed, and this is why the shift is not clamped below a sample.
-        ``delay`` comes from a threshold crossing on the blip's leading edge, so it moves
-        with the response's pre-ringing and can step by a whole sample (or further) while
-        the peak barely moves. When it does, that step is a genuine misalignment of the
-        written data, and compensating for it is the correct response -- the whole part of
-        the shift costs nothing, since it is taken by slicing the recording one sample
-        over rather than by filtering.
+        ``peak_delay`` locates the blip response's energy peak to a fraction of a sample,
+        so taking the label from it directly::
+
+            target = peak_delay - ALIGNMENT_LEAD_SAMPLES
+            delay  = round(target)
+            shift  = delay - target
+
+        gives ``r = target - D = (peak_delay - D) - ALIGNMENT_LEAD_SAMPLES``. The first
+        term is fixed hardware -- through a loopback the round trip is LTI, so its peak
+        sits the same distance past the true arrival on every capture -- and the second is
+        a constant, so ``r`` is the same for every capture without anything from any other
+        capture entering. The shift is only the rounding residue of the label, so it is
+        always within half a sample and never large enough to be worth a resample beyond
+        the fractional filter.
+
+        This used to take the label from the calibrator's threshold crossing instead,
+        which is amplitude-biased: a quieter return crosses later, so it steps by whole
+        samples while the peak barely moves. Holding ``r`` constant then meant cancelling
+        that step against a project-wide reference offset taken from whichever capture
+        happened to be recorded first -- which silently made that one capture's
+        measurement the timebase for every later one, with nothing checking it. A first
+        capture whose two blips disagreed (see ``blip_delays``) put the reference 129
+        samples out, and every later capture was then told that *it* was the one that had
+        drifted. Deriving the label from the peak removes the shared state, so a bad
+        capture is now only ever bad on its own.
 
         Only done when a loopback is in use. The amp return carries the tone stack's
         genuine knob-dependent group delay, which the model is supposed to learn; taking
         that out per capture would be correcting away real amp behaviour, which is worse
         than leaving the jitter in.
 
-        What this is for, measured rather than assumed: while the interface's clock stays
-        put there is no sub-sample drift at all (52 route tests on an iD44 read the same
-        offset to sd 0.0000). Re-clocking it is what moves the phase -- taking the device
-        to 44.1 kHz and back to 48 kHz shifted the round trip by 0.48 samples while the
-        integer delay stayed at 8442, invisible to any whole-sample measurement. A project
-        captured over several days crosses clock epochs whenever another application
-        touches the interface, which is why ``alignment_reference`` lives in the project
-        file rather than in a session.
+        What the sub-sample part is for, measured rather than assumed: while the
+        interface's clock stays put there is no drift at all (52 route tests on an iD44
+        read the same offset to sd 0.0000). Re-clocking it is what moves the phase --
+        taking the device to 44.1 kHz and back to 48 kHz shifted the round trip by 0.48
+        samples while the integer delay stayed at 8442, invisible to any whole-sample
+        measurement. A project captured over several days crosses clock epochs whenever
+        another application touches the interface, and each capture now measures its own.
         """
-        if not loopback_used or latency.peak_delay is None or latency.delay is None:
-            return 0.0, None
+        if not loopback_used or latency.peak_delay is None:
+            return latency.delay, 0.0
 
-        offset = latency.peak_delay - latency.delay
-        if self.project.alignment_reference is None:
-            self.project.alignment_reference = offset
-            return 0.0, None
-
-        shift = self.project.alignment_reference - offset
-        if abs(shift) > MAX_ALIGNMENT_SHIFT:
-            return 0.0, (
-                f"Alignment correction of {shift:+.2f} samples was needed but not "
-                f"applied: past {MAX_ALIGNMENT_SHIFT:g} samples the timing measurement "
-                "itself is in doubt. Re-run the route test and check the loopback patch "
-                "before trusting this capture."
+        target = latency.peak_delay - ALIGNMENT_LEAD_SAMPLES
+        delay = int(round(target))
+        shift = float(delay - target)
+        if abs(shift) > MAX_ALIGNMENT_SHIFT + 1e-9:  # pragma: no cover - invariant
+            raise CaptureSessionError(
+                f"Internal error: alignment shift {shift:+.4f} exceeds the half-sample "
+                "rounding residue it is defined as."
             )
-        note = None
-        if abs(shift) >= 0.5:
-            note = (
-                f"Timing moved {shift:+.2f} samples from this project's reference; the "
-                "capture was realigned, but a sub-sample shift this large usually means "
-                "the interface re-clocked or the routing changed mid-session."
-            )
-        return float(shift), note
+        return delay, shift
 
     def route_test(
         self,
@@ -594,7 +614,7 @@ class CaptureSession:
             # fix the loopback patch or uncheck it before this entry can be captured.
             raise CaptureSessionError(LOOPBACK_NOT_DETECTED_MESSAGE)
         loopback_used = loopback is not None
-        shift, shift_note = self._alignment_shift(latency, loopback_used)
+        delay, shift = self._alignment(latency, loopback_used)
         y = self._aligned_target(main, preamble, len(x), shift)
 
         qa = self._qa(
@@ -605,7 +625,7 @@ class CaptureSession:
             loopback_disagreement=loopback_disagreement,
             crosscheck=crosscheck,
             alignment_shift=shift,
-            alignment_note=shift_note,
+            delay=delay,
         )
 
         self._write_raw_recordings(
@@ -619,7 +639,7 @@ class CaptureSession:
         self._write_capture_wav(entry, y, sample_rate)
         _mark_captured(
             entry,
-            delay=latency.delay,
+            delay=delay,
             qa=qa,
             stream_config=self.project.audio.stream_fingerprint(),
         )
@@ -676,9 +696,9 @@ class CaptureSession:
         a machine that needs a bigger buffer today should not cost a project -- and doing
         so moves the round trip by hundreds or thousands of samples at once. That is not
         a fault: ``delay`` is measured and written per capture, and the sub-sample
-        timebase is untouched by it (a buffer change is a whole number of samples, so the
-        blip response and its energy peak move together and ``_alignment_shift`` sees
-        nothing). Only the delay-consistency check would notice, and comparing across
+        timebase is untouched by it (a buffer change is a whole number of samples, so it
+        lands entirely in the rounded label and ``_alignment`` sees no change in the
+        residue). Only the delay-consistency check would notice, and comparing across
         configurations would make it fire on every capture after the change while saying
         "did the routing change?" -- training the user to ignore the one message that
         catches a genuinely mispatched rig.
@@ -707,9 +727,14 @@ class CaptureSession:
         loopback_disagreement: bool = False,
         crosscheck: _Optional[_LatencyResult] = None,
         alignment_shift: float = 0.0,
-        alignment_note: _Optional[str] = None,
+        delay: _Optional[int] = None,
     ) -> _QAModel:
         messages: list[str] = []
+        # The delay actually written for this capture, which is what later captures are
+        # compared against. Falls back to the measurement for callers that do not derive
+        # a label of their own (recovery from disk).
+        if delay is None:
+            delay = latency.delay
 
         peak = float(_np.max(_np.abs(y))) if len(y) else 0.0
         peak_dbfs = _peak_to_dbfs(peak)
@@ -726,21 +751,50 @@ class CaptureSession:
                 "and levels, then recapture."
             )
         elif latency.disagreement_too_high:
+            # Name the two readings. This fires when one blip came back at a different
+            # time from the other, which means a glitch during the preamble rather than
+            # anything about the rig's steady-state latency -- and the pair of numbers is
+            # what makes that recognisable instead of a bare "may be unreliable".
+            blips = (
+                " and ".join(f"{d:+d}" for d in latency.blip_delays)
+                if latency.blip_delays
+                else "different amounts"
+            )
             messages.append(
-                "The two timing blips disagree about the delay; the measurement may "
-                "be unreliable."
+                f"The two timing blips came back at different delays ({blips} samples), "
+                "so this capture's timing could not be measured reliably and its target "
+                "may be misaligned. This is a dropout during the count-in rather than a "
+                "problem with the rig; recapture this entry. Other captures are "
+                "unaffected -- each one measures its own timing."
             )
 
+        # The label is placed ALIGNMENT_LEAD_SAMPLES ahead of the blip's energy peak,
+        # which is only conservative if that clears the converter's pre-ringing. That
+        # holds on the rigs this was measured on, but it is an assumption about someone
+        # else's hardware, so it is checked against this capture's own independently
+        # detected onset rather than trusted -- otherwise a converter that rings longer
+        # would quietly produce targets that start before the input they are paired with.
+        if loopback_used and delay is not None and latency.delay is not None:
+            if delay > latency.delay:
+                messages.append(
+                    f"This capture is labelled with a delay of {delay}, which is later "
+                    f"than the {latency.delay} its blip onset was detected at, so its "
+                    "target starts slightly ahead of the input it is paired with. The "
+                    f"{ALIGNMENT_LEAD_SAMPLES:g}-sample alignment lead is too short for "
+                    "this converter -- raise ALIGNMENT_LEAD_SAMPLES and recapture the "
+                    "project."
+                )
+
         delay_disagreement = False
-        if latency.delay is not None:
+        if delay is not None:
             other_delays = self._comparable_delays(entry)
             if other_delays and (
-                abs(latency.delay - int(_np.median(other_delays)))
+                abs(delay - int(_np.median(other_delays)))
                 >= DELAY_DISAGREEMENT_SAMPLES
             ):
                 delay_disagreement = True
                 messages.append(
-                    f"Delay {latency.delay} differs from this project's typical "
+                    f"Delay {delay} differs from this project's typical "
                     f"{int(_np.median(other_delays))} by {DELAY_DISAGREEMENT_SAMPLES}+ "
                     "samples at these audio settings. Did the routing change?"
                 )
@@ -751,15 +805,16 @@ class CaptureSession:
                 "input connected and the device under test on?"
             )
 
-        if loopback_disagreement:
+        # Not reported when this capture's own blips disagreed: the loopback delay is
+        # then a blend of two arrival times, so it will differ from the amp return no
+        # matter how the rig is patched. Saying "check the loopback patch" there sends
+        # the user after a cable when the fault is a dropout during the count-in.
+        if loopback_disagreement and not latency.disagreement_too_high:
             messages.append(
                 f"The loopback and amp-return timing blips disagree by more than "
                 f"{LOOPBACK_CROSSCHECK_SAMPLES} samples. Check the loopback patch: the "
                 "two routes are no longer travelling the same chain."
             )
-
-        if alignment_note:
-            messages.append(alignment_note)
 
         return _QAModel(
             peak=peak_dbfs,
@@ -772,6 +827,13 @@ class CaptureSession:
                 crosscheck.delay if loopback_used and crosscheck else latency.delay
             ),
             subsample_shift=alignment_shift or None,
+            # The measurement the timebase is actually built from, and the per-blip
+            # readings behind it. Recorded because the one failure this had to be
+            # diagnosed from left neither behind: the project stored a shift and a
+            # complaint, and the numbers that would have identified the real culprit
+            # had to be recovered by re-measuring captures_raw/ by hand.
+            peak_delay=latency.peak_delay,
+            blip_delays=list(latency.blip_delays),
             messages=messages,
         )
 

@@ -116,9 +116,15 @@ class LatencyResult:
     safety_factor: int
     # Sub-sample position of the blip response's energy peak, in the same frame as
     # ``delay``. See :func:`_peak_delay` for why this is not simply ``delay`` with a
-    # fractional part: the two are different estimators of the same arrival, and only
-    # the *difference between captures* of this one is meaningful.
+    # fractional part: the two are different estimators of the same arrival, and this
+    # is the one the capture timebase is built from.
     peak_delay: _Optional[float] = None
+    # What each blip said on its own, before they were averaged. Kept so a capture that
+    # trips ``disagreement_too_high`` can show the user the two numbers rather than an
+    # unexplained complaint -- one blip arriving at the wrong time is a specific,
+    # recognisable fault (a stream glitch during the preamble) and the pair of readings
+    # is what makes it recognisable.
+    blip_delays: tuple[int, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -261,4 +267,5 @@ def measure_delay(recording: _np.ndarray, preamble: BlipPreamble) -> LatencyResu
         disagreement_too_high=calibration.warnings.disagreement_too_high,
         safety_factor=int(calibration.safety_factor),
         peak_delay=None if peak is None else peak + coarse,
+        blip_delays=tuple(int(d) + coarse for d in calibration.delays),
     )

@@ -202,9 +202,19 @@ class QAModel(_BaseModel):
     loopback_delay: _Optional[int] = None
     amp_return_delay: _Optional[int] = None
     # Shift, in samples, applied to the target before it was written, to put it on the
-    # project's timebase (see CaptureSession._alignment_shift). ``None`` when no
-    # correction was applied.
+    # project's timebase (see CaptureSession._alignment). Always within half a sample --
+    # it is the rounding residue of the delay label. ``None`` when no correction was
+    # applied.
     subsample_shift: _Optional[float] = None
+    # Sub-sample position of the loopback blip response's energy peak: the measurement
+    # the delay label and the shift are both derived from. Kept because a timing fault
+    # is only diagnosable after the fact if the number the timebase was built from was
+    # written down at the time.
+    peak_delay: _Optional[float] = None
+    # What each timing blip read on its own. Two numbers that disagree mean a dropout
+    # during the count-in; a capture that shows it is not trustworthy no matter how
+    # ordinary its other fields look.
+    blip_delays: list[int] = _Field(default_factory=list)
     messages: list[str] = _Field(default_factory=list)
 
 
@@ -248,14 +258,14 @@ class CaptureProject(_BaseModel):
     # planned LHS size drift every time the project is reopened.
     n_train_lhs: int = 0
     include_initial_corners: bool = False
-    # Timebase for this project: the offset, in samples, between the blip response's
-    # energy peak and the integer delay reported alongside it. The first capture that
-    # measures it sets it, and every later capture is shifted so its own offset matches --
-    # which is what puts the whole project on one timebase. The value itself is arbitrary
-    # (it carries the round trip's impulse-response shape); only holding it constant
-    # matters. ``None`` until the first capture sets it, and for projects captured without
-    # a loopback, where the correction is deliberately not applied.
-    alignment_reference: _Optional[float] = None
+    # Note: this used to carry an ``alignment_reference`` -- a project-wide timing offset
+    # seeded from whichever capture was recorded first, which every later capture was then
+    # shifted to match. It is gone, and old projects that still have the key simply ignore
+    # it on load. Each capture now derives its timebase from its own loopback blip peak
+    # (see CaptureSession._alignment), which puts the set on one timebase without any
+    # shared state -- so a single bad measurement can no longer be inherited by every
+    # capture that follows it.
+    #
     # The capture app version this project was created under, stamped once at creation and
     # carried forward unchanged (including when the plan is regenerated) -- it dates the
     # project, not the last thing to touch it. ``None`` means the project was created

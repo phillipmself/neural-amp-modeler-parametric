@@ -17,6 +17,8 @@ from nam.capture.project import new_project as _new_project
 from nam.capture.project import save_project as _save_project
 from nam.capture.session import CaptureSession as _CaptureSession
 from nam.capture.session import CaptureSessionError as _CaptureSessionError
+from nam.capture.session import ALIGNMENT_LEAD_SAMPLES as _LEAD
+from nam.capture.session import MAX_ALIGNMENT_SHIFT as _MAX_ALIGNMENT_SHIFT
 from nam.capture.session import playback_input_path as _playback_input_path
 from nam.capture.session import raw_paths as _raw_paths
 from nam.data import np_to_wav as _np_to_wav
@@ -84,6 +86,7 @@ class _FakeRecorder:
 
 
 def _make_project_dir(tmp_path: _Path, *, validation_rate: int = _RATE) -> _Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     rng = _np.random.default_rng(42)
     train_x = (0.1 * rng.standard_normal(_RATE)).astype(_np.float32)
     validation_x = (0.1 * rng.standard_normal(_RATE // 2)).astype(_np.float32)
@@ -109,7 +112,7 @@ def test_capture_entry_records_measures_and_persists(tmp_path):
     assert qa.impulse_detected
     assert not qa.clipping
     assert not qa.delay_disagreement
-    assert entry.delay == true_delay - 1
+    assert entry.delay == true_delay - _LEAD
 
     wav_path = project_dir / entry.y_path
     assert wav_path.is_file()
@@ -124,7 +127,7 @@ def test_capture_entry_records_measures_and_persists(tmp_path):
     data = _json.loads((project_dir / "data.json").read_text())
     assert len(data["train"]) == 1
     assert data["train"][0]["y_path"] == entry.y_path
-    assert data["train"][0]["delay"] == true_delay - 1
+    assert data["train"][0]["delay"] == true_delay - _LEAD
     assert data["train"][0]["x_path"] == "input_train.wav"
     assert data["validation"] == []
 
@@ -142,13 +145,17 @@ def test_capture_saves_response_content_aligned_by_delay(tmp_path):
 
     x = _np.asarray(_wav_to_np(project_dir / "input_train.wav")).squeeze()
     y = _np.asarray(_wav_to_np(project_dir / entry.y_path)).squeeze()
-    # The fake chain is y[n] = gain * x[n - delay]; after the loader shifts by the
-    # measured delay (true_delay - safety factor 1), y should track gain * x.
+    # The fake chain is y[n] = gain * x[n - delay]. The label sits ALIGNMENT_LEAD_SAMPLES
+    # ahead of the true latency, so after the loader shifts by it the response lags the
+    # input by exactly that lead -- the same amount on every capture, which is the point.
     delay = entry.delay
     assert delay is not None
+    lead = int(_LEAD)
     aligned_y = y[delay:]
     aligned_x = x[: len(aligned_y)]
-    _np.testing.assert_allclose(aligned_y[1000:2000], gain * aligned_x[999:1999], atol=2e-4)
+    _np.testing.assert_allclose(
+        aligned_y[1000:2000], gain * aligned_x[1000 - lead : 2000 - lead], atol=2e-4
+    )
 
 
 def test_validation_capture_uses_validation_input(tmp_path):
@@ -394,7 +401,7 @@ def test_capture_uses_loopback_delay_and_crosschecks_amp(tmp_path):
     entry = project.pending_entries()[0]
     qa = session.capture_entry(entry)
 
-    assert entry.delay == 480 - 1
+    assert entry.delay == 480 - _LEAD
     assert qa.impulse_detected
     assert qa.loopback_disagreement is False
     # Both measurements are kept, not just the boolean above.
@@ -414,7 +421,7 @@ def test_capture_flags_loopback_disagreement(tmp_path):
     entry = project.pending_entries()[0]
     qa = session.capture_entry(entry)
 
-    assert entry.delay == 480 - 1
+    assert entry.delay == 480 - _LEAD
     assert qa.loopback_disagreement is True
     assert any("loopback" in message for message in qa.messages)
 
@@ -837,22 +844,47 @@ class _DriftingRecorder(_FakeRecorder):
         return recording, loopback
 
 
-def test_first_capture_sets_the_timebase_and_is_not_shifted(tmp_path):
-    project_dir = _make_project_dir(tmp_path)
-    project = _load_project(project_dir)
-    _enable_loopback(project)
-    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
+class _GlitchedBlipRecorder(_DriftingRecorder):
+    """
+    A rig that drops samples during the count-in, so the second timing blip comes back
+    at a different delay from the first and much quieter.
 
-    assert project.alignment_reference is None
-    qa = session.capture_entry(project.pending_entries()[0])
+    This is the real fault behind the bug these tests exist for: a capture whose blips
+    landed 129 samples apart produced a delay measured off one blip and a peak measured
+    off the other, and nothing caught it.
+    """
 
-    assert project.alignment_reference is not None
-    assert qa.subsample_shift is None
-    # It is persisted, so reopening the project keeps the same timebase.
-    assert _load_project(project_dir).alignment_reference == project.alignment_reference
+    def __init__(self, delay: int, jump: int = 130, survives: float = 0.02, **kwargs):
+        super().__init__(delay, **kwargs)
+        self.jump = jump
+        self.survives = survives
+
+    def playrec(self, playback, sample_rate, **kwargs):
+        recording, loopback = super().playrec(playback, sample_rate, **kwargs)
+        if loopback is not None:
+            loopback = loopback.copy()
+            second = _BlipPreamble(sample_rate=sample_rate).blip_locations[1]
+            lo, hi = second, second + 20_000
+            response = loopback[lo:hi].copy()
+            loopback[lo:hi] = 0.0
+            loopback[lo - self.jump : hi - self.jump] += (
+                response * self.survives
+            ).astype(_np.float32)
+            loopback = loopback.astype(_np.float32)
+        self.returns[-1] = (recording, loopback)
+        return recording, loopback
 
 
-def test_later_captures_are_shifted_back_onto_the_timebase(tmp_path):
+def _timebase(entry) -> float:
+    """
+    Where a written capture actually sits: the delay it is labelled with, minus the
+    shift that was applied to it. Two captures of the same rig are mutually aligned
+    exactly when this tracks the rig's true latency one-for-one.
+    """
+    return entry.delay - (entry.qa.subsample_shift or 0.0)
+
+
+def test_captures_share_a_timebase_without_sharing_any_state(tmp_path):
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -861,14 +893,79 @@ def test_later_captures_are_shifted_back_onto_the_timebase(tmp_path):
 
     entries = project.pending_entries()
     session.capture_entry(entries[0])
-
-    # The rig's sub-sample phase moves between captures; the correction should take it
-    # straight back out rather than leaving it for the model to memorise.
+    # The rig's sub-sample phase moves between captures (the interface re-clocked). The
+    # written timebase has to follow it exactly, so that what the model sees does not.
     recorder.drift = 0.3
-    qa = session.capture_entry(entries[1])
+    session.capture_entry(entries[1])
 
-    assert qa.subsample_shift is not None
-    assert qa.subsample_shift == _pytest.approx(-0.3, abs=0.05)
+    assert _timebase(entries[1]) - _timebase(entries[0]) == _pytest.approx(
+        0.3, abs=0.05
+    )
+    # Nothing about the timebase is carried in the project file any more.
+    assert "alignment_reference" not in _json.loads(
+        (project_dir / "capture_project.json").read_text()
+    )
+
+
+def test_a_captures_alignment_does_not_depend_on_what_was_captured_before(tmp_path):
+    # The regression this whole change is for. A capture whose blips disagree used to
+    # define the project's timebase, and every later capture was then shifted onto it --
+    # so one bad measurement silently moved every good one that followed. A capture's
+    # alignment must now depend on nothing but its own recording.
+    def timebase_of_second_entry(directory, first_recorder) -> float:
+        project = _load_project(directory)
+        _enable_loopback(project)
+        recorder = first_recorder
+        session = _CaptureSession(project, directory, recorder=recorder)
+        entries = project.pending_entries()
+        session.capture_entry(entries[0])
+        session._recorder = _DriftingRecorder(480, drift=0.25)
+        session.capture_entry(entries[1])
+        return _timebase(entries[1])
+
+    after_good = timebase_of_second_entry(
+        _make_project_dir(tmp_path / "good"), _DriftingRecorder(480)
+    )
+    after_glitched = timebase_of_second_entry(
+        _make_project_dir(tmp_path / "glitched"), _GlitchedBlipRecorder(480)
+    )
+
+    assert after_glitched == _pytest.approx(after_good, abs=1e-9)
+
+
+def test_disagreeing_blips_are_flagged_with_both_readings(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(
+        project, project_dir, recorder=_GlitchedBlipRecorder(480, jump=130)
+    )
+
+    qa = session.capture_entry(project.pending_entries()[0])
+
+    assert len(qa.blip_delays) == 2
+    assert abs(qa.blip_delays[0] - qa.blip_delays[1]) >= 20
+    # The message has to name the two readings and say which capture is at fault, since
+    # the failure it describes is local to this one.
+    (message,) = [m for m in qa.messages if "came back at different delays" in m]
+    assert all(str(d) in message for d in qa.blip_delays)
+    assert "recapture this entry" in message
+    # The loopback cross-check is downstream of the same broken measurement, so it
+    # must not also fire and send the user after a cable.
+    assert not any("check the loopback patch" in m.lower() for m in qa.messages)
+
+
+def test_shift_is_only_ever_the_rounding_residue_of_the_label(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+
+    for entry, drift in zip(project.pending_entries(), (0.0, 0.4, -0.45)):
+        recorder.drift = drift
+        qa = session.capture_entry(entry)
+        assert abs(qa.subsample_shift or 0.0) <= _MAX_ALIGNMENT_SHIFT + 1e-9
 
 
 def test_no_correction_without_a_loopback(tmp_path):
@@ -883,41 +980,5 @@ def test_no_correction_without_a_loopback(tmp_path):
     qa = session.capture_entry(project.pending_entries()[0])
 
     assert qa.subsample_shift is None
-    assert project.alignment_reference is None
     assert qa.loopback_delay is None
     assert qa.amp_return_delay == 480 - 1
-
-
-def test_implausible_shift_is_refused_and_flagged(tmp_path):
-    project_dir = _make_project_dir(tmp_path)
-    project = _load_project(project_dir)
-    _enable_loopback(project)
-    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
-    # A timebase from a rig that no longer exists: correcting onto it would slide the
-    # capture far enough to do real damage.
-    project.alignment_reference = 500.0
-
-    qa = session.capture_entry(project.pending_entries()[0])
-
-    assert qa.subsample_shift is None
-    assert any("Alignment correction" in message for message in qa.messages)
-
-
-def test_whole_sample_part_of_a_shift_is_taken_losslessly(tmp_path):
-    project_dir = _make_project_dir(tmp_path)
-    project = _load_project(project_dir)
-    _enable_loopback(project)
-    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
-    entries = project.pending_entries()
-
-    session.capture_entry(entries[0])
-    baseline = _wav_to_np(project_dir / entries[0].y_path)
-
-    # Same rig, but the timebase asks for exactly one whole sample of delay. That is a
-    # slice offset, not a resample, so the samples themselves must be untouched.
-    project.alignment_reference += 1.0
-    qa = session.capture_entry(entries[1])
-    shifted = _wav_to_np(project_dir / entries[1].y_path)
-
-    assert qa.subsample_shift == _pytest.approx(1.0, abs=1e-6)
-    assert _np.abs(shifted[1:] - baseline[:-1]).max() < 1e-6
