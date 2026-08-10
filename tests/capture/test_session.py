@@ -1201,8 +1201,10 @@ def test_audit_finds_a_misaligned_capture_without_any_stored_timing(tmp_path):
     problems = _audit_problems(audits)
 
     assert all(a.residual is not None for a in audits)
-    assert any("don't all line up" in p for p in problems)
-    assert any(entries[1].y_path in p for p in problems)
+    # Only the capture that actually moved is named. The one that is where the project's
+    # alignment puts it must not be reported alongside it.
+    assert any(entries[1].y_path in p and "samples away" in p for p in problems)
+    assert not any(entries[0].y_path in p for p in problems)
 
 
 def test_audit_passes_a_healthy_set_and_flags_disagreeing_blips(tmp_path):

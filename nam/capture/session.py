@@ -141,6 +141,25 @@ class CaptureSessionError(RuntimeError):
     pass
 
 
+def alignment_lead(project: _CaptureProject, project_dir: _Path) -> float:
+    """
+    The lead this project's captures are expected to sit on, without refusing or
+    changing anything -- :meth:`CaptureSession._alignment_lead` does both, and the audit
+    needs to ask the same question of a project it is only inspecting.
+
+    A reference too large to be a converter's offset is not a timebase to measure
+    against, so the constant is used and :func:`timebase_problem` reports the reference
+    separately. Every capture in such a project then reads as misaligned, which is the
+    honest answer: they are.
+    """
+    reference = project.alignment_reference
+    if reference is None or not has_captures(project, project_dir):
+        return ALIGNMENT_LEAD_SAMPLES
+    if 0.0 < reference <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+        return float(reference)
+    return ALIGNMENT_LEAD_SAMPLES
+
+
 def has_captures(project: _CaptureProject, project_dir: _Path) -> bool:
     """
     Whether this project has captures the legacy timebase could still describe.
@@ -191,11 +210,16 @@ class CaptureAudit:
     """
 
     y_path: str
-    # Where this capture sits on the project's timebase: the delay it is labelled with,
-    # less the shift applied to it, less the arrival its own loopback shows. Captures are
-    # mutually aligned exactly when this is the same for all of them; the value itself is
-    # arbitrary. ``None`` when the capture could not be re-measured.
+    # Where this capture sits: the delay it is labelled with, less the shift applied to
+    # it, less the arrival its own loopback shows. ``None`` when it could not be
+    # re-measured.
     residual: _Optional[float] = None
+    # How far that is from where this project's alignment puts a capture, which is
+    # ``-lead`` exactly for anything written under it. This is what is judged, rather
+    # than each capture's distance from the middle of the set: the middle is not a fixed
+    # point, so with two captures 0.42 apart it sits between them and reports both as
+    # 0.21 out, naming the good one alongside the bad and identifying neither.
+    offset: _Optional[float] = None
     blip_delays: tuple[int, ...] = ()
     blips_disagree: bool = False
     # Why this capture could not be checked, if it could not be.
@@ -224,6 +248,7 @@ def audit_captures(
     from ..data import wav_to_np
 
     audits: list[CaptureAudit] = []
+    expected = -alignment_lead(project, project_dir)
     entries = project.captured_entries()
     for index, entry in enumerate(entries):
         if progress is not None:
@@ -257,10 +282,12 @@ def audit_captures(
             )
             continue
         shift = (entry.qa.subsample_shift if entry.qa else None) or 0.0
+        residual = entry.delay - shift - latency.peak_delay
         audits.append(
             CaptureAudit(
                 y_path=entry.y_path,
-                residual=entry.delay - shift - latency.peak_delay,
+                residual=residual,
+                offset=residual - expected,
                 blip_delays=latency.blip_delays,
                 blips_disagree=latency.disagreement_too_high,
             )
@@ -273,12 +300,10 @@ def audit_captures(
 def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
     """
     The captures in an :func:`audit_captures` result that need attention, in plain words.
-    Empty when the set is mutually aligned.
+    Empty when they all sit where this project's alignment puts them.
 
-    What is compared is how far each capture sits from the *typical* one rather than from
-    any particular value, because the value is arbitrary -- a project made under an older
-    scheme sits somewhere else entirely and is no less aligned for it. Only disagreement
-    within the set matters.
+    Each is judged against that alignment rather than against the others, so a capture
+    that is where it should be is never named because something else is not.
     """
     problems: list[str] = []
     for audit in audits:
@@ -290,27 +315,11 @@ def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
                 f"{audit.y_path}: its two timing blips came back {gap} samples apart, so "
                 "its timing was never measured reliably. Record it again."
             )
-    measured = [a for a in audits if a.residual is not None and not a.blips_disagree]
-    if len(measured) > 1:
-        residuals = [a.residual for a in measured]
-        spread = max(residuals) - min(residuals)
-        if spread >= ALIGNMENT_MISMATCH_SAMPLES:
-            # The spread is what is judged, not each capture's distance from the middle.
-            # With two captures the median sits between them, so a pair a full sample
-            # apart looks like two half-sample deviations and neither trips a threshold
-            # meant to catch exactly that.
+        elif audit.offset is not None and abs(audit.offset) >= ALIGNMENT_MISMATCH_SAMPLES:
             problems.append(
-                f"These captures don't all line up with each other (spread {spread:.2f} "
-                "samples). A parametric model can't learn timing that changes between "
-                "captures, so the ones below need recording again:"
+                f"{audit.y_path}: sits {audit.offset:+.2f} samples away from the rest of "
+                "this project's captures. Record it again."
             )
-            typical = float(_np.median(residuals))
-            for audit in sorted(
-                measured, key=lambda a: abs(a.residual - typical), reverse=True
-            ):
-                offset = audit.residual - typical
-                if abs(offset) >= ALIGNMENT_MISMATCH_SAMPLES / 2:
-                    problems.append(f"    {audit.y_path}: {offset:+.2f} samples")
     return problems
 
 
