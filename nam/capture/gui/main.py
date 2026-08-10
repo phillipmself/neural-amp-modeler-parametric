@@ -70,6 +70,8 @@ from ..project import new_project as _new_project
 from ..project import PROJECT_FILENAME as _PROJECT_FILENAME
 from ..project import reconcile_with_disk as _reconcile_with_disk
 from ..project import save_project as _save_project
+from ..session import audit_captures as _audit_captures
+from ..session import audit_problems as _audit_problems
 from ..session import timebase_problem as _timebase_problem
 from ..project import QAModel as _QAModel
 from ..session import CaptureSession as _CaptureSession
@@ -712,11 +714,14 @@ class MainWindow(_QMainWindow):
         self.cancel_button = _QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._on_cancel_capture)
+        self.check_captures_button = _QPushButton("Check captures")
+        self.check_captures_button.clicked.connect(self._on_check_captures)
         self.clear_captures_button = _QPushButton("Clear captures")
         self.clear_captures_button.clicked.connect(self._on_clear_captures)
         buttons.addWidget(self.capture_next_button)
         buttons.addWidget(self.capture_selected_button)
         buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.check_captures_button)
         buttons.addWidget(self.clear_captures_button)
         buttons.addWidget(self._make_sort_button())
         layout.addLayout(buttons)
@@ -1010,6 +1015,53 @@ class MainWindow(_QMainWindow):
             f"{problem}\n\nUse \u201cClear captures\u201d on the Capture tab to start "
             "this project's captures again.",
         )
+
+    def _on_check_captures(self) -> None:
+        """
+        Re-measure every capture from its own raw recording and report any that do not
+        line up with the rest. Asks the recordings rather than the project file, so it
+        still works on a project whose timing metadata was lost -- which is the case that
+        needs it most, since nothing else can then tell the user anything is wrong.
+        """
+        if self.project is None or self.project_dir is None:
+            _QMessageBox.warning(self, "No project", "Open or create a project first.")
+            return
+        if not self.project.captured_entries():
+            _QMessageBox.information(
+                self, "Nothing to check", "This project has no captures yet."
+            )
+            return
+        project, project_dir = self.project, self.project_dir
+        self._run_worker(
+            lambda progress, cancel: _audit_problems(
+                _audit_captures(project, project_dir, progress=progress)
+            ),
+            on_progress=lambda fraction: self.capture_progress.setValue(
+                int(fraction * 100)
+            ),
+            on_success=self._on_check_captures_done,
+            on_failure=lambda message: _QMessageBox.critical(
+                self, "Check failed", message
+            ),
+            disable=[self.check_captures_button],
+        )
+
+    def _on_check_captures_done(self, problems: list) -> None:
+        self.capture_progress.setValue(100)
+        if not problems:
+            self.capture_log.appendPlainText(
+                "Checked captures: all line up with each other."
+            )
+            _QMessageBox.information(
+                self,
+                "Captures checked",
+                "Every capture was re-measured from its own recording and they all line "
+                "up with each other.",
+            )
+            return
+        body = "\n".join(problems)
+        self.capture_log.appendPlainText(f"Checked captures:\n{body}")
+        _QMessageBox.warning(self, "Captures need attention", body)
 
     def _on_clear_captures(self) -> None:
         if self.project is None or self.project_dir is None:

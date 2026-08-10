@@ -24,6 +24,8 @@ from nam.capture.session import (
     MAX_LEGACY_ALIGNMENT_REFERENCE as _MAX_LEGACY_REFERENCE,
 )
 from nam.capture.session import playback_input_path as _playback_input_path
+from nam.capture.session import audit_captures as _audit_captures
+from nam.capture.session import audit_problems as _audit_problems
 from nam.capture.session import raw_paths as _raw_paths
 from nam.capture.session import timebase_problem as _timebase_problem
 from nam.data import np_to_wav as _np_to_wav
@@ -1172,3 +1174,72 @@ def test_a_timebase_survives_its_captures_being_pending_pre_recovery(tmp_path):
     assert _timebase_problem(project, project_dir) is not None
     with _pytest.raises(_CaptureSessionError):
         session.capture_entry(project.pending_entries()[0])
+
+
+def test_audit_finds_a_misaligned_capture_without_any_stored_timing(tmp_path):
+    # The check that works when everything else has been lost. A project whose plan was
+    # regenerated and whose files were restored from disk has no measured QA left, so
+    # nothing in the project file can say whether its captures agree -- but the raw
+    # recordings can, and they cannot go stale.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+    entries = project.pending_entries()
+    session.capture_entry(entries[0])
+    session.capture_entry(entries[1])
+    # Put the second one somewhere else on the timebase, as a capture written under a
+    # different scheme would be, and strip the QA the way plan regeneration does.
+    entries[1].delay += 3
+    for entry in project.captured_entries():
+        entry.qa.peak_delay = None
+        entry.qa.subsample_shift = None
+        entry.qa.blip_delays = []
+
+    audits = _audit_captures(project, project_dir)
+    problems = _audit_problems(audits)
+
+    assert all(a.residual is not None for a in audits)
+    assert any("don't all line up" in p for p in problems)
+    assert any(entries[1].y_path in p for p in problems)
+
+
+def test_audit_passes_a_healthy_set_and_flags_disagreeing_blips(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+    entries = project.pending_entries()
+    session.capture_entry(entries[0])
+    # A different sub-sample phase is not a misalignment: the shift takes it out, which
+    # is the whole point, so the audit must not report it.
+    recorder.drift = 0.3
+    session.capture_entry(entries[1])
+
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+
+    session._recorder = _GlitchedBlipRecorder(480)
+    session.capture_entry(entries[2])
+    problems = _audit_problems(_audit_captures(project, project_dir))
+    assert any("timing blips came back" in p and entries[2].y_path in p
+               for p in problems)
+
+
+def test_audit_reports_captures_it_cannot_check_rather_than_passing_them(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    # As a project made before captures_raw/ existed would be.
+    _, raw_loopback = _raw_paths(project_dir, entry.y_path)
+    raw_loopback.unlink()
+
+    (audit,) = _audit_captures(project, project_dir)
+
+    assert audit.residual is None
+    assert audit.unchecked is not None
+    assert any("not checked" in p for p in _audit_problems([audit]))

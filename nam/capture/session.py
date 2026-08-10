@@ -127,6 +127,10 @@ MAX_LEGACY_ALIGNMENT_REFERENCE = 32.0
 # past it means the arithmetic below is broken rather than the rig, so it is checked
 # rather than trusted.
 MAX_ALIGNMENT_SHIFT = 0.5
+# How far a capture may sit from the rest of its project before it is reported as
+# misaligned. Half a sample is the error the alignment exists to remove, so the check
+# has to sit below that to be worth running; a healthy set agrees to a few hundredths.
+ALIGNMENT_MISMATCH_SAMPLES = 0.25
 
 
 # Schema version of captures_raw/manifest.json, independent of the project file's.
@@ -177,6 +181,144 @@ def timebase_problem(
         f"record them again. (Timing offset {reference:.0f} samples, usually caused by "
         "an audio dropout during the first capture.)"
     )
+
+
+@_dataclass(frozen=True)
+class CaptureAudit:
+    """
+    One capture re-measured from the recording it was made from. See
+    :func:`audit_captures`.
+    """
+
+    y_path: str
+    # Where this capture sits on the project's timebase: the delay it is labelled with,
+    # less the shift applied to it, less the arrival its own loopback shows. Captures are
+    # mutually aligned exactly when this is the same for all of them; the value itself is
+    # arbitrary. ``None`` when the capture could not be re-measured.
+    residual: _Optional[float] = None
+    blip_delays: tuple[int, ...] = ()
+    blips_disagree: bool = False
+    # Why this capture could not be checked, if it could not be.
+    unchecked: _Optional[str] = None
+
+
+def audit_captures(
+    project: _CaptureProject,
+    project_dir: _Path,
+    progress: _Optional[_Callable[[float], None]] = None,
+) -> list[CaptureAudit]:
+    """
+    Re-measure every captured entry from its own raw loopback recording and report where
+    each one sits on the project's timebase.
+
+    This asks the recordings rather than the project file, which is what makes it worth
+    having: it needs no ``alignment_reference``, no ``peak_delay`` in the QA, and no
+    knowledge of which scheme a capture was made under. A project whose timebase was lost
+    -- regenerating the plan and restoring the files from disk drops the QA that was
+    measured live -- can still be checked completely, because ``captures_raw/`` holds
+    what the rig actually did and that cannot go stale.
+
+    Captures from before ``captures_raw/`` existed have nothing to re-measure and are
+    reported as unchecked rather than as passing.
+    """
+    from ..data import wav_to_np
+
+    audits: list[CaptureAudit] = []
+    entries = project.captured_entries()
+    for index, entry in enumerate(entries):
+        if progress is not None:
+            progress(index / max(len(entries), 1))
+        _, raw_loopback = raw_paths(project_dir, entry.y_path)
+        if not raw_loopback.is_file():
+            audits.append(
+                CaptureAudit(
+                    y_path=entry.y_path,
+                    unchecked="no raw loopback recording was kept for it",
+                )
+            )
+            continue
+        try:
+            recording = _np.asarray(wav_to_np(raw_loopback), dtype=_np.float32).squeeze()
+            rate = project.sample_rate or _read_rate(raw_loopback)
+            latency = _measure_delay(recording, _BlipPreamble(sample_rate=rate))
+        except Exception as exc:  # unreadable or too short to scan
+            audits.append(
+                CaptureAudit(y_path=entry.y_path, unchecked=f"could not measure ({exc})")
+            )
+            continue
+        if latency.peak_delay is None or entry.delay is None:
+            audits.append(
+                CaptureAudit(
+                    y_path=entry.y_path,
+                    blip_delays=latency.blip_delays,
+                    blips_disagree=latency.disagreement_too_high,
+                    unchecked="no timing blip was detected in it",
+                )
+            )
+            continue
+        shift = (entry.qa.subsample_shift if entry.qa else None) or 0.0
+        audits.append(
+            CaptureAudit(
+                y_path=entry.y_path,
+                residual=entry.delay - shift - latency.peak_delay,
+                blip_delays=latency.blip_delays,
+                blips_disagree=latency.disagreement_too_high,
+            )
+        )
+    if progress is not None:
+        progress(1.0)
+    return audits
+
+
+def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
+    """
+    The captures in an :func:`audit_captures` result that need attention, in plain words.
+    Empty when the set is mutually aligned.
+
+    What is compared is how far each capture sits from the *typical* one rather than from
+    any particular value, because the value is arbitrary -- a project made under an older
+    scheme sits somewhere else entirely and is no less aligned for it. Only disagreement
+    within the set matters.
+    """
+    problems: list[str] = []
+    for audit in audits:
+        if audit.unchecked is not None:
+            problems.append(f"{audit.y_path}: not checked -- {audit.unchecked}.")
+        elif audit.blips_disagree:
+            gap = max(audit.blip_delays) - min(audit.blip_delays)
+            problems.append(
+                f"{audit.y_path}: its two timing blips came back {gap} samples apart, so "
+                "its timing was never measured reliably. Record it again."
+            )
+    measured = [a for a in audits if a.residual is not None and not a.blips_disagree]
+    if len(measured) > 1:
+        residuals = [a.residual for a in measured]
+        spread = max(residuals) - min(residuals)
+        if spread >= ALIGNMENT_MISMATCH_SAMPLES:
+            # The spread is what is judged, not each capture's distance from the middle.
+            # With two captures the median sits between them, so a pair a full sample
+            # apart looks like two half-sample deviations and neither trips a threshold
+            # meant to catch exactly that.
+            problems.append(
+                f"These captures don't all line up with each other (spread {spread:.2f} "
+                "samples). A parametric model can't learn timing that changes between "
+                "captures, so the ones below need recording again:"
+            )
+            typical = float(_np.median(residuals))
+            for audit in sorted(
+                measured, key=lambda a: abs(a.residual - typical), reverse=True
+            ):
+                offset = audit.residual - typical
+                if abs(offset) >= ALIGNMENT_MISMATCH_SAMPLES / 2:
+                    problems.append(f"    {audit.y_path}: {offset:+.2f} samples")
+    return problems
+
+
+def _read_rate(path: _Path) -> int:
+    import wave as _wave
+
+    with _wave.open(str(path), "rb") as handle:
+        return handle.getframerate()
 
 
 def raw_paths(project_dir: _Path, y_path: str) -> tuple[_Path, _Path]:
