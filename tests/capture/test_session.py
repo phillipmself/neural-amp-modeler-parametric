@@ -998,10 +998,13 @@ def test_a_legacy_project_keeps_the_timebase_its_captures_were_written_against(t
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
-    legacy = 11.0
-    project.alignment_reference = legacy
     recorder = _DriftingRecorder(480, drift=0.2)
     session = _CaptureSession(project, project_dir, recorder=recorder)
+    # Stand in for what the old app left behind: a capture, and the offset it was
+    # written against.
+    session.capture_entry(project.pending_entries()[0])
+    legacy = 11.0
+    project.alignment_reference = legacy
 
     entry = project.pending_entries()[0]
     session.capture_entry(entry)
@@ -1020,9 +1023,13 @@ def test_a_poisoned_legacy_timebase_is_refused_before_anything_is_recorded(tmp_p
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
-    project.alignment_reference = 129.0
     recorder = _DriftingRecorder(480)
     session = _CaptureSession(project, project_dir, recorder=recorder)
+    # A capture already in the project, then the poisoned reference it was written
+    # against: that is the state a project part-captured under the old scheme is in.
+    session.capture_entry(project.pending_entries()[0])
+    project.alignment_reference = 129.0
+    recorder.calls.clear()
     entry = project.pending_entries()[0]
 
     with _pytest.raises(_CaptureSessionError) as excinfo:
@@ -1041,6 +1048,8 @@ def test_the_legacy_bound_is_the_boundary(tmp_path):
     project = _load_project(project_dir)
     _enable_loopback(project)
     session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    # The reference only applies while there are captures written against it.
+    session.capture_entry(project.pending_entries()[0])
 
     project.alignment_reference = _MAX_LEGACY_REFERENCE
     assert session._alignment_lead() == _MAX_LEGACY_REFERENCE
@@ -1050,3 +1059,23 @@ def test_the_legacy_bound_is_the_boundary(tmp_path):
     # A project with no reference is not a legacy project; it uses the constant.
     project.alignment_reference = None
     assert session._alignment_lead() == _LEAD
+
+
+def test_clearing_a_projects_captures_releases_its_legacy_timebase(tmp_path):
+    # The refusal tells the user to clear the captures and record them again, so that
+    # has to actually work: with nothing left written against the old reference there is
+    # nothing to match, and the project starts fresh on the constant.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    project.alignment_reference = 129.0
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    assert not project.captured_entries()
+
+    qa = session.capture_entry(project.pending_entries()[0])
+
+    assert qa.peak_delay is not None
+    # Dropped, not just skipped -- otherwise reopening the project would put a reference
+    # back in force over captures that were never written against it.
+    assert project.alignment_reference is None
+    assert _load_project(project_dir).alignment_reference is None

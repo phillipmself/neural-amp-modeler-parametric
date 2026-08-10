@@ -515,6 +515,17 @@ class CaptureSession:
         legacy = self.project.alignment_reference
         if legacy is None:
             return ALIGNMENT_LEAD_SAMPLES
+        if not self.project.captured_entries():
+            # The reference exists only to match captures already written against it.
+            # With none left there is nothing to match, so the project starts fresh --
+            # and it is dropped rather than merely skipped, or capturing a few entries
+            # and reopening would put it back in force over captures that never used it.
+            #
+            # This is also what makes the refusal below possible to act on: it tells the
+            # user to clear the captures and record them again, which they cannot do if
+            # the reference that refuses them survives having no captures left.
+            self.project.alignment_reference = None
+            return ALIGNMENT_LEAD_SAMPLES
         if not 0.0 < legacy <= MAX_LEGACY_ALIGNMENT_REFERENCE:
             raise CaptureSessionError(
                 "The captures already in this project have a bad timing measurement, so "
