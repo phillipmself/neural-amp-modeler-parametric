@@ -4,6 +4,8 @@ from pathlib import Path as _Path
 import numpy as _np
 import pytest as _pytest
 
+from nam.capture import CAPTURE_APP_VERSION as _CAPTURE_APP_VERSION
+from nam.capture import RAW_RECORDING_SINCE_VERSION as _RAW_RECORDING_SINCE_VERSION
 from nam.capture.audio import AudioDropoutError as _AudioDropoutError
 from nam.capture.latency import BlipPreamble as _BlipPreamble
 from nam.capture.params import KnobSpec as _KnobSpec
@@ -680,6 +682,60 @@ def test_other_manifest_records_survive_a_later_capture(tmp_path):
         entries[0].y_path,
         entries[1].y_path,
     ]
+
+
+def test_a_project_from_before_raw_recordings_says_so_in_the_manifest(tmp_path):
+    """
+    A project carried over from a version that never wrote raw recordings will have
+    captures with nothing behind them. The folder explains itself rather than looking
+    like it lost files.
+    """
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    # What an older project file looks like: no version was recorded when it was made.
+    project.created_with_version = None
+    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
+
+    entries = project.pending_entries()
+    session.capture_entry(entries[0])
+    note = _read_manifest(project_dir)["note"]
+    assert _RAW_RECORDING_SINCE_VERSION in note
+
+    # It describes the folder's history, so it is written once and not repeated or
+    # revised as more captures arrive.
+    session.capture_entry(entries[1])
+    assert _read_manifest(project_dir)["note"] == note
+
+
+def test_a_project_created_here_has_nothing_to_explain(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    assert project.created_with_version == _CAPTURE_APP_VERSION
+
+    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
+    session.capture_entry(project.pending_entries()[0])
+
+    assert "note" not in _read_manifest(project_dir)
+
+
+def test_a_project_file_without_a_version_still_opens(tmp_path):
+    """
+    Projects made before the version was recorded must open and carry on. The schema is
+    unchanged, so this is a load, not a migration.
+    """
+    project_dir = _make_project_dir(tmp_path)
+    path = project_dir / "capture_project.json"
+    payload = _json.loads(path.read_text())
+    del payload["created_with_version"]
+    path.write_text(_json.dumps(payload))
+
+    project = _load_project(project_dir)
+
+    assert project.created_with_version is None
+    assert len(project.entries) == 3
+    session = _CaptureSession(project, project_dir, recorder=_FakeRecorder(480))
+    session.capture_entry(project.pending_entries()[0])
+    assert project.captured_entries()
 
 
 def test_the_played_stream_is_saved_for_each_input(tmp_path):

@@ -45,6 +45,7 @@ from PySide6.QtWidgets import QWidget as _QWidget
 
 from .. import al_runner as _al_runner
 from ..audio import current_device_sample_rates as _current_device_sample_rates
+from .. import CAPTURE_APP_VERSION as _CAPTURE_APP_VERSION
 from ..audio import DeviceInfo as _DeviceInfo
 from ..audio import LATENCY_CHOICES as _LATENCY_CHOICES
 from ..audio import list_devices as _list_devices
@@ -901,6 +902,7 @@ class MainWindow(_QMainWindow):
             train_input=train_name,
             validation_input=validation_name,
             audio=self._audio_settings.model_copy(deep=True),
+            created_with_version=_CAPTURE_APP_VERSION,
         )
         self.project_dir = project_dir
         self.session = _CaptureSession(self.project, self.project_dir)
@@ -1273,6 +1275,11 @@ class MainWindow(_QMainWindow):
 
         if self.project is not None:
             project.audio = self.project.audio
+            # Regenerating the plan does not make this a new project: it keeps the folder,
+            # its captures and its history, so it keeps the version it was created under.
+            # Restamping here would erase the fact that its earlier captures predate
+            # captures_raw/, which is exactly what that stamp is for.
+            project.created_with_version = self.project.created_with_version
 
         project.include_initial_corners = self.include_corners_check.isChecked()
         corner_note = ""

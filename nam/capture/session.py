@@ -40,6 +40,7 @@ from typing import Sequence as _Sequence
 
 import numpy as _np
 
+from . import RAW_RECORDING_SINCE_VERSION as _RAW_RECORDING_SINCE_VERSION
 from .audio import PlaybackRecorder as _PlaybackRecorder
 from .audio import peak_to_dbfs as _peak_to_dbfs
 from .export import update_data_json as _update_data_json
@@ -153,7 +154,30 @@ def playback_input_path(project_dir: _Path, x_path: str) -> _Path:
     )
 
 
-def update_raw_manifest(project_dir: _Path, record: dict) -> None:
+def _predates_raw_recording_note(project: _CaptureProject) -> _Optional[str]:
+    """
+    The one-line explanation for a ``captures_raw/`` that cannot possibly be complete,
+    or ``None`` when there is nothing to explain.
+
+    A project with no recorded version was created before the capture app stamped one,
+    which is also before raw recordings existed -- so anything captured back then has
+    nothing here, and the folder will look like it lost files it never had. Saying so in
+    the folder itself beats a dialog: it is read exactly when someone is looking at the
+    gap, and it survives the folder being copied away from the project.
+    """
+    if project.created_with_version is not None:
+        return None
+    return (
+        f"Raw recordings were first saved in capture app {_RAW_RECORDING_SINCE_VERSION}. "
+        f"This project was created before that, so captures made earlier have no files "
+        f"here; everything captured from {_RAW_RECORDING_SINCE_VERSION} on is listed "
+        "below."
+    )
+
+
+def update_raw_manifest(
+    project_dir: _Path, record: dict, note: _Optional[str] = None
+) -> None:
     """
     Insert or replace one capture's record in ``captures_raw/manifest.json``, keyed by
     ``y_path``. Written as each capture is recorded, so every record describes a file
@@ -167,9 +191,14 @@ def update_raw_manifest(project_dir: _Path, record: dict) -> None:
     or from the blips when the preamble carries them. What cannot be recovered from the
     audio alone is which part of it is the reamp, and that is what a recoverer needs to
     trim a raw file back to something that lines up with the input WAV sample for sample.
+
+    ``note`` is recorded once, when the manifest is created, and left alone afterwards:
+    it explains something about the folder's history, not about any one capture.
     """
     path = _Path(project_dir) / _CAPTURES_RAW_DIRNAME / _RAW_MANIFEST_FILENAME
     manifest: dict = {"version": RAW_MANIFEST_VERSION, "captures": []}
+    if note:
+        manifest["note"] = note
     if path.is_file():
         try:
             with path.open() as fp:
@@ -786,6 +815,7 @@ class CaptureSession:
                 "preamble_samples": preamble_samples,
                 "tail_samples": len(main) - preamble_samples - input_samples,
             },
+            note=_predates_raw_recording_note(self.project),
         )
 
     def _write_capture_wav(
