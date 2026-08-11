@@ -62,21 +62,23 @@ from ..project import clear_captures as _clear_captures
 from ..project import AudioSettingsModel as _AudioSettingsModel
 from ..project import CaptureEntryModel as _CaptureEntryModel
 from ..project import CaptureProject as _CaptureProject
+from ..project import find_clearable_entries as _find_clearable_entries
 from ..project import find_recoverable_entries as _find_recoverable_entries
 from ..project import KnobModel as _KnobModel
 from ..project import load_project as _load_project
 from ..project import migrate_legacy_peak_values as _migrate_legacy_peak_values
 from ..project import new_project as _new_project
 from ..project import PROJECT_FILENAME as _PROJECT_FILENAME
+from ..project import QAModel as _QAModel
 from ..project import reconcile_with_disk as _reconcile_with_disk
 from ..project import save_project as _save_project
+from ..session import adoptable_lead as _adoptable_lead
 from ..session import audit_captures as _audit_captures
 from ..session import audit_problems as _audit_problems
-from ..session import timebase_problem as _timebase_problem
-from ..project import QAModel as _QAModel
 from ..session import CaptureSession as _CaptureSession
 from ..session import LOOPBACK_CROSSCHECK_SAMPLES as _LOOPBACK_CROSSCHECK_SAMPLES
 from ..session import LOOPBACK_NOT_DETECTED_MESSAGE as _LOOPBACK_NOT_DETECTED_MESSAGE
+from ..session import timebase_problem as _timebase_problem
 from .workers import CancelToken as _CancelToken
 from .workers import SessionWorker as _SessionWorker
 
@@ -1033,8 +1035,8 @@ class MainWindow(_QMainWindow):
             return
         project, project_dir = self.project, self.project_dir
         self._run_worker(
-            lambda progress, cancel: _audit_problems(
-                _audit_captures(project, project_dir, progress=progress)
+            lambda progress, cancel: _audit_captures(
+                project, project_dir, progress=progress
             ),
             on_progress=lambda fraction: self.capture_progress.setValue(
                 int(fraction * 100)
@@ -1046,8 +1048,9 @@ class MainWindow(_QMainWindow):
             disable=[self.check_captures_button],
         )
 
-    def _on_check_captures_done(self, problems: list) -> None:
+    def _on_check_captures_done(self, audits: list) -> None:
         self.capture_progress.setValue(100)
+        problems = _audit_problems(audits)
         if not problems:
             self.capture_log.appendPlainText(
                 "Checked captures: all line up with each other."
@@ -1062,13 +1065,54 @@ class MainWindow(_QMainWindow):
         body = "\n".join(problems)
         self.capture_log.appendPlainText(f"Checked captures:\n{body}")
         _QMessageBox.warning(self, "Captures need attention", body)
+        self._maybe_adopt_measured_timebase(audits)
+
+    def _maybe_adopt_measured_timebase(self, audits: list) -> None:
+        """
+        Offer to record the timebase the existing captures were measured to sit on, when
+        the project has lost its own and they all agree on one.
+
+        This is the repair for the set the check has just reported: with the lead written
+        back, later captures are labelled to land on it and the whole project stays one
+        set. Without it the only remedy on offer is recapturing work that is not actually
+        damaged.
+        """
+        if self.project is None or self.project_dir is None:
+            return
+        lead = _adoptable_lead(self.project, audits)
+        if lead is None:
+            return
+        confirm = _QMessageBox.question(
+            self,
+            "Use these captures' timing?",
+            f"These captures were all measured to sit {lead:.2f} samples ahead of their "
+            "timing blip, and they agree with each other exactly.\n\n"
+            "Record that as this project's timing so new captures line up with them, "
+            "instead of recapturing? The existing captures and their files are not "
+            "changed.",
+            _QMessageBox.StandardButton.Yes | _QMessageBox.StandardButton.No,
+            _QMessageBox.StandardButton.Yes,
+        )
+        if confirm != _QMessageBox.StandardButton.Yes:
+            return
+        self.project.alignment_reference = lead
+        _save_project(self.project, self.project_dir)
+        self.capture_log.appendPlainText(
+            f"Recorded this project's capture timing as {lead:.4f} samples; new captures "
+            "will line up with the existing ones."
+        )
+        self._refresh_all()
 
     def _on_clear_captures(self) -> None:
         if self.project is None or self.project_dir is None:
             _QMessageBox.warning(self, "No project", "Open or create a project first.")
             return
-        captured = self.project.captured_entries()
-        if not captured:
+        # Not just captured_entries(): a pending entry whose WAV is still on disk (the
+        # window before the user accepts or declines the offer to restore it) is exactly
+        # the case this button has to be able to clear -- it's what a poisoned legacy
+        # timebase looks like when the warning that names this button as the fix fires.
+        clearable = _find_clearable_entries(self.project, self.project_dir)
+        if not clearable:
             _QMessageBox.information(
                 self, "Nothing to clear", "This project has no captures yet."
             )
@@ -1076,7 +1120,7 @@ class MainWindow(_QMainWindow):
         confirm = _QMessageBox.question(
             self,
             "Clear captures?",
-            f"Delete all {len(captured)} capture(s) in this project and mark them for "
+            f"Delete all {len(clearable)} capture(s) in this project and mark them for "
             "recapturing?\n\nThe capture WAVs are deleted and cannot be recovered. The "
             "original recordings in captures_raw/ are kept.",
             _QMessageBox.StandardButton.Yes | _QMessageBox.StandardButton.No,
@@ -1391,6 +1435,13 @@ class MainWindow(_QMainWindow):
             # Restamping here would erase the fact that its earlier captures predate
             # captures_raw/, which is exactly what that stamp is for.
             project.created_with_version = self.project.created_with_version
+            # For the same reason, and more sharply: the capture WAVs survive this and
+            # are re-imported afterwards, so the timebase they were written against has
+            # to survive it too. Dropping it here left the files on one lead and every
+            # later capture on the constant, with nothing recording the difference --
+            # which is how a project ends up with captures 0.43 samples apart and no
+            # way to tell from the project file that anything happened.
+            project.alignment_reference = self.project.alignment_reference
 
         project.include_initial_corners = self.include_corners_check.isChecked()
         corner_note = ""

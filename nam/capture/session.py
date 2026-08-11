@@ -60,6 +60,7 @@ from .project import CaptureEntryModel as _CaptureEntryModel
 from .project import CaptureProject as _CaptureProject
 from .project import QAModel as _QAModel
 from .project import atomic_write_json as _atomic_write_json
+from .project import find_clearable_entries as _find_clearable_entries
 from .project import mark_captured as _mark_captured
 from .project import save_project as _save_project
 
@@ -141,23 +142,44 @@ class CaptureSessionError(RuntimeError):
     pass
 
 
-def alignment_lead(project: _CaptureProject, project_dir: _Path) -> float:
+def recorded_lead(project: _CaptureProject) -> _Optional[float]:
     """
-    The lead this project's captures are expected to sit on, without refusing or
+    This project's own recorded lead, if it has one that could be a converter's timing
+    offset. ``None`` when there is none or it is out of range.
+
+    A value outside the range is not a timebase: it is a broken measurement (a first
+    capture whose two timing blips disagreed writes exactly that), and the callers treat
+    it as a fault to report rather than a number to use.
+    """
+    reference = project.alignment_reference
+    if reference is None:
+        return None
+    if 0.0 < reference <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+        return float(reference)
+    return None
+
+
+def alignment_lead(project: _CaptureProject) -> float:
+    """
+    The lead every capture in this project is labelled against, without refusing or
     changing anything -- :meth:`CaptureSession._alignment_lead` does both, and the audit
     needs to ask the same question of a project it is only inspecting.
 
-    A reference too large to be a converter's offset is not a timebase to measure
-    against, so the constant is used and :func:`timebase_problem` reports the reference
-    separately. Every capture in such a project then reads as misaligned, which is the
-    honest answer: they are.
+    A recorded lead, once present and usable, is the project's lead unconditionally --
+    whether or not it currently has captures. It is deliberately not conditioned on the
+    project having captures right now, because that made the answer depend on state that
+    moves underneath it: regenerating the plan with a different seed renames every entry,
+    so the capture files on disk stop matching any planned ``y_path`` and the project
+    reads as empty. Releasing the lead there and taking it back when the old seed returns
+    would put captures made in between on a different timebase from the ones on either
+    side -- silently, since by then nothing records what the earlier ones used. Holding it
+    fixed costs nothing (the lead is arbitrary; only holding it constant matters) and
+    removes that whole class of failure. It is dropped only by an explicit
+    :func:`nam.capture.project.clear_captures`, or by
+    :meth:`CaptureSession._alignment_lead` when it is unusable *and* describes nothing.
     """
-    reference = project.alignment_reference
-    if reference is None or not has_captures(project, project_dir):
-        return ALIGNMENT_LEAD_SAMPLES
-    if 0.0 < reference <= MAX_LEGACY_ALIGNMENT_REFERENCE:
-        return float(reference)
-    return ALIGNMENT_LEAD_SAMPLES
+    recorded = recorded_lead(project)
+    return ALIGNMENT_LEAD_SAMPLES if recorded is None else recorded
 
 
 def has_captures(project: _CaptureProject, project_dir: _Path) -> bool:
@@ -171,11 +193,14 @@ def has_captures(project: _CaptureProject, project_dir: _Path) -> bool:
     back. Reading only the statuses there let the timebase be released and a new capture
     made against a different one, which is the mixed set the whole thing exists to
     prevent, so the files are what is asked.
+
+    Delegates to :func:`nam.capture.project.find_clearable_entries`, which asks the same
+    question for :func:`~nam.capture.project.clear_captures` -- the GUI action this
+    refusal points the user at. Two separate answers to "does this project have
+    captures" is exactly how it was possible to be told to clear a project that
+    "Clear captures" then saw as already empty.
     """
-    project_dir = _Path(project_dir)
-    return bool(project.captured_entries()) or any(
-        (project_dir / entry.y_path).is_file() for entry in project.entries
-    )
+    return bool(_find_clearable_entries(project, project_dir))
 
 
 def timebase_problem(
@@ -188,11 +213,17 @@ def timebase_problem(
     the GUI can ask the same question without starting one -- the answer does not depend
     on anything a capture produces, and arriving as a failure *after* a recording is a
     poor way to learn that the recording could never have been kept.
+
+    An unusable reference is only a problem while there are captures written against it.
+    With none, it describes nothing, so it is not reported here and
+    :meth:`CaptureSession._alignment_lead` drops it instead of refusing forever -- there
+    would otherwise be no way out, since "clear the captures" cannot be done on a project
+    that has none.
     """
     reference = project.alignment_reference
-    if reference is None or not has_captures(project, project_dir):
+    if reference is None or recorded_lead(project) is not None:
         return None
-    if 0.0 < reference <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+    if not has_captures(project, project_dir):
         return None
     return (
         "The captures already in this project have a bad timing measurement, so new "
@@ -248,7 +279,7 @@ def audit_captures(
     from ..data import wav_to_np
 
     audits: list[CaptureAudit] = []
-    expected = -alignment_lead(project, project_dir)
+    expected = -alignment_lead(project)
     entries = project.captured_entries()
     for index, entry in enumerate(entries):
         if progress is not None:
@@ -297,13 +328,72 @@ def audit_captures(
     return audits
 
 
+def shared_offset(audits: _Sequence[CaptureAudit]) -> _Optional[float]:
+    """
+    The one offset every measurable capture shares, or ``None`` if they do not share one.
+
+    A whole set sitting the same distance from the project's lead is a different fact
+    from captures sitting at different distances, and needs saying differently. The first
+    means the set agrees with itself and was written under another timebase -- harmless
+    to train on, since a constant latency is the same constant on every capture. The
+    second means the captures genuinely disagree, which is the fault that hurts.
+    """
+    offsets = [
+        audit.offset
+        for audit in audits
+        if audit.offset is not None and not audit.blips_disagree
+    ]
+    if not offsets:
+        return None
+    if max(offsets) - min(offsets) >= ALIGNMENT_MISMATCH_SAMPLES:
+        return None
+    return sum(offsets) / len(offsets)
+
+
+def adoptable_lead(
+    project: _CaptureProject, audits: _Sequence[CaptureAudit]
+) -> _Optional[float]:
+    """
+    The lead this project's existing captures actually sit on, when that can be measured
+    from them and recorded so later captures join them instead of landing beside them.
+    ``None`` when it cannot be.
+
+    This is the repair for a project whose recorded lead was lost while its captures kept
+    it -- the state regenerating the plan leaves behind, since that rebuilds the project
+    file from the plan and the old ``alignment_reference`` does not survive it. The
+    captures themselves still know: their raw loopbacks re-measure to a lead that is not
+    the constant, consistently, and writing that number back reproduces exactly the
+    timebase they were written against.
+
+    Refused unless the evidence is complete. A project that already records a lead is
+    left alone (it is not lost), and one with any capture that could not be checked, or
+    whose blips disagreed, does not get a lead adopted from the remainder -- a number
+    inferred from part of a set would be applied to all of it.
+    """
+    if project.alignment_reference is not None:
+        return None
+    if not audits or any(a.unchecked is not None or a.blips_disagree for a in audits):
+        return None
+    offset = shared_offset(audits)
+    if offset is None:
+        return None
+    lead = alignment_lead(project) - offset
+    if not 0.0 < lead <= MAX_LEGACY_ALIGNMENT_REFERENCE:
+        return None
+    return lead
+
+
 def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
     """
     The captures in an :func:`audit_captures` result that need attention, in plain words.
     Empty when they all sit where this project's alignment puts them.
 
-    Each is judged against that alignment rather than against the others, so a capture
-    that is where it should be is never named because something else is not.
+    Captures that disagree with each other are judged against the project's alignment
+    rather than against the set, so a capture that is where it should be is never named
+    because something else is not. But a set that agrees with itself and sits together
+    away from that alignment is reported once, as the single fact it is: naming each
+    capture as "away from the rest" there would accuse every capture of a discrepancy
+    with captures it in fact matches exactly.
     """
     problems: list[str] = []
     for audit in audits:
@@ -315,10 +405,29 @@ def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
                 f"{audit.y_path}: its two timing blips came back {gap} samples apart, so "
                 "its timing was never measured reliably. Record it again."
             )
-        elif audit.offset is not None and abs(audit.offset) >= ALIGNMENT_MISMATCH_SAMPLES:
+
+    offset = shared_offset(audits)
+    if offset is not None:
+        if abs(offset) >= ALIGNMENT_MISMATCH_SAMPLES:
+            measured = sum(1 for a in audits if a.offset is not None)
             problems.append(
-                f"{audit.y_path}: sits {audit.offset:+.2f} samples away from the rest of "
-                "this project's captures. Record it again."
+                f"All {measured} measurable capture(s) agree with each other, but the "
+                f"set sits {offset:+.2f} samples from where a new capture in this "
+                "project would land. They were recorded on an older timebase that this "
+                "project no longer records. Training on them as they are is fine -- the "
+                "offset is the same on every one -- but a capture added now would be "
+                f"{abs(offset):.2f} samples out from them."
+            )
+        return problems
+
+    for audit in audits:
+        if audit.unchecked is not None or audit.blips_disagree:
+            continue
+        if audit.offset is not None and abs(audit.offset) >= ALIGNMENT_MISMATCH_SAMPLES:
+            problems.append(
+                f"{audit.y_path}: sits {audit.offset:+.2f} samples away from where this "
+                "project's alignment puts a capture, and the rest of the set does not "
+                "agree with it. Record it again."
             )
     return problems
 
@@ -700,29 +809,29 @@ class CaptureSession:
         keeps using its recorded offset and its captures stay mutually aligned. Nothing is
         measured into it and nothing is written back; it is a constant read from the file.
 
+        Once a project records a usable lead it keeps using it for every capture, whether
+        or not it has captures at this moment -- see :func:`alignment_lead` for why that
+        must not be conditional. The reference is released only by an explicit
+        :func:`nam.capture.project.clear_captures`.
+
         A reference too large to be a converter's timing offset is refused rather than
         reproduced. That is what the original fault wrote (129 samples, from a first
         capture whose two timing blips disagreed), and honouring it would spread a bad
         measurement into every remaining capture -- the exact failure this replaced.
         """
-        legacy = self.project.alignment_reference
-        if legacy is None:
+        if self.project.alignment_reference is None:
             return ALIGNMENT_LEAD_SAMPLES
-        if not has_captures(self.project, self.project_dir):
-            # The reference exists only to match captures already written against it.
-            # With none left there is nothing to match, so the project starts fresh --
-            # and it is dropped rather than merely skipped, or capturing a few entries
-            # and reopening would put it back in force over captures that never used it.
-            #
-            # This is also what makes the refusal below possible to act on: it tells the
-            # user to clear the captures and record them again, which they cannot do if
-            # the reference that refuses them survives having no captures left.
-            self.project.alignment_reference = None
-            return ALIGNMENT_LEAD_SAMPLES
+        recorded = recorded_lead(self.project)
+        if recorded is not None:
+            return recorded
         problem = timebase_problem(self.project, self.project_dir)
         if problem is not None:
             raise CaptureSessionError(problem)
-        return float(legacy)
+        # Unusable *and* describing no captures, so there is nothing it could keep this
+        # capture aligned with and nothing for the user to clear. Dropped rather than
+        # refused, or the project would be permanently uncapturable with no way out.
+        self.project.alignment_reference = None
+        return ALIGNMENT_LEAD_SAMPLES
 
     @staticmethod
     def _alignment(

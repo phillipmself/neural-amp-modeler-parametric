@@ -258,9 +258,10 @@ class CaptureProject(_BaseModel):
     # planned LHS size drift every time the project is reopened.
     n_train_lhs: int = 0
     include_initial_corners: bool = False
-    # Legacy only, and never written: nothing sets this any more. It survives because
-    # projects captured before the timebase became stateless have it, and their captures
-    # sit on the timebase it describes.
+    # The lead this project's captures are labelled against, when it is not the current
+    # constant. Absent for anything captured under the stateless timebase, which is the
+    # normal case; present for a project captured before it, and for one that has since
+    # had that lead measured back out of its own recordings and recorded here.
     #
     # It used to be seeded from whichever capture was recorded first and every later
     # capture was then shifted to match it -- so one bad measurement silently became the
@@ -269,10 +270,17 @@ class CaptureProject(_BaseModel):
     # But a project part-captured under the old scheme still has captures written against
     # this offset, and resuming it with a different one would leave the two groups a
     # fraction of a sample (or worse) apart -- exactly the per-capture phase error the
-    # alignment exists to remove. So for those projects it is read back, once, as the
-    # alignment lead, which reproduces their existing timebase exactly and lets them be
-    # finished without recapturing anything. It is never adopted, never updated, and
-    # never consulted for a project that does not already have one.
+    # alignment exists to remove. So for those projects it is read back as the alignment
+    # lead, which reproduces their existing timebase exactly and lets them be finished
+    # without recapturing anything.
+    #
+    # No capture ever measures a value in here: it is set only by carrying it forward
+    # when the plan is regenerated, and by the user accepting the offer to adopt a lead
+    # the audit measured from the captures themselves (see session.adoptable_lead) --
+    # which is the repair for a project whose captures kept their timebase while the
+    # project file lost it. Once present it applies to every capture unconditionally, and
+    # is released only by clear_captures. See session.alignment_lead for why that must not
+    # depend on whether the project currently has captures.
     #
     # See CaptureSession._alignment_lead, which also rejects a value too large to be a
     # converter's timing offset -- that is what a poisoned reference looks like.
@@ -454,14 +462,38 @@ def reconcile_with_disk(project: CaptureProject, project_dir: _Path) -> list[str
     return notes
 
 
+def find_clearable_entries(
+    project: CaptureProject, project_dir: _Path
+) -> list[CaptureEntryModel]:
+    """
+    Entries :func:`clear_captures` would touch: every entry recorded as captured, plus
+    any pending entry whose WAV is still on disk.
+
+    That second group matters: regenerating the plan resets a captured entry's status to
+    pending but leaves its WAV in place, and until the user accepts or declines the offer
+    to restore it (see :func:`find_recoverable_entries`) the entry is pending while the
+    file -- and whatever timebase it was written against -- is still live. Reporting only
+    ``captured_entries()`` here would call a project "nothing to clear" while it still had
+    a file sitting on a timebase nothing else can now see, in exactly the state a caller
+    reaches this function to get out of.
+    """
+    project_dir = _Path(project_dir)
+    return [
+        entry
+        for entry in project.entries
+        if entry.status == "captured" or (project_dir / entry.y_path).is_file()
+    ]
+
+
 def clear_captures(project: CaptureProject, project_dir: _Path) -> list[str]:
     """
-    Put every captured entry back to pending and delete its capture WAV, so the project
+    Put every capture in this project back to pending and delete its WAV, so the project
     starts its captures over. Does not save; the caller saves. Returns a note per entry.
 
-    The files have to go, not just the statuses: a pending entry whose WAV is still on
-    disk is offered back to the user as recoverable (see :func:`find_recoverable_entries`)
-    and would be marked captured again on the next open, undoing this.
+    Covers everything :func:`find_clearable_entries` finds, not just entries recorded as
+    captured: a pending entry whose WAV is still on disk is offered back to the user as
+    recoverable (see :func:`find_recoverable_entries`) and would be marked captured again
+    on the next open, undoing this, if its file were left behind.
 
     ``captures_raw/`` is left alone. Those recordings are the only record of what the rig
     actually did, which is what a timing fault has to be diagnosed from after the fact,
@@ -473,12 +505,12 @@ def clear_captures(project: CaptureProject, project_dir: _Path) -> list[str]:
     """
     project_dir = _Path(project_dir)
     notes: list[str] = []
-    for entry in project.captured_entries():
+    for entry in find_clearable_entries(project, project_dir):
         wav_path = project_dir / entry.y_path
         try:
             wav_path.unlink(missing_ok=True)
         except OSError as exc:
-            notes.append(f"{entry.y_path}: could not delete ({exc}); left as captured.")
+            notes.append(f"{entry.y_path}: could not delete ({exc}); left as is.")
             continue
         entry.status = "pending"
         entry.delay = None

@@ -611,6 +611,38 @@ def test_regenerate_plan_reimports_matching_captures_immediately(
     window.close()
 
 
+def test_regenerate_plan_keeps_the_projects_recorded_timebase(
+    _qapp, tmp_path, monkeypatch
+):
+    # Regenerating rebuilds the project file from the plan, but the capture WAVs survive
+    # it and are re-imported straight afterwards -- so the timebase they were written
+    # against has to survive it too. Dropping it left the re-imported files on one lead
+    # and every later capture on the constant, with nothing recording the difference.
+    monkeypatch.setattr(
+        _MainWindow_module._QMessageBox, "information", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        _MainWindow_module._QMessageBox, "question",
+        lambda *a, **k: _MainWindow_module._QMessageBox.StandardButton.Yes,
+    )
+    window = _MainWindow()
+    window.project_dir = tmp_path
+    _fill_knob_rows(window, _GAIN_KNOB_ROWS)
+    window.n_train_spin.setValue(4)
+    window.n_validation_spin.setValue(2)
+    window.seed_spin.setValue(7)
+    window.include_corners_check.setChecked(False)
+    window._on_generate_plan()
+
+    window.project.alignment_reference = 4.4297
+
+    window._on_generate_plan()
+
+    assert window.project.alignment_reference == 4.4297
+    assert _load_project(tmp_path).alignment_reference == 4.4297
+    window.close()
+
+
 def _entry(index, gain, tone, status="pending"):
     return _CaptureEntryModel(
         index=index,
@@ -806,3 +838,34 @@ def test_clear_captures_button_resets_the_project(_qapp, tmp_path, monkeypatch):
     # Persisted, so reopening does not bring the old state back.
     assert _load_project(tmp_path).alignment_reference is None
     assert _load_project(tmp_path).captured_entries() == []
+
+
+def test_clear_captures_button_reaches_a_pending_entry_whose_file_survives(
+    _qapp, tmp_path, monkeypatch
+):
+    # The exact deadlock this guards against: regenerating the plan (or declining the
+    # offer to restore) leaves an entry pending with its WAV still on disk. The refusal
+    # to capture names this button as the fix, so it must not itself say "Nothing to
+    # clear" and leave the project stuck.
+    window, project, entry = _project_with_captures(tmp_path, _qapp)
+    project.alignment_reference = 129.0
+    entry.status = "pending"
+    assert not project.captured_entries()
+    assert (tmp_path / entry.y_path).is_file()
+
+    informed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        _MainWindow_module._QMessageBox, "information",
+        lambda parent, title, text, *a, **k: informed.append((title, text)),
+    )
+    monkeypatch.setattr(
+        _MainWindow_module._QMessageBox, "question",
+        lambda *a, **k: _MainWindow_module._QMessageBox.StandardButton.Yes,
+    )
+
+    window._on_clear_captures()
+    window.close()
+
+    assert not any(title == "Nothing to clear" for title, _ in informed)
+    assert not (tmp_path / entry.y_path).exists()
+    assert project.alignment_reference is None

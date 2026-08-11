@@ -12,6 +12,7 @@ from nam.capture.params import KnobSpec as _KnobSpec
 from nam.capture.planner import CAPTURES_RAW_DIRNAME as _CAPTURES_RAW_DIRNAME
 from nam.capture.planner import RAW_MANIFEST_FILENAME as _RAW_MANIFEST_FILENAME
 from nam.capture.project import clear_captures as _clear_captures
+from nam.capture.project import find_clearable_entries as _find_clearable_entries
 from nam.capture.project import find_recoverable_entries as _find_recoverable_entries
 from nam.capture.project import load_project as _load_project
 from nam.capture.project import new_project as _new_project
@@ -24,9 +25,12 @@ from nam.capture.session import (
     MAX_LEGACY_ALIGNMENT_REFERENCE as _MAX_LEGACY_REFERENCE,
 )
 from nam.capture.session import playback_input_path as _playback_input_path
+from nam.capture.session import adoptable_lead as _adoptable_lead
 from nam.capture.session import audit_captures as _audit_captures
 from nam.capture.session import audit_problems as _audit_problems
+from nam.capture.session import has_captures as _has_captures
 from nam.capture.session import raw_paths as _raw_paths
+from nam.capture.session import shared_offset as _shared_offset
 from nam.capture.session import timebase_problem as _timebase_problem
 from nam.data import np_to_wav as _np_to_wav
 from nam.data import wav_to_np as _wav_to_np
@@ -1065,10 +1069,10 @@ def test_the_legacy_bound_is_the_boundary(tmp_path):
     assert session._alignment_lead() == _LEAD
 
 
-def test_clearing_a_projects_captures_releases_its_legacy_timebase(tmp_path):
-    # The refusal tells the user to clear the captures and record them again, so that
-    # has to actually work: with nothing left written against the old reference there is
-    # nothing to match, and the project starts fresh on the constant.
+def test_an_unusable_reference_describing_no_captures_is_dropped_not_refused(tmp_path):
+    # A poisoned reference with nothing written against it cannot be acted on by the
+    # advice the refusal gives ("clear the captures"), because there are none to clear.
+    # It describes nothing, so it is dropped and the project starts fresh.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1082,6 +1086,74 @@ def test_clearing_a_projects_captures_releases_its_legacy_timebase(tmp_path):
     # Dropped, not just skipped -- otherwise reopening the project would put a reference
     # back in force over captures that were never written against it.
     assert project.alignment_reference is None
+    assert _load_project(project_dir).alignment_reference is None
+
+
+def test_a_recorded_lead_survives_having_no_captures_right_now(tmp_path):
+    # The hazard the old release-on-empty behaviour created. Regenerating the plan with a
+    # different seed renames every entry, so the capture files stop matching any planned
+    # y_path and the project reads as empty -- releasing the lead there and taking it back
+    # when the old seed returns would strand whatever was captured in between on a
+    # different timebase, with nothing recording that it happened.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    legacy = 4.43
+    project.alignment_reference = legacy
+    assert not _has_captures(project, project_dir)
+
+    # Used even with nothing to match right now, and still there afterwards.
+    assert session._alignment_lead() == _pytest.approx(legacy)
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    assert project.alignment_reference == _pytest.approx(legacy)
+    # And the capture that was just made sits on it, not on the constant.
+    assert _timebase(entry) == _pytest.approx(480.0 - legacy, abs=0.05)
+
+
+def test_captures_made_while_entries_are_pending_join_the_recorded_timebase(tmp_path):
+    # The sequence the plan-regeneration path actually produces: the lead is carried
+    # forward, the capture files are on disk but their entries are pending (not yet
+    # re-imported), and the user captures something new before accepting the offer. The
+    # new capture has to land on the same timebase as the files waiting to be imported,
+    # or importing them afterwards mixes two timebases in one project.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entries = project.pending_entries()
+    # A project already on a recorded lead, with a capture written against it.
+    legacy = 4.43
+    project.alignment_reference = legacy
+    session.capture_entry(entries[0])
+    first_timebase = _timebase(entries[0])
+
+    # Post-regeneration: the entry is pending again but its WAV is still on disk, and
+    # the lead was carried forward with the rebuilt project file.
+    entries[0].status = "pending"
+    assert not project.captured_entries()
+
+    session.capture_entry(entries[1])
+
+    # Both on the recorded lead, so re-importing the first one later is consistent.
+    assert _timebase(entries[1]) == _pytest.approx(first_timebase, abs=0.05)
+    assert project.alignment_reference == _pytest.approx(legacy)
+
+
+def test_nothing_a_capture_does_writes_a_new_reference(tmp_path):
+    # No capture measures a timebase into the project any more, in any state. The only
+    # things that set it are carrying it forward and the user adopting a measured one.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+
+    for entry, drift in zip(project.pending_entries(), (0.0, 0.3, -0.2)):
+        recorder.drift = drift
+        session.capture_entry(entry)
+        assert project.alignment_reference is None
     assert _load_project(project_dir).alignment_reference is None
 
 
@@ -1176,6 +1248,35 @@ def test_a_timebase_survives_its_captures_being_pending_pre_recovery(tmp_path):
         session.capture_entry(project.pending_entries()[0])
 
 
+def test_clear_captures_reaches_a_pending_entry_whose_file_is_still_on_disk(tmp_path):
+    # The refusal above tells the user to clear captures and try again. That has to
+    # actually be possible from the same pending-but-file-present state: a pending entry
+    # whose WAV survives on disk is what has_captures() (and so timebase_problem()) is
+    # keying off of, so clear_captures() has to reach it too, or the fix this refusal
+    # points at is a no-op and the project is stuck.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    project.alignment_reference = 129.0
+
+    # The pre-recovery window: pending again, but the capture file is still there.
+    entry.status = "pending"
+    assert not project.captured_entries()
+    assert (project_dir / entry.y_path).is_file()
+    assert _find_clearable_entries(project, project_dir) == [entry]
+
+    notes = _clear_captures(project, project_dir)
+
+    assert notes
+    assert not (project_dir / entry.y_path).exists()
+    assert project.alignment_reference is None
+    assert _timebase_problem(project, project_dir) is None
+    assert _find_clearable_entries(project, project_dir) == []
+
+
 def test_audit_finds_a_misaligned_capture_without_any_stored_timing(tmp_path):
     # The check that works when everything else has been lost. A project whose plan was
     # regenerated and whose files were restored from disk has no measured QA left, so
@@ -1245,3 +1346,122 @@ def test_audit_reports_captures_it_cannot_check_rather_than_passing_them(tmp_pat
     assert audit.residual is None
     assert audit.unchecked is not None
     assert any("not checked" in p for p in _audit_problems([audit]))
+
+
+def _put_set_on_a_larger_lead(project, by: float) -> None:
+    """
+    Put every capture on a lead ``by`` samples larger than the project's, the way a set
+    written under an older scheme sits -- uniformly, agreeing with each other exactly.
+    The audit then reads each one as ``-by`` from where the project would put a capture,
+    which is the shape of the real failure (an iD44 set reading -0.43 against a lead of
+    4.0, having been written against 4.43).
+    """
+    for entry in project.captured_entries():
+        entry.qa.subsample_shift = (entry.qa.subsample_shift or 0.0) + by
+
+
+def test_a_uniformly_offset_set_is_reported_as_one_fact_not_as_disagreement(tmp_path):
+    # The real project this came from: three captures written under an older lead, all
+    # agreeing with each other to 0.000000 samples, every one of them reported as sitting
+    # "away from the rest of this project's captures" -- away from captures it matched
+    # exactly. A set that agrees with itself has one thing wrong with it, not three.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    recorder = _DriftingRecorder(480)
+    session = _CaptureSession(project, project_dir, recorder=recorder)
+    for entry, drift in zip(project.pending_entries(), (0.0, 0.3, -0.2)):
+        recorder.drift = drift
+        session.capture_entry(entry)
+    _put_set_on_a_larger_lead(project, 0.43)
+
+    audits = _audit_captures(project, project_dir)
+    offsets = [a.offset for a in audits]
+    assert max(offsets) - min(offsets) < 1e-6  # they agree with each other exactly
+    assert _shared_offset(audits) == _pytest.approx(-0.43, abs=0.02)
+
+    problems = _audit_problems(audits)
+
+    (problem,) = problems
+    assert "agree with each other" in problem
+    # Not named individually, and not told to recapture what is not damaged.
+    assert not any(a.y_path in problem for a in audits)
+    assert "Record it again" not in problem
+
+
+def test_a_uniformly_offset_set_offers_its_measured_lead_for_adoption(tmp_path):
+    # The repair: the captures still know the lead they were written against even after
+    # the project file has lost it, so it can be measured back out and recorded rather
+    # than recapturing a set that is internally perfect.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    for entry in project.pending_entries()[:2]:
+        session.capture_entry(entry)
+    _put_set_on_a_larger_lead(project, 0.43)
+
+    lead = _adoptable_lead(project, _audit_captures(project, project_dir))
+
+    assert lead == _pytest.approx(_LEAD + 0.43, abs=0.02)
+    # Adopting it makes the set read clean, which is the point: it is the timebase they
+    # were always on, now written down.
+    project.alignment_reference = lead
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+    # And a capture made now joins them rather than landing beside them.
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+
+
+def test_a_lead_is_not_adopted_on_partial_or_contradictory_evidence(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entries = project.pending_entries()
+    for entry in entries[:2]:
+        session.capture_entry(entry)
+    _put_set_on_a_larger_lead(project, 0.43)
+    audits = _audit_captures(project, project_dir)
+    assert _adoptable_lead(project, audits) is not None
+
+    # A project that already records a lead has not lost one; nothing to adopt.
+    project.alignment_reference = 11.0
+    assert _adoptable_lead(project, audits) is None
+    project.alignment_reference = None
+
+    # A capture that could not be re-measured (no captures_raw/, as a project predating
+    # it has) means the offset is known for only part of the set, so it is not applied
+    # to all of it.
+    _, raw_loopback = _raw_paths(project_dir, entries[0].y_path)
+    raw_loopback.unlink()
+    partial = _audit_captures(project, project_dir)
+    assert any(a.unchecked for a in partial)
+    assert _adoptable_lead(project, partial) is None
+
+
+def test_captures_from_different_schemes_are_named_individually(tmp_path):
+    # A genuine mixture -- some captures on one timebase, some on another -- is not a
+    # uniform offset, so it must fall back to naming the captures that disagree rather
+    # than reporting the set as coherent.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entries = project.pending_entries()
+    for entry in entries[:3]:
+        session.capture_entry(entry)
+    # One capture left where it is; the other two moved onto an older lead.
+    for entry in entries[1:3]:
+        entry.qa.subsample_shift = (entry.qa.subsample_shift or 0.0) + 0.43
+
+    audits = _audit_captures(project, project_dir)
+    assert _shared_offset(audits) is None
+    problems = _audit_problems(audits)
+
+    assert _adoptable_lead(project, audits) is None
+    assert all(
+        any(entry.y_path in p for p in problems) for entry in entries[1:3]
+    )
+    assert not any(entries[0].y_path in p for p in problems)
