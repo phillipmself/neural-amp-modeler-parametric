@@ -50,6 +50,7 @@ from .audio import PlaybackRecorder as _PlaybackRecorder
 from .audio import peak_to_dbfs as _peak_to_dbfs
 from .export import update_data_json as _update_data_json
 from .latency import BlipPreamble as _BlipPreamble
+from .latency import PlayedPreamble as _PlayedPreamble
 from .latency import LatencyResult as _LatencyResult
 from .latency import measure_delay as _measure_delay
 from .planner import CAPTURES_RAW_DIRNAME as _CAPTURES_RAW_DIRNAME
@@ -284,20 +285,9 @@ def audit_captures(
     for index, entry in enumerate(entries):
         if progress is not None:
             progress(index / max(len(entries), 1))
-        _, raw_loopback = raw_paths(project_dir, entry.y_path)
-        if not raw_loopback.is_file():
-            audits.append(
-                CaptureAudit(
-                    y_path=entry.y_path,
-                    unchecked="no raw loopback recording was kept for it",
-                )
-            )
-            continue
         try:
-            recording = _np.asarray(wav_to_np(raw_loopback), dtype=_np.float32).squeeze()
-            rate = project.sample_rate or _read_rate(raw_loopback)
-            latency = _measure_delay(recording, _BlipPreamble(sample_rate=rate))
-        except Exception as exc:  # unreadable or too short to scan
+            latency = measure_from_raw(project, project_dir, entry.y_path)
+        except Exception as exc:  # unreadable, too short, or nothing kept to measure
             audits.append(
                 CaptureAudit(y_path=entry.y_path, unchecked=f"could not measure ({exc})")
             )
@@ -350,39 +340,6 @@ def shared_offset(audits: _Sequence[CaptureAudit]) -> _Optional[float]:
     return sum(offsets) / len(offsets)
 
 
-def adoptable_lead(
-    project: _CaptureProject, audits: _Sequence[CaptureAudit]
-) -> _Optional[float]:
-    """
-    The lead this project's existing captures actually sit on, when that can be measured
-    from them and recorded so later captures join them instead of landing beside them.
-    ``None`` when it cannot be.
-
-    This is the repair for a project whose recorded lead was lost while its captures kept
-    it -- the state regenerating the plan leaves behind, since that rebuilds the project
-    file from the plan and the old ``alignment_reference`` does not survive it. The
-    captures themselves still know: their raw loopbacks re-measure to a lead that is not
-    the constant, consistently, and writing that number back reproduces exactly the
-    timebase they were written against.
-
-    Refused unless the evidence is complete. A project that already records a lead is
-    left alone (it is not lost), and one with any capture that could not be checked, or
-    whose blips disagreed, does not get a lead adopted from the remainder -- a number
-    inferred from part of a set would be applied to all of it.
-    """
-    if project.alignment_reference is not None:
-        return None
-    if not audits or any(a.unchecked is not None or a.blips_disagree for a in audits):
-        return None
-    offset = shared_offset(audits)
-    if offset is None:
-        return None
-    lead = alignment_lead(project) - offset
-    if not 0.0 < lead <= MAX_LEGACY_ALIGNMENT_REFERENCE:
-        return None
-    return lead
-
-
 def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
     """
     The captures in an :func:`audit_captures` result that need attention, in plain words.
@@ -432,6 +389,66 @@ def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
     return problems
 
 
+def measure_from_raw(
+    project: _CaptureProject, project_dir: _Path, y_path: str
+) -> _LatencyResult:
+    """
+    Measure a capture's delay from the loopback recording it kept.
+
+    The one detection path. A live capture measures the return it just recorded against
+    the preamble it just played; this measures the return that was kept against the
+    preamble that was kept. Same function, same preamble description, same numbers -- so
+    a capture recovered from disk or re-checked by the audit cannot disagree with what
+    the capture itself recorded, which is exactly what went wrong when recovery invented
+    a result from ``data.json`` instead of measuring one.
+
+    Raises when the recording, the playback copy or the manifest entry is missing, which
+    is what a capture from before ``captures_raw/`` looks like.
+    """
+    from ..data import wav_to_np
+
+    project_dir = _Path(project_dir)
+    _, raw_loopback = raw_paths(project_dir, y_path)
+    if not raw_loopback.is_file():
+        raise CaptureSessionError(f"no raw loopback recording was kept for {y_path}")
+    recording = _np.asarray(wav_to_np(raw_loopback), dtype=_np.float32).squeeze()
+    rate = project.sample_rate or _read_rate(raw_loopback)
+    return _measure_delay(recording, played_preamble(project_dir, y_path, rate))
+
+
+def played_preamble(
+    project_dir: _Path, y_path: str, sample_rate: int
+) -> _PlayedPreamble:
+    """
+    The preamble a capture was actually played, rebuilt from ``captures_raw/``.
+
+    Everything needed is already kept per capture: ``manifest.json`` records which
+    playback file went out and how many samples of it were preamble, and the playback
+    file itself is on disk. So the layout is read from the signal rather than from this
+    version's constants (see :class:`nam.capture.latency.PlayedPreamble`), and a capture
+    recorded under a preamble that has since changed is still measured against its own.
+    That is what keeps this free of a project-version gate.
+
+    Raises if the manifest or the playback copy is missing, which is a capture from
+    before they were kept -- reported as unchecked rather than measured against a guess.
+    """
+    project_dir = _Path(project_dir)
+    manifest_path = project_dir / _CAPTURES_RAW_DIRNAME / _RAW_MANIFEST_FILENAME
+    manifest = _json.loads(manifest_path.read_text())
+    record = next(
+        (r for r in manifest.get("captures", []) if r.get("y_path") == y_path), None
+    )
+    if record is None:
+        raise CaptureSessionError(f"{y_path} is not in {_RAW_MANIFEST_FILENAME}")
+    playback_path = project_dir / _CAPTURES_RAW_DIRNAME / record["playback"]
+    from ..data import wav_to_np
+
+    playback = _np.asarray(wav_to_np(playback_path), dtype=_np.float32).squeeze()
+    return _PlayedPreamble.from_playback(
+        playback, int(record["preamble_samples"]), sample_rate
+    )
+
+
 def _read_rate(path: _Path) -> int:
     import wave as _wave
 
@@ -452,7 +469,7 @@ def raw_paths(project_dir: _Path, y_path: str) -> tuple[_Path, _Path]:
 
 def build_playback(
     x: _np.ndarray, sample_rate: int
-) -> tuple[_np.ndarray, _BlipPreamble]:
+) -> tuple[_np.ndarray, _PlayedPreamble]:
     """
     The stream that goes out to the amp: blip preamble, then the input audio, then
     enough tail for the delayed response to land inside the recording.
@@ -460,10 +477,16 @@ def build_playback(
     Single source of this layout. The copy saved in ``captures_raw/`` is what a raw
     recording is correlated against, so it has to be built the same way as the stream
     that was played, not merely the same way in two places.
+
+    The preamble handed back describes the signal as rendered rather than as specified
+    (see :class:`nam.capture.latency.PlayedPreamble`), so a live capture is measured by
+    the same code that re-measures an old recording out of ``captures_raw/`` -- the path
+    that has to survive a preamble change is the one every capture already runs.
     """
-    preamble = _BlipPreamble(sample_rate)
+    rendered = _BlipPreamble(sample_rate)
     tail = _np.zeros(int(TAIL_SECONDS * sample_rate), dtype=_np.float32)
-    playback = _np.concatenate([preamble.render(), x, tail])
+    playback = _np.concatenate([rendered.render(), x, tail])
+    preamble = _PlayedPreamble.from_playback(playback, rendered.n_samples, sample_rate)
     return playback, preamble
 
 
@@ -1028,9 +1051,25 @@ class CaptureSession:
         Restore entries whose capture WAV already exists on disk to "captured" without
         recapturing (see :func:`nam.capture.project.find_recoverable_entries`).
 
-        The delay comes from data.json; QA is reconstructed from the WAV and
-        ``captured_at`` is stamped now, since data.json records neither. Persists the
-        project and data.json once at the end. Returns a note per entry.
+        The delay comes from data.json, which is what the WAV on disk is labelled with.
+        Everything else is re-measured from the recording the capture kept, through
+        :func:`measure_from_raw` -- the same detection a live capture runs.
+
+        Reconstructing rather than inventing matters. This used to fabricate a
+        ``LatencyResult`` from the recorded delay alone, which left the restored QA with
+        no ``peak_delay``, no ``blip_delays`` and no ``subsample_shift`` -- so a capture
+        that had been sub-sample aligned came back looking like one that never was, and
+        anything reading the QA afterwards (the audit especially) measured it against the
+        wrong reference and called a healthy capture misaligned.
+
+        The shift is derived from the delay the file carries and its own measured peak,
+        which reproduces exactly the shift applied when it was written, provided the
+        project's lead has not moved -- and it cannot, being fixed for the life of the
+        project. A shift that comes out past the half-sample residue it is defined as
+        means it has moved anyway, so that is reported rather than recorded.
+
+        ``captured_at`` is stamped now, since data.json records neither it nor QA.
+        Persists the project and data.json once at the end. Returns a note per entry.
         """
         from ..data import wav_to_np
 
@@ -1044,15 +1083,40 @@ class CaptureSession:
                     f"{entry.y_path}: could not read WAV to restore ({exc})."
                 )
                 continue
-            # data.json proves the delay was measured, so treat the impulse as detected;
-            # only the disagreement-vs-history check inside _qa needs re-running.
-            latency = _LatencyResult(
+            shift = 0.0
+            loopback_used = False
+            try:
+                latency = measure_from_raw(self.project, self.project_dir, entry.y_path)
+            except Exception as exc:
+                # No recording kept -- a capture from before captures_raw/. The delay is
+                # still trustworthy (data.json proves it was measured), so it is restored
+                # on that alone and the QA simply has less in it.
+                latency = _LatencyResult(
+                    delay=delay,
+                    detected=delay is not None,
+                    disagreement_too_high=False,
+                    safety_factor=0,
+                )
+                notes.append(f"{entry.y_path}: timing not re-measured ({exc}).")
+            else:
+                loopback_used = True
+                if delay is not None and latency.peak_delay is not None:
+                    shift = float(delay - (latency.peak_delay - self._alignment_lead()))
+                    if abs(shift) > MAX_ALIGNMENT_SHIFT + 1e-9:
+                        notes.append(
+                            f"{entry.y_path}: its recorded delay does not match its own "
+                            f"recording (off by {shift:+.2f} samples); restored without "
+                            "a sub-sample shift, and 'Check captures' will report it."
+                        )
+                        shift = 0.0
+            qa = self._qa(
+                entry,
+                y,
+                latency,
+                loopback_used=loopback_used,
+                alignment_shift=shift,
                 delay=delay,
-                detected=delay is not None,
-                disagreement_too_high=False,
-                safety_factor=0,
             )
-            qa = self._qa(entry, y, latency)
             _mark_captured(entry, delay=delay, qa=qa)
             notes.append(f"{entry.y_path}: restored from disk (delay={delay}).")
         if notes:

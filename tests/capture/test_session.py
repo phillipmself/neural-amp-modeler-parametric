@@ -25,7 +25,6 @@ from nam.capture.session import (
     MAX_LEGACY_ALIGNMENT_REFERENCE as _MAX_LEGACY_REFERENCE,
 )
 from nam.capture.session import playback_input_path as _playback_input_path
-from nam.capture.session import adoptable_lead as _adoptable_lead
 from nam.capture.session import audit_captures as _audit_captures
 from nam.capture.session import audit_problems as _audit_problems
 from nam.capture.session import has_captures as _has_captures
@@ -1389,58 +1388,6 @@ def test_a_uniformly_offset_set_is_reported_as_one_fact_not_as_disagreement(tmp_
     assert "Record it again" not in problem
 
 
-def test_a_uniformly_offset_set_offers_its_measured_lead_for_adoption(tmp_path):
-    # The repair: the captures still know the lead they were written against even after
-    # the project file has lost it, so it can be measured back out and recorded rather
-    # than recapturing a set that is internally perfect.
-    project_dir = _make_project_dir(tmp_path)
-    project = _load_project(project_dir)
-    _enable_loopback(project)
-    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
-    for entry in project.pending_entries()[:2]:
-        session.capture_entry(entry)
-    _put_set_on_a_larger_lead(project, 0.43)
-
-    lead = _adoptable_lead(project, _audit_captures(project, project_dir))
-
-    assert lead == _pytest.approx(_LEAD + 0.43, abs=0.02)
-    # Adopting it makes the set read clean, which is the point: it is the timebase they
-    # were always on, now written down.
-    project.alignment_reference = lead
-    assert _audit_problems(_audit_captures(project, project_dir)) == []
-    # And a capture made now joins them rather than landing beside them.
-    entry = project.pending_entries()[0]
-    session.capture_entry(entry)
-    assert _audit_problems(_audit_captures(project, project_dir)) == []
-
-
-def test_a_lead_is_not_adopted_on_partial_or_contradictory_evidence(tmp_path):
-    project_dir = _make_project_dir(tmp_path)
-    project = _load_project(project_dir)
-    _enable_loopback(project)
-    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
-    entries = project.pending_entries()
-    for entry in entries[:2]:
-        session.capture_entry(entry)
-    _put_set_on_a_larger_lead(project, 0.43)
-    audits = _audit_captures(project, project_dir)
-    assert _adoptable_lead(project, audits) is not None
-
-    # A project that already records a lead has not lost one; nothing to adopt.
-    project.alignment_reference = 11.0
-    assert _adoptable_lead(project, audits) is None
-    project.alignment_reference = None
-
-    # A capture that could not be re-measured (no captures_raw/, as a project predating
-    # it has) means the offset is known for only part of the set, so it is not applied
-    # to all of it.
-    _, raw_loopback = _raw_paths(project_dir, entries[0].y_path)
-    raw_loopback.unlink()
-    partial = _audit_captures(project, project_dir)
-    assert any(a.unchecked for a in partial)
-    assert _adoptable_lead(project, partial) is None
-
-
 def test_captures_from_different_schemes_are_named_individually(tmp_path):
     # A genuine mixture -- some captures on one timebase, some on another -- is not a
     # uniform offset, so it must fall back to naming the captures that disagree rather
@@ -1460,8 +1407,157 @@ def test_captures_from_different_schemes_are_named_individually(tmp_path):
     assert _shared_offset(audits) is None
     problems = _audit_problems(audits)
 
-    assert _adoptable_lead(project, audits) is None
     assert all(
         any(entry.y_path in p for p in problems) for entry in entries[1:3]
     )
     assert not any(entries[0].y_path in p for p in problems)
+
+
+def _played(rate=_RATE, blips=(0.5, 1.5), n_pre=None, amplitude=0.9):
+    """A preamble laid out however we like, plus the length it was played at."""
+    from nam.capture.latency import PlayedPreamble as _PlayedPreamble
+
+    n_pre = n_pre or int(2.25 * rate)
+    playback = _np.zeros(n_pre + rate, dtype=_np.float32)
+    for t in blips:
+        playback[int(t * rate)] = amplitude
+    return playback, n_pre, _PlayedPreamble
+
+
+def test_the_preamble_layout_is_read_from_the_signal_not_from_constants(tmp_path):
+    from nam.capture.latency import BlipPreamble as _BP
+    from nam.capture.latency import PlayedPreamble as _PP
+
+    from nam.capture.latency import _NOISE_INTERVAL_SECONDS as _NOISE
+
+    # The layout this version happens to ship reproduces exactly, so nothing about an
+    # existing project's measurement moves. Checked against the constants themselves,
+    # since BlipPreamble no longer carries a second description of them to compare with.
+    for rate in (44_100, _RATE, 96_000):
+        spec = _BP(sample_rate=rate)
+        read = spec.as_played()
+        assert read.blip_locations == spec.blip_locations
+        assert read.noise_interval == (
+            int(_NOISE[0] * rate), int(_NOISE[1] * rate)
+        )
+
+
+def test_a_changed_preamble_needs_no_version_gate(tmp_path):
+    # The point of reading the layout back: blips somewhere else, more of them, and at a
+    # different amplitude is not a migration, because the signal says where they are.
+    playback, n_pre, _PP = _played(blips=(0.2, 0.9, 1.7), amplitude=0.4)
+    read = _PP.from_playback(playback, n_pre, _RATE)
+
+    assert read.blip_locations == (
+        int(0.2 * _RATE), int(0.9 * _RATE), int(1.7 * _RATE)
+    )
+    # The noise window still lands in the silence before the first blip, wherever it is.
+    assert read.noise_interval[1] <= read.blip_locations[0]
+
+
+def test_a_silent_second_half_yields_one_reading_and_no_false_disagreement(tmp_path):
+    # The case that rules out splitting the preamble blindly in two: a preamble whose
+    # second half carries nothing would have had noise correlated against silence and
+    # reported as a capture whose blips disagree. Reading the layout instead simply finds
+    # one impulse, so there is nothing to compare and nothing is claimed.
+    playback, n_pre, _PP = _played(blips=(0.5,))
+    read = _PP.from_playback(playback, n_pre, _RATE)
+
+    assert read.blip_locations == (int(0.5 * _RATE),)
+
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    session.capture_entry(project.pending_entries()[0])
+    (audit,) = _audit_captures(project, project_dir)
+    single = [a for a in [audit] if len(a.blip_delays) < 2]
+    assert not any(a.blips_disagree for a in single)
+
+
+def test_a_preamble_with_no_impulses_is_refused_rather_than_guessed(tmp_path):
+    from nam.capture.latency import PlayedPreamble as _PP
+
+    with _pytest.raises(ValueError):
+        _PP.from_playback(_np.zeros(1000, dtype=_np.float32), 1000, _RATE)
+
+
+def test_audit_measures_against_the_preamble_the_capture_was_played(tmp_path):
+    # It reads captures_raw/, so removing the played copy is what makes it unmeasurable
+    # -- not anything about which version wrote the capture.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+
+    # Drop the played copy the manifest points at.
+    import json as _j
+    man = _j.loads(
+        (project_dir / _CAPTURES_RAW_DIRNAME / _RAW_MANIFEST_FILENAME).read_text()
+    )
+    record = next(r for r in man['captures'] if r['y_path'] == entry.y_path)
+    (project_dir / _CAPTURES_RAW_DIRNAME / record['playback']).unlink()
+    (audit,) = _audit_captures(project, project_dir)
+    assert audit.unchecked is not None
+
+
+def test_recovery_re_measures_instead_of_inventing_a_result(tmp_path):
+    # Recovery used to fabricate a LatencyResult from data.json's delay, which left the
+    # restored QA with no peak_delay, no blip_delays and no subsample_shift -- so a
+    # capture that had been sub-sample aligned came back looking like one that never was,
+    # and the audit then measured it against the wrong reference and called a healthy
+    # capture misaligned. Detection is now one path, so what comes back matches what the
+    # capture recorded.
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480, drift=0.3))
+    entries = project.pending_entries()
+    for entry in entries[:2]:
+        session.capture_entry(entry)
+    original = {e.y_path: (e.delay, e.qa.subsample_shift, e.qa.peak_delay)
+                for e in project.captured_entries()}
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+
+    # Plan regenerated: entries pending, WAVs and data.json still on disk.
+    for entry in project.entries:
+        entry.status, entry.qa = "pending", None
+    session.recover_captured_from_disk(
+        _find_recoverable_entries(project, project_dir)
+    )
+
+    for entry in project.captured_entries():
+        delay, shift, peak = original[entry.y_path]
+        assert entry.delay == delay
+        assert entry.qa.peak_delay == _pytest.approx(peak, abs=1e-9)
+        assert (entry.qa.subsample_shift or 0.0) == _pytest.approx(shift or 0.0, abs=1e-9)
+        assert len(entry.qa.blip_delays) == 2
+    # And the audit still passes, rather than reporting the whole set as offset because
+    # the shift it was written with had been forgotten.
+    assert _audit_problems(_audit_captures(project, project_dir)) == []
+
+
+def test_recovery_still_works_when_nothing_was_kept_to_re_measure(tmp_path):
+    project_dir = _make_project_dir(tmp_path)
+    project = _load_project(project_dir)
+    _enable_loopback(project)
+    session = _CaptureSession(project, project_dir, recorder=_DriftingRecorder(480))
+    entry = project.pending_entries()[0]
+    session.capture_entry(entry)
+    delay = entry.delay
+    # As a project made before captures_raw/ existed.
+    _, raw_loopback = _raw_paths(project_dir, entry.y_path)
+    raw_loopback.unlink()
+    for e in project.entries:
+        e.status, e.qa = "pending", None
+
+    notes = session.recover_captured_from_disk(
+        _find_recoverable_entries(project, project_dir)
+    )
+
+    restored = project.captured_entries()[0]
+    assert restored.delay == delay
+    assert any("not re-measured" in n for n in notes)

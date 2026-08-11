@@ -72,7 +72,6 @@ from ..project import PROJECT_FILENAME as _PROJECT_FILENAME
 from ..project import QAModel as _QAModel
 from ..project import reconcile_with_disk as _reconcile_with_disk
 from ..project import save_project as _save_project
-from ..session import adoptable_lead as _adoptable_lead
 from ..session import audit_captures as _audit_captures
 from ..session import audit_problems as _audit_problems
 from ..session import CaptureSession as _CaptureSession
@@ -1075,43 +1074,6 @@ class MainWindow(_QMainWindow):
         body = "\n".join(problems)
         self.capture_log.appendPlainText(f"Checked captures:\n{body}")
         _QMessageBox.warning(self, "Captures need attention", body)
-        self._maybe_adopt_measured_timebase(audits)
-
-    def _maybe_adopt_measured_timebase(self, audits: list) -> None:
-        """
-        Offer to record the timebase the existing captures were measured to sit on, when
-        the project has lost its own and they all agree on one.
-
-        This is the repair for the set the check has just reported: with the lead written
-        back, later captures are labelled to land on it and the whole project stays one
-        set. Without it the only remedy on offer is recapturing work that is not actually
-        damaged.
-        """
-        if self.project is None or self.project_dir is None:
-            return
-        lead = _adoptable_lead(self.project, audits)
-        if lead is None:
-            return
-        confirm = _QMessageBox.question(
-            self,
-            "Use these captures' timing?",
-            f"These captures were all measured to sit {lead:.2f} samples ahead of their "
-            "timing blip, and they agree with each other exactly.\n\n"
-            "Record that as this project's timing so new captures line up with them, "
-            "instead of recapturing? The existing captures and their files are not "
-            "changed.",
-            _QMessageBox.StandardButton.Yes | _QMessageBox.StandardButton.No,
-            _QMessageBox.StandardButton.Yes,
-        )
-        if confirm != _QMessageBox.StandardButton.Yes:
-            return
-        self.project.alignment_reference = lead
-        _save_project(self.project, self.project_dir)
-        self.capture_log.appendPlainText(
-            f"Recorded this project's capture timing as {lead:.4f} samples; new captures "
-            "will line up with the existing ones."
-        )
-        self._refresh_all()
 
     def _on_clear_captures(self) -> None:
         if self.project is None or self.project_dir is None:
