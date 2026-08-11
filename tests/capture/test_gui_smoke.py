@@ -869,3 +869,19 @@ def test_clear_captures_button_reaches_a_pending_entry_whose_file_survives(
     assert not any(title == "Nothing to clear" for title, _ in informed)
     assert not (tmp_path / entry.y_path).exists()
     assert project.alignment_reference is None
+
+
+def test_the_running_version_is_shown_at_the_bottom_right(_qapp):
+    from nam.capture import CAPTURE_APP_VERSION
+
+    window = _MainWindow()
+
+    assert window.version_label.text() == f"v{CAPTURE_APP_VERSION}"
+    # A permanent widget, so the constant rewriting of the message area leaves it alone.
+    window.status_bar.showMessage("Capturing 3 of 12...")
+    assert window.version_label.text() == f"v{CAPTURE_APP_VERSION}"
+    assert window.version_label.isVisible() or not window.isVisible()
+    # Right of the message area: permanent widgets are laid out from the right edge, so
+    # it must start beyond where a status message is drawn.
+    assert window.version_label.x() > 0
+    window.close()

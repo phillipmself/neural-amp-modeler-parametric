@@ -461,6 +461,16 @@ class MainWindow(_QMainWindow):
         if self._enable_active_learning:
             tabs.addTab(self._build_al_tab(), "Active Learning")
         self.status_bar = self.statusBar()
+        # Bottom right, and a permanent widget rather than a message: the message area is
+        # rewritten on every refresh (see _refresh_status_bar), so anything shown there
+        # would be wiped within moments. Permanent widgets sit to the right of it and are
+        # left alone. It reads which version is running, which is not what any project
+        # was created under -- CAPTURE_APP_VERSION explains why those differ.
+        self.version_label = _QLabel(f"v{_CAPTURE_APP_VERSION}")
+        self.version_label.setToolTip(f"Capture app version {_CAPTURE_APP_VERSION}")
+        # Clear of the size grip that owns the actual corner.
+        self.version_label.setContentsMargins(0, 0, 6, 0)
+        self.status_bar.addPermanentWidget(self.version_label)
 
     def _build_project_tab(self) -> _QWidget:
         widget = _QWidget()
