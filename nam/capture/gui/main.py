@@ -460,11 +460,9 @@ class MainWindow(_QMainWindow):
         if self._enable_active_learning:
             tabs.addTab(self._build_al_tab(), "Active Learning")
         self.status_bar = self.statusBar()
-        # Bottom right, and a permanent widget rather than a message: the message area is
-        # rewritten on every refresh (see _refresh_status_bar), so anything shown there
-        # would be wiped within moments. Permanent widgets sit to the right of it and are
-        # left alone. It reads which version is running, which is not what any project
-        # was created under -- CAPTURE_APP_VERSION explains why those differ.
+        # A permanent widget, not a message: _refresh_status_bar rewrites the message
+        # area constantly and would wipe it. Reads the running version, which is not what
+        # a project was created under -- see CAPTURE_APP_VERSION.
         self.version_label = _QLabel(f"v{_CAPTURE_APP_VERSION}")
         self.version_label.setToolTip(f"Capture app version {_CAPTURE_APP_VERSION}")
         # Clear of the size grip that owns the actual corner.
@@ -1079,10 +1077,9 @@ class MainWindow(_QMainWindow):
         if self.project is None or self.project_dir is None:
             _QMessageBox.warning(self, "No project", "Open or create a project first.")
             return
-        # Not just captured_entries(): a pending entry whose WAV is still on disk (the
-        # window before the user accepts or declines the offer to restore it) is exactly
-        # the case this button has to be able to clear -- it's what a poisoned legacy
-        # timebase looks like when the warning that names this button as the fix fires.
+        # Not just captured_entries(): a pending entry whose WAV is still on disk is
+        # exactly what this button has to clear, since that is the state the warning
+        # naming it as the fix fires in.
         clearable = _find_clearable_entries(self.project, self.project_dir)
         if not clearable:
             _QMessageBox.information(
@@ -1407,12 +1404,10 @@ class MainWindow(_QMainWindow):
             # Restamping here would erase the fact that its earlier captures predate
             # captures_raw/, which is exactly what that stamp is for.
             project.created_with_version = self.project.created_with_version
-            # For the same reason, and more sharply: the capture WAVs survive this and
-            # are re-imported afterwards, so the timebase they were written against has
-            # to survive it too. Dropping it here left the files on one lead and every
-            # later capture on the constant, with nothing recording the difference --
-            # which is how a project ends up with captures 0.43 samples apart and no
-            # way to tell from the project file that anything happened.
+            # Same reason, more sharply: the capture WAVs survive this and are
+            # re-imported straight afterwards, so the timebase they were written against
+            # must survive it too. Dropping it left the files on one lead and every later
+            # capture on the constant, with nothing recording the difference.
             project.alignment_reference = self.project.alignment_reference
 
         project.include_initial_corners = self.include_corners_check.isChecked()

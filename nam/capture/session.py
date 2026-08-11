@@ -93,45 +93,36 @@ LOOPBACK_NOT_DETECTED_MESSAGE = (
 TAIL_SECONDS = 0.5
 # How far ahead of the loopback blip's energy peak a capture is labelled, in samples.
 #
-# The label has to sit a little before the response: a converter's anti-alias filter
-# spreads energy ahead of the peak, and a label placed on the peak itself would ask the
-# model to account for input it has not been shown yet. Any fixed value puts the whole
-# project on one timebase (see :meth:`CaptureSession._alignment`) -- what matters is only
-# that it never varies between captures.
+# The label has to sit before the response: a converter's anti-alias filter spreads energy
+# ahead of the peak, and labelling the peak itself would ask the model to account for
+# input it has not been shown. Any fixed value puts the project on one timebase (see
+# :meth:`CaptureSession._alignment`); only never varying between captures matters.
 #
-# Nearly all of it is a change of reference point rather than caution. The peak is not
-# where the response begins: it is the maximum, and on an iD44 it sits 3.4 samples past
-# the first sample to clear the noise floor. NAM labels from that onset and pads it by one
-# sample (``_DELAY_CALIBRATION_SAFETY_FACTOR``), so reproducing the same instant from the
-# peak means backing off that 3.4 plus NAM's 1 -- which is this constant. It is NAM's
-# single sample of padding expressed in the peak's frame, not four samples of padding
-# stacked on top of a measurement that is already precise.
+# Nearly all of it is a change of reference point rather than caution. The peak is the
+# maximum, not the onset, and on an iD44 sits 3.4 samples past the first sample to clear
+# the noise floor. NAM labels from that onset less one sample of padding
+# (``_DELAY_CALIBRATION_SAFETY_FACTOR``), so reaching the same instant from the peak means
+# backing off 3.4 + 1 -- this constant. It lands where NAM does exactly: a blip peak of
+# 1194.42 labels 1190, which is what NAM's threshold-minus-one gives, so the latency baked
+# into everything exported is unchanged. What it buys is a peak that is stable and
+# resolvable below a sample, where a threshold crossing moves with amplitude -- which is
+# what let one bad capture take a project's timebase with it.
 #
-# It lands where NAM does, exactly: on an iD44 blip peak 1194.42, this labels 1190, which
-# is the same number NAM's threshold-minus-one produces. So the lead the model has to
-# learn -- and the latency baked into everything exported from the project -- is unchanged
-# from the old scheme's. What is bought with it is that the peak is stable and resolvable
-# below a sample, and a threshold crossing is neither: it moves with the response's
-# amplitude, which is what let one bad capture take a whole project's timebase with it.
-#
-# The cost is that 3.4 is a property of the converter, not a constant, so a converter
-# whose response spreads further needs more than 4 and would be labelled fractionally
-# late. ``CaptureSession._qa`` checks each capture against its own detected onset and says
-# so, rather than leaving it to be found in a model that sounds soft.
+# The cost: 3.4 is a property of the converter, so one whose response spreads further
+# would be labelled fractionally late. ``CaptureSession._qa`` checks each capture against
+# its own onset and says so, rather than leaving it to be found in a soft-sounding model.
 ALIGNMENT_LEAD_SAMPLES = 4.0
-# Beyond this, a legacy ``alignment_reference`` is not a converter's timing offset but a
-# broken measurement (a first capture whose two timing blips disagreed produces exactly
-# that), and reproducing its timebase would mean inheriting the fault. Sized to sit above
-# any plausible converter and well below the 129-sample reference the failure that
-# prompted this actually wrote.
+# Past this a legacy ``alignment_reference`` is not a converter's offset but a broken
+# measurement -- a first capture whose blips disagreed writes exactly that -- and
+# reproducing its timebase would inherit the fault. Above any plausible converter, well
+# below the 129 samples the failure that prompted this wrote.
 MAX_LEGACY_ALIGNMENT_REFERENCE = 32.0
-# A shift is the rounding residue of the label, so it cannot leave this range. Anything
-# past it means the arithmetic below is broken rather than the rig, so it is checked
-# rather than trusted.
+# A shift is the rounding residue of the label, so it cannot leave this range. Past it the
+# arithmetic is broken rather than the rig, so it is checked rather than trusted.
 MAX_ALIGNMENT_SHIFT = 0.5
-# How far a capture may sit from the rest of its project before it is reported as
-# misaligned. Half a sample is the error the alignment exists to remove, so the check
-# has to sit below that to be worth running; a healthy set agrees to a few hundredths.
+# How far a capture may sit from the rest before it is reported as misaligned. Half a
+# sample is the error the alignment removes, so the check must sit below that to be worth
+# running; a healthy set agrees to a few hundredths.
 ALIGNMENT_MISMATCH_SAMPLES = 0.25
 
 
@@ -166,18 +157,15 @@ def alignment_lead(project: _CaptureProject) -> float:
     changing anything -- :meth:`CaptureSession._alignment_lead` does both, and the audit
     needs to ask the same question of a project it is only inspecting.
 
-    A recorded lead, once present and usable, is the project's lead unconditionally --
-    whether or not it currently has captures. It is deliberately not conditioned on the
-    project having captures right now, because that made the answer depend on state that
+    A usable recorded lead is the project's lead unconditionally, whether or not it has
+    captures right now. Conditioning it on that made the answer depend on state that
     moves underneath it: regenerating the plan with a different seed renames every entry,
-    so the capture files on disk stop matching any planned ``y_path`` and the project
-    reads as empty. Releasing the lead there and taking it back when the old seed returns
-    would put captures made in between on a different timebase from the ones on either
-    side -- silently, since by then nothing records what the earlier ones used. Holding it
-    fixed costs nothing (the lead is arbitrary; only holding it constant matters) and
-    removes that whole class of failure. It is dropped only by an explicit
+    so the files stop matching any planned ``y_path`` and the project reads as empty.
+    Releasing the lead there and taking it back when the old seed returns would strand
+    whatever was captured in between on a third timebase, silently. Holding it costs
+    nothing -- the lead is arbitrary, only constancy matters. It is dropped only by
     :func:`nam.capture.project.clear_captures`, or by
-    :meth:`CaptureSession._alignment_lead` when it is unusable *and* describes nothing.
+    :meth:`CaptureSession._alignment_lead` when unusable *and* describing nothing.
     """
     recorded = recorded_lead(project)
     return ALIGNMENT_LEAD_SAMPLES if recorded is None else recorded
@@ -187,19 +175,15 @@ def has_captures(project: _CaptureProject, project_dir: _Path) -> bool:
     """
     Whether this project has captures the legacy timebase could still describe.
 
-    Deliberately not just ``captured_entries()``. An entry goes pending while its WAV
-    stays on disk -- after the plan is regenerated, until the user accepts the offer to
-    restore it (:func:`nam.capture.project.find_recoverable_entries`) -- and during that
-    window the project looks empty while being one dialog away from having every capture
-    back. Reading only the statuses there let the timebase be released and a new capture
-    made against a different one, which is the mixed set the whole thing exists to
-    prevent, so the files are what is asked.
+    Deliberately not just ``captured_entries()``: an entry goes pending while its WAV
+    stays on disk, after the plan is regenerated and until the user accepts the offer to
+    restore it (:func:`nam.capture.project.find_recoverable_entries`), and the project
+    then looks empty while being one dialog from having every capture back.
 
-    Delegates to :func:`nam.capture.project.find_clearable_entries`, which asks the same
-    question for :func:`~nam.capture.project.clear_captures` -- the GUI action this
-    refusal points the user at. Two separate answers to "does this project have
-    captures" is exactly how it was possible to be told to clear a project that
-    "Clear captures" then saw as already empty.
+    Delegates to :func:`nam.capture.project.find_clearable_entries` so that the refusal
+    and the "Clear captures" it points at cannot disagree -- two answers to "does this
+    project have captures" is how a user could be told to clear a project that Clear
+    captures then called empty.
     """
     return bool(_find_clearable_entries(project, project_dir))
 
@@ -215,11 +199,10 @@ def timebase_problem(
     on anything a capture produces, and arriving as a failure *after* a recording is a
     poor way to learn that the recording could never have been kept.
 
-    An unusable reference is only a problem while there are captures written against it.
-    With none, it describes nothing, so it is not reported here and
-    :meth:`CaptureSession._alignment_lead` drops it instead of refusing forever -- there
-    would otherwise be no way out, since "clear the captures" cannot be done on a project
-    that has none.
+    An unusable reference is only a problem while captures are written against it. With
+    none it describes nothing, so it is not reported and
+    :meth:`CaptureSession._alignment_lead` drops it rather than refusing forever -- there
+    is no way out otherwise, since a project with no captures cannot clear any.
     """
     reference = project.alignment_reference
     if reference is None or recorded_lead(project) is not None:
@@ -320,13 +303,12 @@ def audit_captures(
 
 def shared_offset(audits: _Sequence[CaptureAudit]) -> _Optional[float]:
     """
-    The one offset every measurable capture shares, or ``None`` if they do not share one.
+    The one offset every measurable capture shares, or ``None`` if they share none.
 
-    A whole set sitting the same distance from the project's lead is a different fact
-    from captures sitting at different distances, and needs saying differently. The first
-    means the set agrees with itself and was written under another timebase -- harmless
-    to train on, since a constant latency is the same constant on every capture. The
-    second means the captures genuinely disagree, which is the fault that hurts.
+    A whole set sitting the same distance from the project's lead agrees with itself and
+    was written under another timebase -- harmless to train on, since the constant is the
+    same on every capture. Captures at *different* distances genuinely disagree, which is
+    the fault that hurts. The two need saying differently.
     """
     offsets = [
         audit.offset
@@ -345,12 +327,11 @@ def audit_problems(audits: _Sequence[CaptureAudit]) -> list[str]:
     The captures in an :func:`audit_captures` result that need attention, in plain words.
     Empty when they all sit where this project's alignment puts them.
 
-    Captures that disagree with each other are judged against the project's alignment
-    rather than against the set, so a capture that is where it should be is never named
-    because something else is not. But a set that agrees with itself and sits together
-    away from that alignment is reported once, as the single fact it is: naming each
-    capture as "away from the rest" there would accuse every capture of a discrepancy
-    with captures it in fact matches exactly.
+    Captures that disagree are judged against the project's alignment rather than against
+    the set, so one that is where it should be is never named because something else is
+    not. A set that agrees with itself but sits together away from that alignment is
+    reported once instead: naming each capture as "away from the rest" would accuse every
+    one of them of a discrepancy with captures it matches exactly.
     """
     problems: list[str] = []
     for audit in audits:
@@ -395,15 +376,13 @@ def measure_from_raw(
     """
     Measure a capture's delay from the loopback recording it kept.
 
-    The one detection path. A live capture measures the return it just recorded against
-    the preamble it just played; this measures the return that was kept against the
-    preamble that was kept. Same function, same preamble description, same numbers -- so
-    a capture recovered from disk or re-checked by the audit cannot disagree with what
-    the capture itself recorded, which is exactly what went wrong when recovery invented
-    a result from ``data.json`` instead of measuring one.
+    The one detection path, shared with a live capture: same function, same preamble
+    description, same numbers. So the audit and recovery cannot disagree with what the
+    capture itself recorded -- which they did when recovery invented a result from
+    ``data.json`` rather than measuring one.
 
-    Raises when the recording, the playback copy or the manifest entry is missing, which
-    is what a capture from before ``captures_raw/`` looks like.
+    Raises when nothing was kept to measure, as for a capture predating
+    ``captures_raw/``.
     """
     from ..data import wav_to_np
 
@@ -420,17 +399,13 @@ def played_preamble(
     project_dir: _Path, y_path: str, sample_rate: int
 ) -> _PlayedPreamble:
     """
-    The preamble a capture was actually played, rebuilt from ``captures_raw/``.
+    The preamble a capture was played, rebuilt from ``captures_raw/``: ``manifest.json``
+    names the playback file and its preamble length, and the file itself is kept. See
+    :class:`nam.capture.latency.PlayedPreamble` for why the layout is read rather than
+    assumed.
 
-    Everything needed is already kept per capture: ``manifest.json`` records which
-    playback file went out and how many samples of it were preamble, and the playback
-    file itself is on disk. So the layout is read from the signal rather than from this
-    version's constants (see :class:`nam.capture.latency.PlayedPreamble`), and a capture
-    recorded under a preamble that has since changed is still measured against its own.
-    That is what keeps this free of a project-version gate.
-
-    Raises if the manifest or the playback copy is missing, which is a capture from
-    before they were kept -- reported as unchecked rather than measured against a guess.
+    Raises if either is missing, so such a capture is reported as unchecked rather than
+    measured against a guess.
     """
     project_dir = _Path(project_dir)
     manifest_path = project_dir / _CAPTURES_RAW_DIRNAME / _RAW_MANIFEST_FILENAME
@@ -478,10 +453,9 @@ def build_playback(
     recording is correlated against, so it has to be built the same way as the stream
     that was played, not merely the same way in two places.
 
-    The preamble handed back describes the signal as rendered rather than as specified
-    (see :class:`nam.capture.latency.PlayedPreamble`), so a live capture is measured by
-    the same code that re-measures an old recording out of ``captures_raw/`` -- the path
-    that has to survive a preamble change is the one every capture already runs.
+    The preamble handed back describes the signal as rendered rather than as specified,
+    so a live capture is measured by the same code that re-measures an old recording:
+    the path that has to survive a preamble change is one every capture already runs.
     """
     rendered = _BlipPreamble(sample_rate)
     tail = _np.zeros(int(TAIL_SECONDS * sample_rate), dtype=_np.float32)
@@ -824,23 +798,21 @@ class CaptureSession:
         How far ahead of the blip peak this project's captures are labelled.
 
         :data:`ALIGNMENT_LEAD_SAMPLES` for any project made under the stateless timebase,
-        which is all of them from here on. A project part-captured before it has captures
-        already written against its own ``alignment_reference``, and finishing it with a
-        different lead would leave those and the new ones on timebases a fraction of a
-        sample -- or, on a rig whose response spreads further, many samples -- apart. That
-        is the per-capture phase error the alignment exists to remove, so such a project
-        keeps using its recorded offset and its captures stay mutually aligned. Nothing is
-        measured into it and nothing is written back; it is a constant read from the file.
+        which is all of them from here on. One part-captured before it has captures
+        written against its own ``alignment_reference``, and finishing it with a different
+        lead would leave the two groups a fraction of a sample -- or, on a rig whose
+        response spreads further, many samples -- apart, which is the per-capture phase
+        error the alignment exists to remove. So it keeps using its recorded offset,
+        read from the file and never written back.
 
-        Once a project records a usable lead it keeps using it for every capture, whether
-        or not it has captures at this moment -- see :func:`alignment_lead` for why that
-        must not be conditional. The reference is released only by an explicit
+        Once recorded, a usable lead applies to every capture whether or not the project
+        has any right now (see :func:`alignment_lead` for why that must not be
+        conditional), and is released only by
         :func:`nam.capture.project.clear_captures`.
 
-        A reference too large to be a converter's timing offset is refused rather than
-        reproduced. That is what the original fault wrote (129 samples, from a first
-        capture whose two timing blips disagreed), and honouring it would spread a bad
-        measurement into every remaining capture -- the exact failure this replaced.
+        A reference too large to be a converter's offset is refused rather than
+        reproduced: that is what the original fault wrote, and honouring it would spread
+        one bad measurement into every remaining capture.
         """
         if self.project.alignment_reference is None:
             return ALIGNMENT_LEAD_SAMPLES
@@ -865,10 +837,8 @@ class CaptureSession:
         derived from this capture alone.
 
         Static, and deliberately so: given the project's fixed ``lead`` it reads nothing
-        else from the session or the project, which is the property that makes one
-        capture unable to disturb another. See :meth:`_alignment_lead` for where ``lead``
-        comes from -- a constant for every project made under this scheme, and a legacy
-        project's own recorded offset for one part-captured before it.
+        else, which is the property that makes one capture unable to disturb another. See
+        :meth:`_alignment_lead` for where ``lead`` comes from.
 
         What has to hold for a capture set to be mutually aligned is that
 
@@ -885,37 +855,30 @@ class CaptureSession:
             delay  = round(target)
             shift  = delay - target
 
-        gives ``r = target - D = (peak_delay - D) - lead``. The first
-        term is fixed hardware -- through a loopback the round trip is LTI, so its peak
-        sits the same distance past the true arrival on every capture -- and the second is
-        a constant, so ``r`` is the same for every capture without anything from any other
-        capture entering. The shift is only the rounding residue of the label, so it is
-        always within half a sample and never large enough to be worth a resample beyond
-        the fractional filter.
+        gives ``r = target - D = (peak_delay - D) - lead``. The first term is fixed
+        hardware -- through a loopback the round trip is LTI, so its peak sits the same
+        distance past the true arrival every time -- and the second is a constant, so
+        ``r`` is the same for every capture with nothing from any other capture entering.
+        The shift is only the label's rounding residue, always within half a sample.
 
-        This used to take the label from the calibrator's threshold crossing instead,
-        which is amplitude-biased: a quieter return crosses later, so it steps by whole
-        samples while the peak barely moves. Holding ``r`` constant then meant cancelling
-        that step against a project-wide reference offset taken from whichever capture
-        happened to be recorded first -- which silently made that one capture's
-        measurement the timebase for every later one, with nothing checking it. A first
-        capture whose two blips disagreed (see ``blip_delays``) put the reference 129
-        samples out, and every later capture was then told that *it* was the one that had
-        drifted. Deriving the label from the peak removes the shared state, so a bad
-        capture is now only ever bad on its own.
+        This used to take the label from the calibrator's threshold crossing, which is
+        amplitude-biased: a quieter return crosses later, stepping by whole samples while
+        the peak barely moves. Holding ``r`` constant then meant cancelling that step
+        against a project-wide offset taken from whichever capture was recorded first,
+        which silently made that one capture's measurement the timebase for every later
+        one. A first capture whose blips disagreed (see ``blip_delays``) put it 129
+        samples out, and every later capture was told *it* had drifted.
 
         Only done when a loopback is in use. The amp return carries the tone stack's
-        genuine knob-dependent group delay, which the model is supposed to learn; taking
-        that out per capture would be correcting away real amp behaviour, which is worse
-        than leaving the jitter in.
+        knob-dependent group delay, which the model is supposed to learn; removing that
+        per capture would correct away real amp behaviour.
 
-        What the sub-sample part is for, measured rather than assumed: while the
-        interface's clock stays put there is no drift at all (52 route tests on an iD44
-        read the same offset to sd 0.0000). Re-clocking it is what moves the phase --
-        taking the device to 44.1 kHz and back to 48 kHz shifted the round trip by 0.48
-        samples while the integer delay stayed at 8442, invisible to any whole-sample
-        measurement. A project captured over several days crosses clock epochs whenever
-        another application touches the interface, and each capture now measures its own.
+        What the sub-sample part is for, measured rather than assumed: while the clock
+        stays put there is no drift (52 route tests on an iD44, sd 0.0000). Re-clocking
+        moves the phase -- 44.1 kHz and back to 48 shifted the round trip 0.48 samples
+        while the integer delay stayed at 8442, invisible to any whole-sample measure. A
+        project captured over days crosses clock epochs whenever another application
+        touches the interface, and each capture now measures its own.
         """
         if not loopback_used or latency.peak_delay is None:
             return latency.delay, 0.0
@@ -1053,20 +1016,18 @@ class CaptureSession:
 
         The delay comes from data.json, which is what the WAV on disk is labelled with.
         Everything else is re-measured from the recording the capture kept, through
-        :func:`measure_from_raw` -- the same detection a live capture runs.
+        :func:`measure_from_raw`.
 
-        Reconstructing rather than inventing matters. This used to fabricate a
-        ``LatencyResult`` from the recorded delay alone, which left the restored QA with
-        no ``peak_delay``, no ``blip_delays`` and no ``subsample_shift`` -- so a capture
-        that had been sub-sample aligned came back looking like one that never was, and
-        anything reading the QA afterwards (the audit especially) measured it against the
-        wrong reference and called a healthy capture misaligned.
+        This used to fabricate a ``LatencyResult`` from the delay alone, leaving the
+        restored QA with no ``peak_delay``, ``blip_delays`` or ``subsample_shift`` -- so a
+        sub-sample aligned capture came back looking like one that never was, and the
+        audit, reading a shift of zero where a real one had been applied, called a
+        healthy capture misaligned.
 
-        The shift is derived from the delay the file carries and its own measured peak,
-        which reproduces exactly the shift applied when it was written, provided the
-        project's lead has not moved -- and it cannot, being fixed for the life of the
-        project. A shift that comes out past the half-sample residue it is defined as
-        means it has moved anyway, so that is reported rather than recorded.
+        The shift is derived from that delay and the capture's own measured peak, which
+        reproduces what was applied when it was written as long as the project's lead has
+        not moved. One landing past the half-sample residue it is defined as means it has,
+        so that is reported rather than recorded.
 
         ``captured_at`` is stamped now, since data.json records neither it nor QA.
         Persists the project and data.json once at the end. Returns a note per entry.
@@ -1088,9 +1049,8 @@ class CaptureSession:
             try:
                 latency = measure_from_raw(self.project, self.project_dir, entry.y_path)
             except Exception as exc:
-                # No recording kept -- a capture from before captures_raw/. The delay is
-                # still trustworthy (data.json proves it was measured), so it is restored
-                # on that alone and the QA simply has less in it.
+                # Nothing kept to measure. data.json proves the delay was measured once,
+                # so the entry is restored on that alone with less in its QA.
                 latency = _LatencyResult(
                     delay=delay,
                     detected=delay is not None,

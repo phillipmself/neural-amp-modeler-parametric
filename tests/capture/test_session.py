@@ -856,12 +856,9 @@ class _DriftingRecorder(_FakeRecorder):
 
 class _GlitchedBlipRecorder(_DriftingRecorder):
     """
-    A rig that drops samples during the count-in, so the second timing blip comes back
-    at a different delay from the first and much quieter.
-
-    This is the real fault behind the bug these tests exist for: a capture whose blips
-    landed 129 samples apart produced a delay measured off one blip and a peak measured
-    off the other, and nothing caught it.
+    A rig that drops samples during the count-in, so the second blip comes back later and
+    much quieter -- the real fault behind these tests: blips 129 samples apart gave a
+    delay measured off one and a peak off the other, and nothing caught it.
     """
 
     def __init__(self, delay: int, jump: int = 130, survives: float = 0.02, **kwargs):
@@ -887,9 +884,8 @@ class _GlitchedBlipRecorder(_DriftingRecorder):
 
 def _timebase(entry) -> float:
     """
-    Where a written capture actually sits: the delay it is labelled with, minus the
-    shift that was applied to it. Two captures of the same rig are mutually aligned
-    exactly when this tracks the rig's true latency one-for-one.
+    Where a written capture sits: its label less the shift applied to it. Two captures of
+    the same rig are aligned exactly when this tracks the rig's true latency one-for-one.
     """
     return entry.delay - (entry.qa.subsample_shift or 0.0)
 
@@ -921,10 +917,9 @@ def test_captures_share_a_timebase_without_sharing_any_state(tmp_path):
 
 
 def test_a_captures_alignment_does_not_depend_on_what_was_captured_before(tmp_path):
-    # The regression this whole change is for. A capture whose blips disagree used to
-    # define the project's timebase, and every later capture was then shifted onto it --
-    # so one bad measurement silently moved every good one that followed. A capture's
-    # alignment must now depend on nothing but its own recording.
+    # The regression this change is for: a capture whose blips disagree used to define the
+    # project's timebase, so one bad measurement silently moved every good one after it.
+    # Alignment must now depend on nothing but the capture's own recording.
     def timebase_of_second_entry(directory, first_recorder) -> float:
         project = _load_project(directory)
         _enable_loopback(project)
@@ -998,10 +993,9 @@ def test_no_correction_without_a_loopback(tmp_path):
 
 
 def test_a_legacy_project_keeps_the_timebase_its_captures_were_written_against(tmp_path):
-    # A project part-captured before the timebase became stateless has captures already
-    # written against its own recorded offset. Finishing it has to reproduce that offset,
-    # or the captures made before and after the upgrade land on timebases that differ by
-    # (reference - lead) samples -- the per-capture phase error alignment exists to remove.
+    # A project part-captured before the timebase became stateless must reproduce its own
+    # recorded offset, or captures from before and after the upgrade land (reference-lead)
+    # samples apart -- the phase error alignment exists to remove.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1024,9 +1018,8 @@ def test_a_legacy_project_keeps_the_timebase_its_captures_were_written_against(t
 
 
 def test_a_poisoned_legacy_timebase_is_refused_before_anything_is_recorded(tmp_path):
-    # The reference the original fault wrote was 129 samples, taken from a first capture
-    # whose two timing blips disagreed. Reproducing it would spread that one bad
-    # measurement into every remaining capture, which is the failure this replaced.
+    # The original fault wrote 129 samples, from a first capture whose blips disagreed.
+    # Reproducing it would spread that one bad measurement into every remaining capture.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1089,11 +1082,10 @@ def test_an_unusable_reference_describing_no_captures_is_dropped_not_refused(tmp
 
 
 def test_a_recorded_lead_survives_having_no_captures_right_now(tmp_path):
-    # The hazard the old release-on-empty behaviour created. Regenerating the plan with a
-    # different seed renames every entry, so the capture files stop matching any planned
-    # y_path and the project reads as empty -- releasing the lead there and taking it back
-    # when the old seed returns would strand whatever was captured in between on a
-    # different timebase, with nothing recording that it happened.
+    # The hazard of releasing on empty: regenerating with a different seed renames every
+    # entry, so the files stop matching any planned y_path and the project reads as empty.
+    # Releasing there and taking it back when the old seed returns would strand whatever
+    # was captured in between on a different timebase, silently.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1112,11 +1104,10 @@ def test_a_recorded_lead_survives_having_no_captures_right_now(tmp_path):
 
 
 def test_captures_made_while_entries_are_pending_join_the_recorded_timebase(tmp_path):
-    # The sequence the plan-regeneration path actually produces: the lead is carried
-    # forward, the capture files are on disk but their entries are pending (not yet
-    # re-imported), and the user captures something new before accepting the offer. The
-    # new capture has to land on the same timebase as the files waiting to be imported,
-    # or importing them afterwards mixes two timebases in one project.
+    # What plan regeneration produces: the lead carried forward, files on disk but their
+    # entries pending, and a new capture made before the restore offer is accepted. It has
+    # to land on the same timebase as the files waiting to be imported, or importing them
+    # afterwards mixes two timebases in one project.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1219,11 +1210,10 @@ def test_clearing_captures_deletes_the_files_and_the_timebase(tmp_path):
 
 
 def test_a_timebase_survives_its_captures_being_pending_pre_recovery(tmp_path):
-    # Regenerating the plan leaves entries pending while their WAVs stay on disk, until
-    # the user accepts the offer to restore them. Reading only the statuses in that window
-    # released the timebase and let the next capture be made against a different one --
-    # which is how a real project ended up with two captures on one timebase and a third
-    # on another, with nothing left to detect it.
+    # Regenerating the plan leaves entries pending while their WAVs stay on disk. Reading
+    # only the statuses in that window released the timebase and let the next capture be
+    # made against a different one -- which is how a real project ended up with two
+    # captures on one timebase and a third on another, undetectably.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1248,11 +1238,9 @@ def test_a_timebase_survives_its_captures_being_pending_pre_recovery(tmp_path):
 
 
 def test_clear_captures_reaches_a_pending_entry_whose_file_is_still_on_disk(tmp_path):
-    # The refusal above tells the user to clear captures and try again. That has to
-    # actually be possible from the same pending-but-file-present state: a pending entry
-    # whose WAV survives on disk is what has_captures() (and so timebase_problem()) is
-    # keying off of, so clear_captures() has to reach it too, or the fix this refusal
-    # points at is a no-op and the project is stuck.
+    # The refusal above says to clear captures and retry, so that must work from the same
+    # pending-but-file-present state: a surviving WAV is what has_captures() keys off, so
+    # clear_captures() has to reach it too or the fix it points at is a no-op.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1277,10 +1265,9 @@ def test_clear_captures_reaches_a_pending_entry_whose_file_is_still_on_disk(tmp_
 
 
 def test_audit_finds_a_misaligned_capture_without_any_stored_timing(tmp_path):
-    # The check that works when everything else has been lost. A project whose plan was
-    # regenerated and whose files were restored from disk has no measured QA left, so
-    # nothing in the project file can say whether its captures agree -- but the raw
-    # recordings can, and they cannot go stale.
+    # The check that works when everything else is lost: a project whose plan was
+    # regenerated has no measured QA left, so nothing in the project file can say whether
+    # its captures agree -- but the raw recordings can, and they cannot go stale.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1360,10 +1347,9 @@ def _put_set_on_a_larger_lead(project, by: float) -> None:
 
 
 def test_a_uniformly_offset_set_is_reported_as_one_fact_not_as_disagreement(tmp_path):
-    # The real project this came from: three captures written under an older lead, all
-    # agreeing with each other to 0.000000 samples, every one of them reported as sitting
-    # "away from the rest of this project's captures" -- away from captures it matched
-    # exactly. A set that agrees with itself has one thing wrong with it, not three.
+    # The real project this came from: three captures on an older lead, agreeing with each
+    # other to 0.000000 samples, every one reported as "away from the rest" -- away from
+    # captures it matched exactly. Such a set has one thing wrong with it, not three.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)
@@ -1443,8 +1429,8 @@ def test_the_preamble_layout_is_read_from_the_signal_not_from_constants(tmp_path
 
 
 def test_a_changed_preamble_needs_no_version_gate(tmp_path):
-    # The point of reading the layout back: blips somewhere else, more of them, and at a
-    # different amplitude is not a migration, because the signal says where they are.
+    # The point of reading the layout back: blips elsewhere, more of them, at another
+    # amplitude is not a migration, because the signal says where they are.
     playback, n_pre, _PP = _played(blips=(0.2, 0.9, 1.7), amplitude=0.4)
     read = _PP.from_playback(playback, n_pre, _RATE)
 
@@ -1456,10 +1442,9 @@ def test_a_changed_preamble_needs_no_version_gate(tmp_path):
 
 
 def test_a_silent_second_half_yields_one_reading_and_no_false_disagreement(tmp_path):
-    # The case that rules out splitting the preamble blindly in two: a preamble whose
-    # second half carries nothing would have had noise correlated against silence and
-    # reported as a capture whose blips disagree. Reading the layout instead simply finds
-    # one impulse, so there is nothing to compare and nothing is claimed.
+    # Why the preamble is not split blindly in two: a second half carrying nothing would
+    # correlate noise against silence and report the capture's blips as disagreeing.
+    # Reading the layout finds one impulse, so there is nothing to compare and none is.
     playback, n_pre, _PP = _played(blips=(0.5,))
     read = _PP.from_playback(playback, n_pre, _RATE)
 
@@ -1505,12 +1490,10 @@ def test_audit_measures_against_the_preamble_the_capture_was_played(tmp_path):
 
 
 def test_recovery_re_measures_instead_of_inventing_a_result(tmp_path):
-    # Recovery used to fabricate a LatencyResult from data.json's delay, which left the
-    # restored QA with no peak_delay, no blip_delays and no subsample_shift -- so a
-    # capture that had been sub-sample aligned came back looking like one that never was,
-    # and the audit then measured it against the wrong reference and called a healthy
-    # capture misaligned. Detection is now one path, so what comes back matches what the
-    # capture recorded.
+    # Recovery used to fabricate a LatencyResult from data.json's delay, leaving the
+    # restored QA with no peak_delay, blip_delays or subsample_shift -- so an aligned
+    # capture came back looking like one that never was, and the audit called it
+    # misaligned. Detection is one path now, so recovery matches what the capture wrote.
     project_dir = _make_project_dir(tmp_path)
     project = _load_project(project_dir)
     _enable_loopback(project)

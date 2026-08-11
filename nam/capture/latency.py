@@ -83,8 +83,8 @@ class BlipPreamble:
 
     def as_played(self) -> "PlayedPreamble":
         """
-        This preamble as measurement sees it. Nothing measures a ``BlipPreamble``
-        directly: it says what to play, and what was played is what gets measured.
+        This preamble as measurement sees it. A ``BlipPreamble`` says what to play;
+        what was played is what gets measured.
         """
         return PlayedPreamble.from_playback(
             self.render(), self.n_samples, self.sample_rate
@@ -93,14 +93,12 @@ class BlipPreamble:
 
 def blip_locations_in(played: _np.ndarray) -> tuple[int, ...]:
     """
-    Where a played preamble actually puts its impulses, read off the signal itself.
+    Where a played preamble puts its impulses, read off the signal itself.
 
-    The preamble is synthesized, so this reads a clean noiseless signal rather than a
-    return: the impulses are exact and stand alone against digital silence, which is why
-    a plain threshold is enough here and nothing like it would do on a recording.
-
-    Adjacent samples are treated as one impulse, so a future preamble that shapes its
-    blips instead of using bare samples still reports one location each.
+    A plain threshold is enough because the preamble is synthesized: exact impulses
+    against digital silence, nothing like the return it will be looked for in. Adjacent
+    samples count as one impulse, so a preamble that shapes its blips still reports one
+    location each.
     """
     played = _np.abs(_np.asarray(played, dtype=_np.float64))
     if not len(played) or played.max() <= 0.0:
@@ -121,19 +119,12 @@ def blip_locations_in(played: _np.ndarray) -> tuple[int, ...]:
 @_dataclass(frozen=True)
 class PlayedPreamble:
     """
-    A preamble described by the signal that was actually played, rather than by this
-    version's constants.
+    A preamble described by the signal that was played, not by this version's constants.
+    The only thing :func:`measure_delay` measures.
 
-    Same interface as :class:`BlipPreamble` as far as measurement is concerned, and it is
-    what :func:`measure_delay` is given in both places it is called. The difference is
-    where the layout comes from: a recording made under a preamble that has since changed
-    is still measured against the preamble *it* was played with, because that signal is
-    kept in ``captures_raw/`` and read back. Nothing here has to be gated on a project
-    version, and a preamble that changes its blip count, timing or amplitude -- or stops
-    using bare impulses -- needs no migration.
-
-    Built at capture time too, from the freshly rendered playback, so the path that
-    measures old recordings is the same one every capture already exercises.
+    Every capture keeps its playback in ``captures_raw/``, so a recording made under a
+    preamble that has since changed is still measured against its own: blip count,
+    timing and amplitude can move, with no migration and no project-version gate.
     """
 
     sample_rate: int
@@ -143,8 +134,8 @@ class PlayedPreamble:
 
     @property
     def blip_section_samples(self) -> int:
-        # The whole preamble. Its trailing gap is silence, which costs the scan nothing
-        # and saves having to guess where a future preamble would put the boundary.
+        # The whole preamble: its trailing gap is silence, so scanning it costs nothing
+        # and saves guessing where a future preamble would put the boundary.
         return self.n_samples
 
     @classmethod
@@ -152,9 +143,8 @@ class PlayedPreamble:
         cls, played: _np.ndarray, n_samples: int, sample_rate: int
     ) -> "PlayedPreamble":
         """
-        Read the layout from the first ``n_samples`` of a playback -- the preamble as
-        played. ``n_samples`` is recorded per capture in the raw manifest, so it does not
-        have to be inferred.
+        Read the layout from the first ``n_samples`` of a playback. The raw manifest
+        records ``n_samples`` per capture, so it is never inferred.
         """
         preamble = _np.asarray(played)[:n_samples]
         locations = blip_locations_in(preamble)
@@ -162,9 +152,8 @@ class PlayedPreamble:
             raise ValueError("No impulses found in the played preamble")
         first = locations[0]
         # The run-up to the first impulse is silent in any preamble worth the name, so
-        # its latter half is a noise-floor window without assuming where it sits. For the
-        # preamble this shipped with, this lands on exactly the interval its constants
-        # name, so nothing about the measurement moves.
+        # its latter half is a noise window that assumes nothing about where it sits --
+        # and lands on exactly the interval this version's constants name.
         return cls(
             sample_rate=int(sample_rate),
             n_samples=int(n_samples),
@@ -188,9 +177,6 @@ class PlayedPreamble:
         )
 
 
-# Either description of a preamble measures the same way: the layout is read through
-# the same few attributes whether it came from this version's constants or from the
-# signal that was actually played.
 _Preamble = _Union[BlipPreamble, PlayedPreamble]
 
 
@@ -205,11 +191,10 @@ class LatencyResult:
     # fractional part: the two are different estimators of the same arrival, and this
     # is the one the capture timebase is built from.
     peak_delay: _Optional[float] = None
-    # What each blip said on its own, before they were averaged. Kept so a capture that
-    # trips ``disagreement_too_high`` can show the user the two numbers rather than an
-    # unexplained complaint -- one blip arriving at the wrong time is a specific,
-    # recognisable fault (a stream glitch during the preamble) and the pair of readings
-    # is what makes it recognisable.
+    # What each blip said before they were averaged. Kept so a capture tripping
+    # ``disagreement_too_high`` can show the numbers rather than an unexplained complaint:
+    # one blip arriving late is a specific fault (a stream glitch during the preamble),
+    # and the pair of readings is what makes it recognisable.
     blip_delays: tuple[int, ...] = ()
 
     @property

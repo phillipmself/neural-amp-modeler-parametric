@@ -615,9 +615,8 @@ def test_regenerate_plan_keeps_the_projects_recorded_timebase(
     _qapp, tmp_path, monkeypatch
 ):
     # Regenerating rebuilds the project file from the plan, but the capture WAVs survive
-    # it and are re-imported straight afterwards -- so the timebase they were written
-    # against has to survive it too. Dropping it left the re-imported files on one lead
-    # and every later capture on the constant, with nothing recording the difference.
+    # and are re-imported straight after, so the timebase they were written against must
+    # survive too. Dropping it left them on one lead and later captures on the constant.
     monkeypatch.setattr(
         _MainWindow_module._QMessageBox, "information", lambda *a, **k: None
     )
@@ -843,10 +842,9 @@ def test_clear_captures_button_resets_the_project(_qapp, tmp_path, monkeypatch):
 def test_clear_captures_button_reaches_a_pending_entry_whose_file_survives(
     _qapp, tmp_path, monkeypatch
 ):
-    # The exact deadlock this guards against: regenerating the plan (or declining the
-    # offer to restore) leaves an entry pending with its WAV still on disk. The refusal
-    # to capture names this button as the fix, so it must not itself say "Nothing to
-    # clear" and leave the project stuck.
+    # The deadlock this guards: regenerating the plan (or declining the restore offer)
+    # leaves an entry pending with its WAV on disk. The refusal names this button as the
+    # fix, so it must not answer "Nothing to clear" and leave the project stuck.
     window, project, entry = _project_with_captures(tmp_path, _qapp)
     project.alignment_reference = 129.0
     entry.status = "pending"

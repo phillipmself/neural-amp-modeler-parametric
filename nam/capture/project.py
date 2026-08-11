@@ -206,14 +206,12 @@ class QAModel(_BaseModel):
     # it is the rounding residue of the delay label. ``None`` when no correction was
     # applied.
     subsample_shift: _Optional[float] = None
-    # Sub-sample position of the loopback blip response's energy peak: the measurement
-    # the delay label and the shift are both derived from. Kept because a timing fault
-    # is only diagnosable after the fact if the number the timebase was built from was
-    # written down at the time.
+    # Sub-sample position of the loopback blip response's energy peak: what the delay
+    # label and the shift are both derived from. A timing fault is only diagnosable after
+    # the fact if the number the timebase was built from was written down at the time.
     peak_delay: _Optional[float] = None
-    # What each timing blip read on its own. Two numbers that disagree mean a dropout
-    # during the count-in; a capture that shows it is not trustworthy no matter how
-    # ordinary its other fields look.
+    # What each timing blip read on its own. Two that disagree mean a dropout during the
+    # count-in, and such a capture is untrustworthy however ordinary its other fields look.
     blip_delays: list[int] = _Field(default_factory=list)
     messages: list[str] = _Field(default_factory=list)
 
@@ -260,30 +258,21 @@ class CaptureProject(_BaseModel):
     include_initial_corners: bool = False
     # The lead this project's captures are labelled against, when it is not the current
     # constant. Absent for anything captured under the stateless timebase, which is the
-    # normal case; present for a project captured before it, and for one that has since
-    # had that lead measured back out of its own recordings and recorded here.
+    # normal case; present for a project captured before it.
     #
-    # It used to be seeded from whichever capture was recorded first and every later
-    # capture was then shifted to match it -- so one bad measurement silently became the
-    # timebase for the whole project, unchecked. Captures now derive their timebase from
-    # their own loopback blip peak (see CaptureSession._alignment) and share nothing.
-    # But a project part-captured under the old scheme still has captures written against
-    # this offset, and resuming it with a different one would leave the two groups a
-    # fraction of a sample (or worse) apart -- exactly the per-capture phase error the
-    # alignment exists to remove. So for those projects it is read back as the alignment
-    # lead, which reproduces their existing timebase exactly and lets them be finished
-    # without recapturing anything.
+    # It used to be seeded from whichever capture was recorded first, and every later one
+    # shifted to match -- so a single bad measurement silently became the whole project's
+    # timebase, unchecked. Captures now derive theirs from their own loopback blip peak
+    # (see CaptureSession._alignment) and share nothing. But a project part-captured under
+    # the old scheme has captures written against this offset, and resuming it with a
+    # different one would leave the two groups a fraction of a sample (or worse) apart, so
+    # it is read back as the alignment lead and finished without recapturing anything.
     #
-    # No capture ever measures a value in here: it is set only by carrying it forward
-    # when the plan is regenerated, and by the user accepting the offer to adopt a lead
-    # the audit measured from the captures themselves (see session.adoptable_lead) --
-    # which is the repair for a project whose captures kept their timebase while the
-    # project file lost it. Once present it applies to every capture unconditionally, and
-    # is released only by clear_captures. See session.alignment_lead for why that must not
-    # depend on whether the project currently has captures.
-    #
-    # See CaptureSession._alignment_lead, which also rejects a value too large to be a
-    # converter's timing offset -- that is what a poisoned reference looks like.
+    # No capture ever measures a value in here; it survives only by being carried forward
+    # when the plan is regenerated. Once present it applies unconditionally and is released
+    # only by clear_captures -- see session.alignment_lead for why that must not depend on
+    # whether the project currently has captures, and CaptureSession._alignment_lead for
+    # the rejection of a value too large to be a converter's offset.
     alignment_reference: _Optional[float] = None
     # The capture app version this project was created under, stamped once at creation and
     # carried forward unchanged (including when the plan is regenerated) -- it dates the
@@ -469,13 +458,11 @@ def find_clearable_entries(
     Entries :func:`clear_captures` would touch: every entry recorded as captured, plus
     any pending entry whose WAV is still on disk.
 
-    That second group matters: regenerating the plan resets a captured entry's status to
-    pending but leaves its WAV in place, and until the user accepts or declines the offer
-    to restore it (see :func:`find_recoverable_entries`) the entry is pending while the
-    file -- and whatever timebase it was written against -- is still live. Reporting only
-    ``captured_entries()`` here would call a project "nothing to clear" while it still had
-    a file sitting on a timebase nothing else can now see, in exactly the state a caller
-    reaches this function to get out of.
+    That second group matters. Regenerating the plan resets a captured entry to pending
+    but leaves its WAV, and until the user accepts or declines the offer to restore it
+    (see :func:`find_recoverable_entries`) the file -- and the timebase it was written
+    against -- is still live. Reporting only ``captured_entries()`` called such a project
+    "nothing to clear" in exactly the state a caller comes here to get out of.
     """
     project_dir = _Path(project_dir)
     return [

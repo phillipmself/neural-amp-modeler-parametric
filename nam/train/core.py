@@ -443,15 +443,12 @@ def _calibrate_latency_v_all(
         triggered = _np.where(_np.abs(scan) > trigger_threshold)[0]
         return None if len(triggered) == 0 else int(triggered[0]) - lookahead
 
-    # Each blip measured on its own, which is what the ensemble disagreement check
-    # below compares. The recommended delay still comes from the average of the scans
-    # (that is the noise-robust estimate), but averaging *first* leaves exactly one
-    # number, and a range over one number is always zero -- so feeding that to the
-    # check made it structurally unable to fire, however far apart the blips actually
-    # landed. The blips travel the same chain a second apart, so a sound measurement
-    # reads the same delay from each; when they disagree the average is a blend of two
-    # different arrival times and the calibration is not trustworthy. This is the only
-    # signal that says so.
+    # Each blip on its own, which is what the ensemble disagreement check compares. The
+    # recommended delay still comes from the averaged scans (the noise-robust estimate),
+    # but averaging *first* leaves one number, and a range over one number is always zero
+    # -- so the check could never fire however far apart the blips landed. They travel the
+    # same chain a second apart, so a sound measurement reads the same delay from each;
+    # when they disagree the average blends two arrival times and cannot be trusted.
     delays = [d for d in map(first_crossing, y_scans) if d is not None]
 
     y_scan_average = _np.mean(_np.stack(y_scans), axis=0)

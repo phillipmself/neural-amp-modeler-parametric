@@ -13,17 +13,15 @@ sounddevice, the training stack) that the desktop app defers until needed.
 # a project is created and never changed afterwards, so a project always says which
 # version's rules it started under.
 #
-# Bump this when the rules change, not merely when the code does -- 1.2.0 is where each
-# capture began deriving its timebase from its own loopback blip peak instead of sharing
-# one measured offset across the project.
+# Bump when the rules change, not merely when the code does -- 1.2.0 is where each capture
+# began deriving its timebase from its own loopback blip peak instead of sharing one
+# offset across the project.
 #
-# It dates a project; it does not describe its captures. A project part-captured across
-# a rules change keeps the stamp it was created under while holding captures made under
-# both, so this cannot say which timebase any given capture used and must not be used to
-# decide. What can say is the project's ``alignment_reference``, a capture's
-# ``qa.peak_delay``, and above all ``captures_raw/``, which can be re-measured and cannot
-# go stale (see ``nam.capture.session.audit_captures``). Compare as parsed numbers if it
-# is ever compared at all: as strings, "1.10.0" sorts below "1.2.0".
+# It dates a project; it does not describe its captures. One part-captured across a rules
+# change keeps its original stamp while holding captures from both sides, so nothing may
+# decide a timebase from it -- ``captures_raw/`` can be re-measured and cannot go stale
+# (see ``nam.capture.session.measure_from_raw``). Parse it if it is ever compared: as
+# strings, "1.10.0" sorts below "1.2.0".
 CAPTURE_APP_VERSION = "1.2.0"
 
 # The version raw recordings (``captures_raw/``) started being saved in. Fixed forever at
