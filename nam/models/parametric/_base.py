@@ -61,6 +61,16 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         self._warned_uncompilable_device = False
 
     @property
+    def supports_param_trajectory(self) -> bool:
+        """Whether ``forward`` accepts a per-sample ``(B, T, P)`` control trajectory.
+
+        False for nets that condition on the control vector as a whole rather than
+        sample-by-sample -- a net that generates its weights from the controls has no
+        meaning to give a value that changes within one forward.
+        """
+        return False
+
+    @property
     def requires_uniform_batch_params(self) -> bool:
         """Whether a batched ``params`` must hold one setting repeated down the batch.
 
@@ -177,9 +187,10 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         raw = _torch.as_tensor(
             raw, dtype=param_mins.dtype, device=param_mins.device
         )
-        if raw.ndim not in (1, 2):
+        if raw.ndim not in (1, 2, 3):
             raise ValueError(
-                f"Expected raw params to have shape (P,) or (B, P); got {tuple(raw.shape)}"
+                "Expected raw params to have shape (P,), (B, P) or (B, T, P); got "
+                f"{tuple(raw.shape)}"
             )
         if raw.shape[-1] != self.param_dim:
             raise ValueError(
@@ -241,10 +252,21 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         batched settings must align 1:1 with batched audio. The (P,) form is the only way one
         setting spans multiple clips. This contract is what lets a subclass that generates
         per-sample weights rely on strict alignment instead of implicit broadcasting.
+
+        Nets that report ``supports_param_trajectory`` additionally accept
+
+        - x (B, L), params (B, L, P) -> y (B, L')  controls that move within the clip,
+
+        which is how a control being turned at runtime is represented. The trajectory is
+        strictly aligned: no broadcasting, and its length must equal the input's. Under
+        ``pad_start`` the receptive-field history takes the trajectory's first frame, since
+        the control was sitting at its starting value before the clip began.
         """
         pad_start = self.pad_start_default if pad_start is None else pad_start
         scalar_input = x.ndim == 1
         params = _torch.as_tensor(params)
+        if params.ndim == 3:
+            return self._forward_trajectory(x, params, pad_start)
         if params.ndim not in (1, 2):
             raise ValueError(
                 f"Expected params to have shape (P,) or (B, P); got {tuple(params.shape)}"
@@ -271,6 +293,60 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         if scalar_input and params.ndim == 1:
             y = y[0]
         return y
+
+    def _forward_trajectory(
+        self, x: _torch.Tensor, params: _torch.Tensor, pad_start: bool
+    ) -> _torch.Tensor:
+        if not self.supports_param_trajectory:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not accept a (B, T, P) param trajectory"
+            )
+        if x.ndim != 2:
+            raise ValueError(
+                f"A param trajectory requires a batched (B, L) input; got {tuple(x.shape)}"
+            )
+        if x.shape[0] != params.shape[0]:
+            raise ValueError(
+                f"Input batch size {x.shape[0]} must match params batch size "
+                f"{params.shape[0]}"
+            )
+        if x.shape[1] != params.shape[1]:
+            raise ValueError(
+                f"Param trajectory length {params.shape[1]} must match the input length "
+                f"{x.shape[1]}"
+            )
+        if pad_start:
+            history = self.receptive_field - 1
+            x = _torch.cat((_torch.zeros((len(x), history)).to(x.device), x), dim=1)
+            params = _torch.cat(
+                (params[:, :1].expand(-1, history, -1), params), dim=1
+            )
+        if x.shape[1] < self.receptive_field:
+            raise ValueError(
+                f"Input has {x.shape[1]} samples, which is too few for this model with "
+                f"receptive field {self.receptive_field}!"
+            )
+        return self._forward_mps_safe(x, params=params)
+
+    def _forward_mps_safe(self, x: _torch.Tensor, **kwargs) -> _torch.Tensor:
+        # The stock fallback splits `x` into <=65,536-sample segments but forwards
+        # `kwargs` whole, which would pair every segment with the full-length trajectory.
+        # Only the trajectory case needs the extra handling; everything else is unchanged.
+        params = kwargs.get("params")
+        if (
+            not self._mps_65536_fallback
+            or not isinstance(params, _torch.Tensor)
+            or params.ndim != 3
+        ):
+            return super()._forward_mps_safe(x, **kwargs)
+        stride = 65_536 - (self.receptive_field - 1)
+        out_list = []
+        for i in range(0, x.shape[1], stride):
+            j = min(i + 65_536, x.shape[1])
+            out_list.append(self._forward(x[:, i:j], params=params[:, i:j]))
+            if j == x.shape[1]:
+                break
+        return _torch.cat(out_list, dim=self._mps_fallback_cat_dim)
 
     def _forward(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, x: _torch.Tensor, *, params: _torch.Tensor

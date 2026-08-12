@@ -13,6 +13,7 @@ the model's per-lag control sensitivity but not how that sum is distributed acro
 Anchoring silence pins the distribution as well.
 """
 
+import math as _math
 from collections.abc import Sequence as _Sequence
 from typing import Optional as _Optional
 
@@ -98,3 +99,114 @@ def anchor_output(
             dim=0,
         )
     return net(x, params, pad_start=False)
+
+
+def sample_param_trajectories(
+    param_specs: _Sequence[_ParamSpec],
+    n: int,
+    length: int,
+    sample_rate: float,
+    *,
+    min_ramp_seconds: float,
+    max_ramp_seconds: float,
+    rail_probability: float = 0.25,
+    device: _Optional[_torch.device] = None,
+    generator: _Optional[_torch.Generator] = None,
+) -> _torch.Tensor:
+    """
+    Draw ``n`` raw control trajectories of ``length`` samples, shaped ``(n, length, P)``.
+
+    Each trajectory models one control gesture as the runtime renders it: a single commit
+    instant at which every switch steps to its new index and every moving continuous
+    control begins a linear ramp of a shared duration. Switches step rather than blend
+    because a blended one-hot is a conditioning vector no model was trained on, which is
+    why the runtime excludes switch channels from its smoothing.
+
+    Trajectories are built in raw units and encoded per frame downstream. For a continuous
+    control the encoding is affine, so a raw-linear ramp is an encoded-linear one; for a
+    switch a raw index step encodes to a one-hot step at the same instant. Both match the
+    runtime, which ramps in the encoded domain.
+
+    The commit instant is drawn from ``[-ramp, length)`` rather than ``[0, length)``. A
+    ramp is longer than a short anchor window, so only a gesture that began before the
+    window opens can finish inside it -- which is the case where the settling tail, and
+    the slope discontinuity that ends the ramp, are scored.
+    """
+    if length < 1:
+        raise ValueError(f"length must be at least 1; got {length}")
+    if sample_rate <= 0.0:
+        raise ValueError(f"sample_rate must be positive; got {sample_rate}")
+    if not 0.0 < min_ramp_seconds <= max_ramp_seconds:
+        raise ValueError(
+            "Ramp durations must satisfy 0 < min_ramp_seconds <= max_ramp_seconds; got "
+            f"{min_ramp_seconds} and {max_ramp_seconds}"
+        )
+    if not 0.0 <= rail_probability <= 1.0:
+        raise ValueError(
+            f"rail_probability must be within [0, 1]; got {rail_probability}"
+        )
+
+    param_specs = tuple(param_specs)
+    start = _sample_endpoints(param_specs, n, rail_probability, device, generator)
+    end = _sample_endpoints(param_specs, n, rail_probability, device, generator)
+
+    def rand(*shape: int) -> _torch.Tensor:
+        return _torch.rand(shape, device=device, generator=generator)
+
+    # Hold a random non-empty subset of the controls still, so single-control moves are
+    # covered alongside the everything-at-once case.
+    held = rand(n, len(param_specs)) < 0.5
+    moved_index = _torch.randint(
+        len(param_specs), (n, 1), device=device, generator=generator
+    )
+    held.scatter_(1, moved_index, False)
+    end = _torch.where(held, start, end)
+
+    # Log-uniform: a gesture's slope spans orders of magnitude, and sampling the duration
+    # uniformly would put almost every draw at the slow end.
+    log_min, log_max = _math.log(min_ramp_seconds), _math.log(max_ramp_seconds)
+    ramp = _torch.exp(log_min + (log_max - log_min) * rand(n, 1)) * sample_rate
+    ramp = ramp.clamp(min=1.0)
+    commit = -ramp + (ramp + length) * rand(n, 1)
+
+    t = _torch.arange(length, device=device, dtype=ramp.dtype)[None, :]
+    fraction = ((t - commit) / ramp).clamp(0.0, 1.0)[:, :, None]
+    stepped = (t >= commit)[:, :, None]
+
+    is_switch = _torch.tensor(
+        [spec.type == "switch" for spec in param_specs], device=device
+    )[None, None, :]
+    return _torch.where(
+        is_switch,
+        _torch.where(stepped, end[:, None, :], start[:, None, :]),
+        start[:, None, :] + fraction * (end - start)[:, None, :],
+    )
+
+
+def _sample_endpoints(
+    param_specs: _Sequence[_ParamSpec],
+    n: int,
+    rail_probability: float,
+    device: _Optional[_torch.device],
+    generator: _Optional[_torch.Generator],
+) -> _torch.Tensor:
+    """Uniform draws, with continuous controls pulled onto a rail some of the time.
+
+    Users park knobs fully off and fully up far more often than uniform sampling would,
+    and the rails are where a model has the least capture data on both sides.
+    """
+    values = sample_raw_params(param_specs, n, device=device, generator=generator)
+    if rail_probability == 0.0:
+        return values
+    for i, spec in enumerate(param_specs):
+        if spec.type == "switch":
+            continue
+        on_rail = _torch.rand(n, device=device, generator=generator) < rail_probability
+        high = _torch.rand(n, device=device, generator=generator) < 0.5
+        rail = _torch.where(
+            high,
+            _torch.full((n,), spec.max, device=device),
+            _torch.full((n,), spec.min, device=device),
+        )
+        values[:, i] = _torch.where(on_rail, rail, values[:, i])
+    return values

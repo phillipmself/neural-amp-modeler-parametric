@@ -4,6 +4,8 @@ from pathlib import Path as _Path
 from time import time as _time
 from collections.abc import Sequence as _Sequence
 from typing import Optional as _Optional
+from typing import ClassVar as _ClassVar
+from typing import Tuple as _Tuple
 from warnings import warn as _warn
 
 import librosa as _librosa
@@ -28,6 +30,9 @@ from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric import ParametricDataset as _ParametricDataset
 from nam.models.parametric import ParametricNet as _ParametricNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import (
+    sample_param_trajectories as _sample_param_trajectories,
+)
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
@@ -431,6 +436,12 @@ class _SilenceAnchorConfig:
     batch_size: int = 8
     ny: int = 512
 
+    _EXTRA_FIELDS: _ClassVar[_Tuple[str, ...]] = ()
+
+    @classmethod
+    def _parse_extra(cls, config: dict) -> dict:
+        return {}
+
     @classmethod
     def from_config(cls, config: _Optional[dict]) -> "_Optional[_SilenceAnchorConfig]":
         if config is None:
@@ -439,7 +450,8 @@ class _SilenceAnchorConfig:
             raise ValueError(
                 f"Silence anchor config must be a mapping; got {type(config).__name__}"
             )
-        unknown = sorted(set(config) - {"weight", "batch_size", "ny"})
+        known = {"weight", "batch_size", "ny", *cls._EXTRA_FIELDS}
+        unknown = sorted(set(config) - known)
         if unknown:
             raise ValueError(
                 "Silence anchor config has unknown field(s): " + ", ".join(unknown)
@@ -450,6 +462,7 @@ class _SilenceAnchorConfig:
             weight=float(config["weight"]),
             batch_size=int(config.get("batch_size", cls.batch_size)),
             ny=int(config.get("ny", cls.ny)),
+            **cls._parse_extra(config),
         )
         if parsed.weight < 0.0:
             raise ValueError(f"Silence anchor weight must be >= 0; got {parsed.weight}")
@@ -463,9 +476,57 @@ class _SilenceAnchorConfig:
 
 
 @_dataclass
+class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
+    """
+    Settings for the moving-control silence anchor.
+
+    The ramp durations bracket what a user actually does, from a fast flick to a slow
+    sweep. The runtime's own smoothing ramp is 200 ms, which is longer than a short anchor
+    window; the sampler handles that by letting a gesture begin before the window opens.
+    """
+
+    min_ramp_seconds: float = 0.05
+    max_ramp_seconds: float = 2.0
+    rail_probability: float = 0.25
+
+    _EXTRA_FIELDS: _ClassVar[_Tuple[str, ...]] = (
+        "min_ramp_seconds",
+        "max_ramp_seconds",
+        "rail_probability",
+    )
+
+    @classmethod
+    def _parse_extra(cls, config: dict) -> dict:
+        parsed = {
+            "min_ramp_seconds": float(
+                config.get("min_ramp_seconds", cls.min_ramp_seconds)
+            ),
+            "max_ramp_seconds": float(
+                config.get("max_ramp_seconds", cls.max_ramp_seconds)
+            ),
+            "rail_probability": float(
+                config.get("rail_probability", cls.rail_probability)
+            ),
+        }
+        if not 0.0 < parsed["min_ramp_seconds"] <= parsed["max_ramp_seconds"]:
+            raise ValueError(
+                "Silence anchor ramp durations must satisfy "
+                "0 < min_ramp_seconds <= max_ramp_seconds; got "
+                f"{parsed['min_ramp_seconds']} and {parsed['max_ramp_seconds']}"
+            )
+        if not 0.0 <= parsed["rail_probability"] <= 1.0:
+            raise ValueError(
+                "Silence anchor rail_probability must be within [0, 1]; got "
+                f"{parsed['rail_probability']}"
+            )
+        return parsed
+
+
+@_dataclass
 class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
     silence_anchor: _Optional[_SilenceAnchorConfig] = None
+    silence_anchor_ramp: _Optional[_SilenceAnchorRampConfig] = None
 
     @classmethod
     def parse_config(cls, config):
@@ -473,6 +534,9 @@ class _ParametricLossConfig(_LossConfig):
         parsed["mel_weight"] = config.get("mel_weight")
         parsed["silence_anchor"] = _SilenceAnchorConfig.from_config(
             config.get("silence_anchor")
+        )
+        parsed["silence_anchor_ramp"] = _SilenceAnchorRampConfig.from_config(
+            config.get("silence_anchor_ramp")
         )
         return parsed
 
@@ -494,6 +558,16 @@ class _ParametricLightningModule(_LightningModule):
             ),
         )
         self._mel_mrstft = None
+        if self._loss_config.silence_anchor_ramp is not None and not (
+            isinstance(net, _ParametricNet) and net.supports_param_trajectory
+        ):
+            # Fail here rather than on the first training step: a net that conditions on
+            # the control vector as a whole has no meaning to give a control that moves
+            # within one forward, so the setting cannot be honoured at all.
+            raise ValueError(
+                "loss.silence_anchor_ramp requires a net that accepts a param "
+                f"trajectory; {type(net).__name__} does not"
+            )
         # Set via `set_capture_batch_samplers` once the dataloaders exist (see `main`).
         # `None` means "capture identity unavailable" -- `_EpochMetrics` then falls back
         # to single-level pooling over the whole split instead of a wrong two-level split.
@@ -537,14 +611,20 @@ class _ParametricLightningModule(_LightningModule):
                 self._loss_config.mel_weight,
                 self._mel_mrstft_loss(preds, targets),
             )
-        silence_anchor = self._loss_config.silence_anchor
-        # Training-only: the anchor is a regularizer on the model, not a measurement of
-        # held-out data, and computing it under validation would cost a forward per batch
-        # for a number that says nothing about the split.
-        if silence_anchor is not None and self.training:
-            loss_dict["Silence Anchor"] = _LossItem(
-                silence_anchor.weight, self._silence_anchor_loss(silence_anchor)
-            )
+        # Training-only: the anchors are regularizers on the model, not measurements of
+        # held-out data, and computing them under validation would cost a forward per
+        # batch for a number that says nothing about the split.
+        if self.training:
+            silence_anchor = self._loss_config.silence_anchor
+            if silence_anchor is not None:
+                loss_dict["Silence Anchor"] = _LossItem(
+                    silence_anchor.weight, self._silence_anchor_loss(silence_anchor)
+                )
+            ramp = self._loss_config.silence_anchor_ramp
+            if ramp is not None:
+                loss_dict["Silence Anchor Ramp"] = _LossItem(
+                    ramp.weight, self._silence_anchor_ramp_loss(ramp)
+                )
         return loss_dict
 
     def _silence_anchor_loss(
@@ -555,6 +635,29 @@ class _ParametricLightningModule(_LightningModule):
         params = _sample_raw_params(
             net.param_specs,
             config.batch_size,
+            device=next(net.parameters()).device,
+        )
+        return _anchor_output(net, params, config.ny).square().mean()
+
+    def _silence_anchor_ramp_loss(
+        self, config: _SilenceAnchorRampConfig
+    ) -> _torch.Tensor:
+        """Silence in, the controls travelling across the window, silence out."""
+        net = _get_parametric_net(self)
+        sample_rate = net.sample_rate
+        if sample_rate is None:
+            raise RuntimeError(
+                "silence_anchor_ramp needs the model sample rate to convert its ramp "
+                "durations to samples"
+            )
+        params = _sample_param_trajectories(
+            net.param_specs,
+            config.batch_size,
+            net.receptive_field - 1 + config.ny,
+            sample_rate,
+            min_ramp_seconds=config.min_ramp_seconds,
+            max_ramp_seconds=config.max_ramp_seconds,
+            rail_probability=config.rail_probability,
             device=next(net.parameters()).device,
         )
         return _anchor_output(net, params, config.ny).square().mean()

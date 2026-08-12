@@ -126,9 +126,19 @@ class ConcatWaveNet(_ParametricNet):
         # straight-line tensor work with nothing for dynamo to graph-break on.
         return True
 
+    @property
+    def supports_param_trajectory(self) -> bool:
+        # The encoded controls are ordinary input channels, so a value that moves within
+        # the window is just a channel that is not constant.
+        return True
+
     def _compilable_step(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
-        """Tile the encoded params across time, concatenate, run the inner WaveNet."""
-        p_t = p[:, :, None].expand(-1, -1, x.shape[1])
+        """Lay the encoded params out across time, concatenate, run the inner WaveNet."""
+        p_t = (
+            p.transpose(1, 2)
+            if p.ndim == 3
+            else p[:, :, None].expand(-1, -1, x.shape[1])
+        )
         return self._wavenet(_torch.cat([x[:, None, :], p_t], dim=1))
 
     def _run_conditioned(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
