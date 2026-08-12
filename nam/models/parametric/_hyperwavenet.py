@@ -141,6 +141,10 @@ class HyperWaveNet(_ParametricNet):
         self._uniform_batch_params_checked = False
 
     @property
+    def requires_uniform_batch_params(self) -> bool:
+        return self._uniform_batch_params
+
+    @property
     def supports_compiled_step(self) -> bool:
         # Worth more here than anywhere else: the generated deltas are ~100 tensors of a few
         # dozen elements each, so the step is dominated by launching kernels too small to pay

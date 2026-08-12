@@ -61,6 +61,16 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         self._warned_uncompilable_device = False
 
     @property
+    def requires_uniform_batch_params(self) -> bool:
+        """Whether a batched ``params`` must hold one setting repeated down the batch.
+
+        True only while a net is running under a promise that lets it apply one row's
+        setting to the whole batch. Callers that want a batch of *distinct* settings
+        (the silence anchors) must then evaluate the rows one at a time.
+        """
+        return False
+
+    @property
     def supports_compiled_step(self) -> bool:
         """Whether ``set_compiled`` has an inner forward it can hand to ``torch.compile``.
 

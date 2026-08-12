@@ -27,6 +27,8 @@ from nam.models.exportable import Exportable as _Exportable
 from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric import ParametricDataset as _ParametricDataset
 from nam.models.parametric import ParametricNet as _ParametricNet
+from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
 from nam.models.parametric import export_parametric as _export_parametric
@@ -415,13 +417,63 @@ def _bucket_means(loss_dict: dict) -> dict[str, _torch.Tensor]:
 
 
 @_dataclass
+class _SilenceAnchorConfig:
+    """
+    Settings for the silence-in / silence-out anchor terms.
+
+    ``ny`` is the number of scored output samples per anchor row. The net needs
+    ``receptive_field - 1`` samples of history on top of that, and for the shipping
+    ConcatWaveNet the receptive field is 6347, so the history dominates the cost at any
+    sane ``ny`` -- widening the window is nearly free while widening the batch is not.
+    """
+
+    weight: float
+    batch_size: int = 8
+    ny: int = 512
+
+    @classmethod
+    def from_config(cls, config: _Optional[dict]) -> "_Optional[_SilenceAnchorConfig]":
+        if config is None:
+            return None
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"Silence anchor config must be a mapping; got {type(config).__name__}"
+            )
+        unknown = sorted(set(config) - {"weight", "batch_size", "ny"})
+        if unknown:
+            raise ValueError(
+                "Silence anchor config has unknown field(s): " + ", ".join(unknown)
+            )
+        if "weight" not in config:
+            raise ValueError("Silence anchor config must define weight")
+        parsed = cls(
+            weight=float(config["weight"]),
+            batch_size=int(config.get("batch_size", cls.batch_size)),
+            ny=int(config.get("ny", cls.ny)),
+        )
+        if parsed.weight < 0.0:
+            raise ValueError(f"Silence anchor weight must be >= 0; got {parsed.weight}")
+        if parsed.batch_size < 1:
+            raise ValueError(
+                f"Silence anchor batch_size must be >= 1; got {parsed.batch_size}"
+            )
+        if parsed.ny < 1:
+            raise ValueError(f"Silence anchor ny must be >= 1; got {parsed.ny}")
+        return parsed
+
+
+@_dataclass
 class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
+    silence_anchor: _Optional[_SilenceAnchorConfig] = None
 
     @classmethod
     def parse_config(cls, config):
         parsed = super().parse_config(config)
         parsed["mel_weight"] = config.get("mel_weight")
+        parsed["silence_anchor"] = _SilenceAnchorConfig.from_config(
+            config.get("silence_anchor")
+        )
         return parsed
 
 
@@ -485,7 +537,27 @@ class _ParametricLightningModule(_LightningModule):
                 self._loss_config.mel_weight,
                 self._mel_mrstft_loss(preds, targets),
             )
+        silence_anchor = self._loss_config.silence_anchor
+        # Training-only: the anchor is a regularizer on the model, not a measurement of
+        # held-out data, and computing it under validation would cost a forward per batch
+        # for a number that says nothing about the split.
+        if silence_anchor is not None and self.training:
+            loss_dict["Silence Anchor"] = _LossItem(
+                silence_anchor.weight, self._silence_anchor_loss(silence_anchor)
+            )
         return loss_dict
+
+    def _silence_anchor_loss(
+        self, config: _SilenceAnchorConfig
+    ) -> _torch.Tensor:
+        """Silence in, a random control setting held across the window, silence out."""
+        net = _get_parametric_net(self)
+        params = _sample_raw_params(
+            net.param_specs,
+            config.batch_size,
+            device=next(net.parameters()).device,
+        )
+        return _anchor_output(net, params, config.ny).square().mean()
 
     def _mel_mrstft_loss(
         self, preds: _torch.Tensor, targets: _torch.Tensor
