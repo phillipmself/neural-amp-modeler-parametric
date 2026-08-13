@@ -313,6 +313,86 @@ def test_parametric_training_main_exports_baked_and_parametric_models(tmp_path):
     assert _torch.isfinite(y).all()
 
 
+def _tiny_film_model_config() -> dict:
+    return {
+        "net": {
+            "name": "FiLMWaveNet",
+            "config": {
+                "layers": [
+                    {
+                        "channels": 2,
+                        "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
+                        "kernel_sizes": [3, 3],
+                        "dilations": [1, 2],
+                        "activation": "Tanh",
+                        "activation_post_film": {
+                            "active": True,
+                            "shift": False,
+                            "groups": 1,
+                        },
+                    }
+                ],
+                "head": None,
+                "head_scale": 0.02,
+                "param_encoder": {
+                    "hidden_sizes": [4],
+                    "out_features": 3,
+                    "activation": "ReLU",
+                },
+                "params": [
+                    {
+                        "name": "gain",
+                        "min": 0.0,
+                        "max": 10.0,
+                        "default": 5.0,
+                        "type": "continuous",
+                    },
+                    {
+                        "name": "mode",
+                        "min": 0,
+                        "max": 2,
+                        "default": 1,
+                        "type": "switch",
+                        "enum_names": ["clean", "crunch", "lead"],
+                    },
+                ],
+            },
+        },
+        "loss": {"val_loss": "esr"},
+        "optimizer": {"lr": 0.01},
+        "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.99}},
+    }
+
+
+def test_film_wavenet_training_main_exports_a_parametric_model(tmp_path):
+    model_config = _tiny_film_model_config()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    _main(
+        data_config=_build_data_config(tmp_path, normalize=True),
+        model_config=model_config,
+        learning_config=_learning_config(),
+        outdir=run_dir,
+        no_show=True,
+        make_plots=False,
+    )
+
+    parametric = _load_json(run_dir / "model_parametric.nam")
+
+    assert parametric["architecture"] == "FiLMWaveNet"
+    assert parametric["config"]["param_encoder"]["out_features"] == 3
+    # Baking a fixed-setting snapshot is HyperWaveNet-only.
+    assert not (run_dir / "model.nam").exists()
+
+    # head_scale is a fixed (untrained) constant, so it moving is direct evidence the joint
+    # normalization was compensated for at export, and the final weight mirrors it.
+    raw_head_scale = model_config["net"]["config"]["head_scale"]
+    exported_head_scale = parametric["config"]["head_scale"]
+    assert exported_head_scale != _pytest.approx(raw_head_scale, rel=1e-3)
+    assert parametric["weights"][-1] == _pytest.approx(exported_head_scale)
+
+
 def test_parametric_training_without_normalization_skips_compensation(tmp_path):
     model_config = _tiny_model_config()
     data_config = _build_data_config(tmp_path, normalize=False)

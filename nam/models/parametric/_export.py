@@ -24,37 +24,34 @@ from ._base import ParametricNet as _ParametricNet
 from ._concat_wavenet import ConcatWaveNet as _ConcatWaveNet
 from ._dataset import ParametricDataset as _ParametricDataset
 from ._dataset import resolve_named_params as _resolve_named_params
+from ._film_wavenet import FiLMWaveNet as _FiLMWaveNet
 from ._hyperwavenet import HyperWaveNet as _HyperWaveNet
 
 _RawParams = _Mapping[str, _Any] | _Sequence[float] | _torch.Tensor
 _Settings = _Mapping[str, _RawParams] | _Sequence[tuple[str, _RawParams]]
 
 
-class _HyperWaveNetScaleOutputHook(_Dataset._ScaleOutputHook):
-    def __init__(self, *, scale: float, base_weight_count: int):
+class _ParametricScaleOutputHook(_Dataset._ScaleOutputHook):
+    """
+    Compensate joint output normalization on a parametric export.
+
+    Every architecture here wraps a stock WaveNet, so the compensation is the same in all
+    of them: scale ``head_scale`` in the config and the weight that mirrors it. They differ
+    only in *where* that mirror sits in the weight blob -- last for the nets that export one
+    WaveNet, and at the end of the template for HyperWaveNet, whose per-setting weights
+    follow it.
+    """
+
+    def __init__(self, *, scale: float, architecture: str, head_scale_index: int = -1):
         super().__init__(scale=scale)
-        if base_weight_count <= 0:
-            raise ValueError(
-                f"base_weight_count must be positive; got {base_weight_count}"
-            )
-        self._base_weight_count = base_weight_count
+        self._architecture = architecture
+        self._head_scale_index = head_scale_index
 
     def apply(self, model_dict: dict):
-        if model_dict["architecture"] != "HyperWaveNet":
+        if model_dict["architecture"] != self._architecture:
             return super().apply(model_dict)
         model_dict["config"]["head_scale"] *= self.scale
-        model_dict["weights"][self._base_weight_count - 1] *= self.scale
-        self._adjust_metadata_loudness(model_dict)
-        return model_dict
-
-
-class _ConcatWaveNetScaleOutputHook(_Dataset._ScaleOutputHook):
-    def apply(self, model_dict: dict):
-        if model_dict["architecture"] != "ConcatWaveNet":
-            return super().apply(model_dict)
-        # Same layout as stock WaveNet: head_scale in config, mirrored as the final weight.
-        model_dict["config"]["head_scale"] *= self.scale
-        model_dict["weights"][-1] *= self.scale
+        model_dict["weights"][self._head_scale_index] *= self.scale
         self._adjust_metadata_loudness(model_dict)
         return model_dict
 
@@ -210,12 +207,20 @@ def _make_parametric_scale_hook(
     model: _ParametricNet, scale: float
 ) -> _Dataset._ScaleOutputHook:
     if isinstance(model, _HyperWaveNet):
-        return _HyperWaveNetScaleOutputHook(
+        base_weight_count = len(model._template.export_weights())
+        if base_weight_count <= 0:
+            raise ValueError(
+                f"base_weight_count must be positive; got {base_weight_count}"
+            )
+        return _ParametricScaleOutputHook(
             scale=scale,
-            base_weight_count=len(model._template.export_weights()),
+            architecture="HyperWaveNet",
+            head_scale_index=base_weight_count - 1,
         )
     if isinstance(model, _ConcatWaveNet):
-        return _ConcatWaveNetScaleOutputHook(scale=scale)
+        return _ParametricScaleOutputHook(scale=scale, architecture="ConcatWaveNet")
+    if isinstance(model, _FiLMWaveNet):
+        return _ParametricScaleOutputHook(scale=scale, architecture="FiLMWaveNet")
     raise NotImplementedError(
         f"Output-scale compensation is not implemented for {type(model).__name__}"
     )

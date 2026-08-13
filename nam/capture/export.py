@@ -6,10 +6,11 @@ parametric trainer needs from the project file —
 
 * ``data.json``: rewritten after every successful capture (completed entries only)
   so the training config stays valid if the app closes mid-session.
-* ``model_concat.json`` / ``learning_concat.json`` and ``model_hyper.json`` /
-  ``learning_hyper.json``: ready-to-train ConcatWaveNet and HyperWaveNet model configs
-  with the project's knobs as their params, each with its own matching learning config
-  (the two architectures do not share learning settings).
+* ``model_concat.json`` / ``learning_concat.json``, ``model_hyper.json`` /
+  ``learning_hyper.json`` and ``model_film.json`` / ``learning_film.json``: ready-to-train
+  ConcatWaveNet, HyperWaveNet and FiLMWaveNet model configs with the project's knobs as
+  their params, each with its own matching learning config (the architectures do not share
+  learning settings).
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from typing import Optional as _Optional
 
 from .project import CONCAT_LEARNING_CONFIG_FILENAME
 from .project import CONCAT_MODEL_CONFIG_FILENAME
+from .project import FILM_LEARNING_CONFIG_FILENAME
+from .project import FILM_MODEL_CONFIG_FILENAME
 from .project import HYPER_LEARNING_CONFIG_FILENAME
 from .project import HYPER_MODEL_CONFIG_FILENAME
 from .project import CaptureProject
@@ -179,6 +182,25 @@ _WAVENET_HEAD: dict[str, _Any] = {"out_channels": 1, "kernel_size": 16, "bias": 
 _CONCAT_BASE_CHANNELS = 8
 _CONCAT_CHANNELS_PER_EXTRA_PARAM = 2
 
+# FiLMWaveNet also sees audio only: the controls reach the layers through FiLM, which is
+# 1x1 in time, so the layer arrays stay at the stock width no matter how many knobs the
+# project has. That is the whole cost argument for this architecture over ConcatWaveNet,
+# which has to widen to carry the control channels.
+_FILM_CHANNELS = 8
+# Modulating the bottleneck after the nonlinearity is the most expressive single site;
+# scale-only because the additive path is already the input mixin's job, and because a
+# control-derived shift is the one part of FiLM that a downstream dilated kernel still
+# straddles when a knob moves.
+_FILM_SITES = ("activation_post_film",)
+_FILM_ENCODER_HIDDEN_SIZES = [16]
+# Width of the FiLM condition, i.e. how many independent functions of the knobs the whole
+# network gets to share: every per-layer gain is a fixed linear combination of these, so at
+# the encoded-param width the 23 layers x 8 channels can only move as rescaled copies of one
+# curve per knob. Deliberately decoupled from the knob count -- what needs covering is the
+# channel response, not the front panel. The encoder runs once per control change and the
+# FiLM 1x1 is cached with it, so widening costs model size, not per-sample work.
+_FILM_ENCODER_OUT_FEATURES = 8
+
 # HyperWaveNet's template sees audio only -- the knobs act through the hypernetwork -- so
 # its layer array stays at the stock channels_8 width with input_size/condition_size 1.
 _HYPER_CHANNELS = 8
@@ -226,6 +248,45 @@ def build_concat_model_config(project: CaptureProject) -> dict[str, _Any]:
         config["sample_rate"] = float(project.sample_rate)
     return {
         "net": {"name": "ConcatWaveNet", "config": config},
+        "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
+        "optimizer": {"lr": 0.003, "weight_decay": 3.17e-07},
+        "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.994}},
+    }
+
+
+def build_film_model_config(project: CaptureProject) -> dict[str, _Any]:
+    # input_size/condition_size/film_condition_size are omitted on purpose: FiLMWaveNet
+    # derives them from the param specs and the encoder width.
+    #
+    # The learning settings below are carried over from the ConcatWaveNet run; unlike that
+    # pair they are provisional, since no FiLMWaveNet capture run has been made yet.
+    params = _training_param_specs(project)
+    layer: dict[str, _Any] = {
+        "channels": _FILM_CHANNELS,
+        "kernel_sizes": list(_WAVENET_KERNEL_SIZES),
+        "dilations": list(_WAVENET_DILATIONS),
+        "activation": "LeakyReLU",
+        "gated": False,
+        "head": dict(_WAVENET_HEAD),
+    }
+    for site in _FILM_SITES:
+        layer[site] = {"active": True, "shift": False, "groups": 1}
+    config: dict[str, _Any] = {
+        "layers": [layer],
+        "head_scale": 0.01,
+        "params": params,
+        # FiLM is linear in its condition, so without an encoder a knob maps linearly to a
+        # channel gain -- which does not match measured knob tapers.
+        "param_encoder": {
+            "hidden_sizes": list(_FILM_ENCODER_HIDDEN_SIZES),
+            "out_features": _FILM_ENCODER_OUT_FEATURES,
+            "activation": "ReLU",
+        },
+    }
+    if project.sample_rate is not None:
+        config["sample_rate"] = float(project.sample_rate)
+    return {
+        "net": {"name": "FiLMWaveNet", "config": config},
         "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
         "optimizer": {"lr": 0.003, "weight_decay": 3.17e-07},
         "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.994}},
@@ -348,6 +409,10 @@ def build_hyper_learning_config(project: CaptureProject) -> dict[str, _Any]:
     return _build_learning_config(gradient_clip_val=1.0)
 
 
+def build_film_learning_config(project: CaptureProject) -> dict[str, _Any]:
+    return _build_learning_config(gradient_clip_val=0.5)
+
+
 # Mirrors nam_full_configs/active_learning/learning.json, less its _notes. trainer.accelerator
 # is a placeholder: nam.train.active_learning.train_ensemble rewrites it at runtime
 # (cuda > mps > cpu).
@@ -430,4 +495,16 @@ def write_hyper_training_configs(
     learning_path = project_dir / HYPER_LEARNING_CONFIG_FILENAME
     _atomic_write_json(model_path, build_hyper_model_config(project))
     _atomic_write_json(learning_path, build_hyper_learning_config(project))
+    return [model_path, learning_path]
+
+
+def write_film_training_configs(
+    project: CaptureProject, project_dir: _Path
+) -> list[_Path]:
+    """FiLMWaveNet counterpart of :func:`write_concat_training_configs`."""
+    project_dir = _Path(project_dir)
+    model_path = project_dir / FILM_MODEL_CONFIG_FILENAME
+    learning_path = project_dir / FILM_LEARNING_CONFIG_FILENAME
+    _atomic_write_json(model_path, build_film_model_config(project))
+    _atomic_write_json(learning_path, build_film_learning_config(project))
     return [model_path, learning_path]

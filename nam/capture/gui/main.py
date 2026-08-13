@@ -52,6 +52,7 @@ from ..audio import list_devices as _list_devices
 from ..audio import reports_current_sample_rate as _reports_current_sample_rate
 from ..export import update_data_json as _update_data_json
 from ..export import write_concat_training_configs as _write_concat_training_configs
+from ..export import write_film_training_configs as _write_film_training_configs
 from ..export import write_hyper_training_configs as _write_hyper_training_configs
 from ..params import KnobSpec as _KnobSpec
 from ..params import validate_knobs as _validate_knobs
@@ -394,11 +395,13 @@ class MainWindow(_QMainWindow):
         *,
         enable_active_learning: bool = False,
         enable_hyperwavenet: bool = False,
+        enable_filmwavenet: bool = False,
     ) -> None:
         super().__init__()
         self.setWindowTitle("NAM Parametric Capture")
         self._enable_active_learning = enable_active_learning
         self._enable_hyperwavenet = enable_hyperwavenet
+        self._enable_filmwavenet = enable_filmwavenet
 
         self.project: _Optional[_CaptureProject] = None
         self.project_dir: _Optional[_Path] = None
@@ -756,8 +759,12 @@ class MainWindow(_QMainWindow):
         self.export_hyper_button = _QPushButton("Export HyperWaveNet Configs")
         self.export_hyper_button.clicked.connect(self._on_export_hyper_configs)
         self.export_hyper_button.setVisible(self._enable_hyperwavenet)
+        self.export_film_button = _QPushButton("Export FiLMWaveNet Configs")
+        self.export_film_button.clicked.connect(self._on_export_film_configs)
+        self.export_film_button.setVisible(self._enable_filmwavenet)
         export_buttons.addWidget(self.export_concat_button)
         export_buttons.addWidget(self.export_hyper_button)
+        export_buttons.addWidget(self.export_film_button)
         layout.addLayout(export_buttons)
         return widget
 
@@ -1951,6 +1958,9 @@ class MainWindow(_QMainWindow):
     def _on_export_hyper_configs(self) -> None:
         self._export_configs("HyperWaveNet", _write_hyper_training_configs)
 
+    def _on_export_film_configs(self) -> None:
+        self._export_configs("FiLMWaveNet", _write_film_training_configs)
+
     def _export_configs(self, architecture: str, writer) -> None:
         if self.project is None or self.project_dir is None:
             _QMessageBox.warning(self, "No project", "Open or create a project first.")
@@ -2349,9 +2359,11 @@ def main() -> None:
     app = _QApplication.instance() or _QApplication(_sys.argv)
     enable_active_learning = "--active-learning" in _sys.argv
     enable_hyperwavenet = "--hyperwavenet" in _sys.argv
+    enable_filmwavenet = "--filmwavenet" in _sys.argv
     window = MainWindow(
         enable_active_learning=enable_active_learning,
         enable_hyperwavenet=enable_hyperwavenet,
+        enable_filmwavenet=enable_filmwavenet,
     )
     window.show()
     _sys.exit(app.exec())

@@ -42,6 +42,8 @@ CONCAT_MODEL_CONFIG_FILENAME = "model_concat.json"
 CONCAT_LEARNING_CONFIG_FILENAME = "learning_concat.json"
 HYPER_MODEL_CONFIG_FILENAME = "model_hyper.json"
 HYPER_LEARNING_CONFIG_FILENAME = "learning_hyper.json"
+FILM_MODEL_CONFIG_FILENAME = "model_film.json"
+FILM_LEARNING_CONFIG_FILENAME = "learning_film.json"
 
 _PROJECT_VERSION = 1
 # Keep every window below one ConcatLSTM processing block (65535 samples) and above the
