@@ -442,6 +442,11 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         dilation = config.pop("dilations")
         channels = config.pop("channels")
         condition_size = config.pop("condition_size")
+        # FiLM may be driven by something other than the layer condition -- e.g. a control
+        # vector that is constant in time. Defaults to the layer condition.
+        film_condition_size = config.pop("film_condition_size", None)
+        if film_condition_size is None:
+            film_condition_size = condition_size
         bottleneck = config.pop("bottleneck", channels)
         kernel_size = config.pop("kernel_size")
         activation: _nn.Module = config.pop("activation")
@@ -504,13 +509,13 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         )
 
         # FiLM modules (optional at each position)
-        def maybe_film(
-            fp: _FiLMParamsConfig, cond_dim: int, in_dim: int
-        ) -> _Optional[_FiLM]:
+        # Every FiLM reads film_condition_size, so a new site added below cannot silently
+        # end up on the layer condition instead.
+        def maybe_film(fp: _FiLMParamsConfig, in_dim: int) -> _Optional[_FiLM]:
             if not fp.active:
                 return None
             return _FiLM(
-                condition_size=cond_dim,
+                condition_size=film_condition_size,
                 input_dim=in_dim,
                 shift=fp.shift,
                 groups=fp.groups,
@@ -525,33 +530,28 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
                 "head1x1_post_film cannot be active when head1x1 is not active"
             )
 
-        conv_pre_film = maybe_film(
-            film_configs["conv_pre_film"], condition_size, channels
-        )
-        conv_post_film = maybe_film(
-            film_configs["conv_post_film"], condition_size, mid_channels
-        )
+        conv_pre_film = maybe_film(film_configs["conv_pre_film"], channels)
+        conv_post_film = maybe_film(film_configs["conv_post_film"], mid_channels)
         input_mixin_pre_film = maybe_film(
-            film_configs["input_mixin_pre_film"], condition_size, condition_size
+            film_configs["input_mixin_pre_film"], condition_size
         )
         input_mixin_post_film = maybe_film(
-            film_configs["input_mixin_post_film"], condition_size, mid_channels
+            film_configs["input_mixin_post_film"], mid_channels
         )
         activation_pre_film = maybe_film(
-            film_configs["activation_pre_film"], condition_size, mid_channels
+            film_configs["activation_pre_film"], mid_channels
         )
         activation_post_film = maybe_film(
-            film_configs["activation_post_film"], condition_size, bottleneck
+            film_configs["activation_post_film"], bottleneck
         )
         layer1x1_post_film = (
-            maybe_film(film_configs["layer1x1_post_film"], condition_size, channels)
+            maybe_film(film_configs["layer1x1_post_film"], channels)
             if layer_1x1_config.active
             else None
         )
         head1x1_post_film = (
             maybe_film(
                 film_configs["head1x1_post_film"],
-                condition_size,
                 head_1x1_config.out_channels if head_1x1_config.active else bottleneck,
             )
             if head_1x1_config.active
@@ -702,11 +702,17 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         return _torch.cat(tensors)
 
     def forward(
-        self, x: _torch.Tensor, h: _torch.Tensor, out_length: int
+        self,
+        x: _torch.Tensor,
+        h: _torch.Tensor,
+        out_length: int,
+        p: _Optional[_torch.Tensor] = None,
     ) -> _Tuple[_Optional[_torch.Tensor], _torch.Tensor]:
         """
         :param x: (B,C,L1) From last layer
         :param h: (B,DX,L2) Conditioning. If first, ignored.
+        :param p: (B,DP,L3) FiLM condition, when the FiLM modules are driven by something
+            other than h. L3 may be 1, in which case it broadcasts across time.
 
         :return:
             If not final:
@@ -715,8 +721,10 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             If final, next layer is None
         """
 
+        film_condition = h if p is None else p
+
         # Helper: slice condition to match tensor time length (conv shortens sequence)
-        def _c(t_len: int, tensor: _torch.Tensor = h) -> _torch.Tensor:
+        def _c(t_len: int, tensor: _torch.Tensor = film_condition) -> _torch.Tensor:
             return tensor[:, :, -t_len:]
 
         # Step 1: input convolution (with optional pre/post FiLM)
@@ -736,7 +744,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         # Input mixin (with optional pre/post FiLM)
         mixin_input = h
         if self._input_mixin_pre_film is not None:
-            mixin_input = self._input_mixin_pre_film(mixin_input, h)
+            mixin_input = self._input_mixin_pre_film(mixin_input, film_condition)
         mix_out = self._input_mixer(mixin_input)[:, :, -zconv.shape[2] :]
         if self._input_mixin_post_film is not None:
             mix_out = self._input_mixin_post_film(mix_out, _c(mix_out.shape[2]))
@@ -857,6 +865,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             config.pop("layer_1x1_config", dict())
         )
         film_params = config.pop("film_params", dict())
+        film_condition_size = config.pop("film_condition_size", None)
         groups_input = config.pop("groups_input", 1)
         groups_input_mixin = config.pop("groups_input_mixin", 1)
         slimmable_config = config.pop("slimmable", None)
@@ -922,6 +931,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
                         "head_1x1_config": head1x1_config,
                         "layer_1x1_config": layer1x1_config,
                         "film_params": film_params,
+                        "film_condition_size": film_condition_size,
                         "groups_input": groups_input,
                         "groups_input_mixin": groups_input_mixin,
                         "slimmable": slimmable_config,
@@ -1050,10 +1060,12 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         x: _torch.Tensor,
         c: _torch.Tensor,
         head_input: _Optional[_torch.Tensor] = None,
+        p: _Optional[_torch.Tensor] = None,
     ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         """
         :param x: (B,Dx,L) layer input
         :param c: (B,Dc,L) condition
+        :param p: (B,Dp,L') FiLM condition, if the FiLM modules read one other than c
 
         Layer array receptive field is R.
 
@@ -1068,7 +1080,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         x = self._rechannel(x)
         for layer in self._layers:
             x, head_term = layer(
-                x, c, out_length_no_head_rechannel
+                x, c, out_length_no_head_rechannel, p=p
             )  # Ensures head_term sample length
             head_input = (
                 head_term

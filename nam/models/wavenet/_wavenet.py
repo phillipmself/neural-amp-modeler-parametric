@@ -256,14 +256,25 @@ class WaveNet(_Slimmable, _nn.Module, _InitializableFromConfig):
     def is_slimmable(self) -> bool:
         return self._is_slimmable
 
-    def forward(self, x: _torch.Tensor) -> _torch.Tensor:
+    def forward(
+        self, x: _torch.Tensor, p: _Optional[_torch.Tensor] = None
+    ) -> _torch.Tensor:
         """
         :param x: (B,Cx,L)
+        :param p: (B,Cp,Lp) FiLM condition, when the layers' FiLM modules are driven by
+            something other than the layer condition. Lp may be 1 to broadcast in time.
         :return: (B,Cy,L-R)
         """
+        if p is not None and p.shape[2] not in (1, x.shape[2]):
+            # The layers right-align the condition against tensors of varying length, so
+            # anything in between broadcasts inconsistently deep inside a FiLM.
+            raise ValueError(
+                f"FiLM condition length {p.shape[2]} must be 1 (broadcast in time) or "
+                f"the input's {x.shape[2]} samples"
+            )
         c = x if self._condition_dsp is None else self._condition_dsp(x)
         y, head_input = x, None
         for layer_array in self._layer_arrays:
-            head_input, y = layer_array(y, c, head_input=head_input)
+            head_input, y = layer_array(y, c, head_input=head_input, p=p)
         head_input = self._head_scale * head_input
         return head_input if self._head is None else self._head(head_input)

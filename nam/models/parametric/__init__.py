@@ -25,6 +25,8 @@ from ._active_learning_params import switch_combinations
 from ._base import ParametricNet
 from ._concat_lstm import ConcatLSTM
 from ._concat_wavenet import ConcatWaveNet
+from ._film_wavenet import FiLMWaveNet
+from ._film_wavenet import ParamEncoder
 from ._hypernet import Hypernetwork
 from ._hyperwavenet import HyperWaveNet
 from ._spec import ParamSpec
@@ -32,6 +34,7 @@ from ._spec import ParamSpec
 _register_dataset_initializer("parametric", _init_dataset)
 _factory.register("ConcatLSTM", ConcatLSTM.init_from_config)
 _factory.register("ConcatWaveNet", ConcatWaveNet.init_from_config)
+_factory.register("FiLMWaveNet", FiLMWaveNet.init_from_config)
 _factory.register("HyperWaveNet", HyperWaveNet.init_from_config)
 
 __all__ = [
@@ -40,10 +43,12 @@ __all__ = [
     "ConcatLSTM",
     "ConcatWaveNet",
     "decode_named_params",
+    "FiLMWaveNet",
     "format_param_value",
     "Hypernetwork",
     "HyperWaveNet",
     "make_capture_y_path",
+    "ParamEncoder",
     "ParamSpec",
     "ParametricDataset",
     "ParametricNet",

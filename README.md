@@ -12,9 +12,10 @@ What the fork adds:
 - **`nam-capture`** — a desktop app that plans the capture set, drives the reamp, measures latency
   per capture, and writes ready-to-train configs. This is the entry point; everything else is
   reachable from it.
-- **Two knob-conditioned architectures** — `ConcatWaveNet` (knob values appended to the audio at
-  every timestep) and `HyperWaveNet` (a small network generates the WaveNet's weights from the knob
-  values). Both train from the same captures.
+- **Three knob-conditioned architectures** — `ConcatWaveNet` (knob values appended to the audio at
+  every timestep), `HyperWaveNet` (a small network generates the WaveNet's weights from the knob
+  values) and `FiLMWaveNet` (the knobs scale each layer's channels, and touch nothing else). All
+  three train from the same captures.
 - **Active-learning capture selection**, which proposes what to capture next. Experimental.
 
 Trained models run in [NamParametricPlugin](https://github.com/phillipmself/NamParametricPlugin)
@@ -95,13 +96,13 @@ dropouts, and writes the WAV.
 
 ## Train
 
-The Capture tab has *Export ConcatWaveNet Configs* and *Export HyperWaveNet Configs*. Either writes
-a matched `model_*.json` and `learning_*.json` into the project folder, next to the `data.json`
-that's been kept current all along. Then:
+The Capture tab has *Export ConcatWaveNet Configs*, *Export HyperWaveNet Configs* and *Export
+FiLMWaveNet Configs*. Any of them writes a matched `model_*.json` and `learning_*.json` into the
+project folder, next to the `data.json` that's been kept current all along. Then:
 
-*Export HyperWaveNet Configs* is hidden by default — see
-[Which architecture?](#which-architecture) below — and needs
-`nam-capture --hyperwavenet` to show it.
+The HyperWaveNet and FiLMWaveNet buttons are hidden by default — see
+[Which architecture?](#which-architecture) below — and need `nam-capture --hyperwavenet` or
+`nam-capture --filmwavenet` to show them.
 
 ```bash
 nam-full-parametric data.json model_hyper.json learning_hyper.json outputs
@@ -115,13 +116,20 @@ sliders.
 A HyperWaveNet run also drops a second file, `model.nam` — a plain fixed-setting WaveNet baked at
 your knobs' default positions, which loads in the stock NAM plugin like any ordinary capture. Handy
 for A/B'ing your parametric model against a conventional one, but it is not the parametric model
-itself. ConcatWaveNet runs produce only `model_parametric.nam`.
+itself. ConcatWaveNet and FiLMWaveNet runs produce only `model_parametric.nam`.
 
 ### Which architecture?
 
 ConcatWaveNet is the default. HyperWaveNet generates its weights whenever the knob values change,
 and audible zippering can show up in the plugin during those transitions with no fix yet — so its
 export button is hidden behind `nam-capture --hyperwavenet` until that's sorted out.
+
+FiLMWaveNet is hidden behind `nam-capture --filmwavenet` for a different reason: it is new and has
+only been shown to train on a synthetic task, never on a real capture set. It is the cheapest of the
+three by a wide margin — the knobs never enter the audio path, so its layer arrays stay at the stock
+8 channels no matter how many knobs you have — and it is built to avoid the knob-move artifact the
+other two can produce. Whether it has the expressive range for tone-stack knobs is the open
+question. See [`docs/parametric_film_wavenet.md`](docs/parametric_film_wavenet.md).
 
 Runtime cost is the tradeoff behind the two architectures. Once a HyperWaveNet's weights settle, its
 audio path is a stock 8-channel WaveNet costing no more per buffer than an ordinary NAM capture. A

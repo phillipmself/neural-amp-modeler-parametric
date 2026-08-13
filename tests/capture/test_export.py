@@ -6,12 +6,17 @@ import pytest as _pytest
 from nam.capture.export import build_concat_learning_config as _build_concat_learning_config
 from nam.capture.export import build_concat_model_config as _build_concat_model_config
 from nam.capture.export import build_data_config as _build_data_config
+from nam.capture.export import build_film_learning_config as _build_film_learning_config
+from nam.capture.export import build_film_model_config as _build_film_model_config
 from nam.capture.export import build_hyper_learning_config as _build_hyper_learning_config
 from nam.capture.export import build_hyper_model_config as _build_hyper_model_config
 from nam.capture.export import concat_wavenet_channels as _concat_wavenet_channels
 from nam.capture.export import update_data_json as _update_data_json
 from nam.capture.export import (
     write_concat_training_configs as _write_concat_training_configs,
+)
+from nam.capture.export import (
+    write_film_training_configs as _write_film_training_configs,
 )
 from nam.capture.export import (
     write_hyper_training_configs as _write_hyper_training_configs,
@@ -24,6 +29,10 @@ from nam.capture.project import (
     CONCAT_MODEL_CONFIG_FILENAME as _CONCAT_MODEL_CONFIG_FILENAME,
 )
 from nam.capture.project import DATA_FILENAME as _DATA_FILENAME
+from nam.capture.project import (
+    FILM_LEARNING_CONFIG_FILENAME as _FILM_LEARNING_CONFIG_FILENAME,
+)
+from nam.capture.project import FILM_MODEL_CONFIG_FILENAME as _FILM_MODEL_CONFIG_FILENAME
 from nam.capture.project import (
     HYPER_LEARNING_CONFIG_FILENAME as _HYPER_LEARNING_CONFIG_FILENAME,
 )
@@ -124,6 +133,7 @@ def test_update_data_json_writes_file_matching_build_data_config(tmp_path: _Path
     [
         (_build_concat_model_config, "ConcatWaveNet"),
         (_build_hyper_model_config, "HyperWaveNet"),
+        (_build_film_model_config, "FiLMWaveNet"),
     ],
 )
 def test_build_model_config_shape_and_params_order(builder, name):
@@ -159,7 +169,8 @@ def test_build_model_config_shape_and_params_order(builder, name):
 
 
 @_pytest.mark.parametrize(
-    "builder", [_build_concat_model_config, _build_hyper_model_config]
+    "builder",
+    [_build_concat_model_config, _build_hyper_model_config, _build_film_model_config],
 )
 def test_build_model_config_omits_sample_rate_when_unset(builder):
     project = _project()
@@ -209,8 +220,34 @@ def test_hyper_model_config_template_and_hypernet():
         assert layer["condition_size"] == 1
 
 
+def test_film_model_config_stays_stock_width_and_decouples_the_encoder():
+    project = _project()
+
+    config = _build_film_model_config(project)
+    net_config = config["net"]["config"]
+
+    # The knobs act through FiLM's 1x1s, so the layer array stays at the stock width no
+    # matter how many knobs the project has -- that is the cost argument for this net.
+    for layer in net_config["layers"]:
+        assert layer["channels"] == 8
+        assert "input_size" not in layer
+        assert "condition_size" not in layer
+        assert "film_condition_size" not in layer
+        assert layer["activation_post_film"] == {
+            "active": True,
+            "shift": False,
+            "groups": 1,
+        }
+
+    # Every per-layer gain is a linear combination of the encoder's outputs, so this width
+    # -- not the knob count -- is what bounds how independently the channels can respond.
+    assert net_config["param_encoder"]["out_features"] == 8
+    assert net_config["param_encoder"]["out_features"] != len(project.knobs)
+
+
 def test_build_model_config_is_loadable_by_its_net():
     from nam.models.parametric import ConcatWaveNet as _ConcatWaveNet
+    from nam.models.parametric import FiLMWaveNet as _FiLMWaveNet
     from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 
     project = _project()
@@ -227,6 +264,10 @@ def test_build_model_config_is_loadable_by_its_net():
         )
         is not None
     )
+    film = _FiLMWaveNet.init_from_config(
+        _build_film_model_config(project)["net"]["config"]
+    )
+    assert film.film_condition_size == 8
 
 
 @_pytest.mark.parametrize(
@@ -267,6 +308,13 @@ def test_build_learning_config_matches_its_architecture(builder, gradient_clip_v
             _build_hyper_model_config,
             _build_hyper_learning_config,
         ),
+        (
+            _write_film_training_configs,
+            _FILM_MODEL_CONFIG_FILENAME,
+            _FILM_LEARNING_CONFIG_FILENAME,
+            _build_film_model_config,
+            _build_film_learning_config,
+        ),
     ],
 )
 def test_write_training_configs_writes_both_files(
@@ -291,11 +339,12 @@ def test_write_training_configs_writes_both_files(
         assert _json.load(fp) == learning_builder(project)
 
 
-def test_both_architectures_export_side_by_side(tmp_path: _Path):
+def test_every_architecture_exports_side_by_side(tmp_path: _Path):
     project = _project()
 
     _write_concat_training_configs(project, tmp_path)
     _write_hyper_training_configs(project, tmp_path)
+    _write_film_training_configs(project, tmp_path)
 
     written = {path.name for path in tmp_path.iterdir()}
     assert written == {
@@ -303,4 +352,6 @@ def test_both_architectures_export_side_by_side(tmp_path: _Path):
         _CONCAT_LEARNING_CONFIG_FILENAME,
         _HYPER_MODEL_CONFIG_FILENAME,
         _HYPER_LEARNING_CONFIG_FILENAME,
+        _FILM_MODEL_CONFIG_FILENAME,
+        _FILM_LEARNING_CONFIG_FILENAME,
     }
