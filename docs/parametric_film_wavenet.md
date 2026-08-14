@@ -161,13 +161,36 @@ where the concat artifact is most audible — against the steady-state reference
 
 ## 6. Runtime smoothing
 
-FiLMWaveNet does not smooth. Under the `IParametricControl` contract that makes a committed control
-vector take effect on the next `process()` call, and `GetParams()` reflects it immediately.
+The runtime ramps a committed control over `kDefaultFiLMRampSeconds` (10 ms), **in scale/shift
+space** rather than on the control vector. `GetParams()` still reflects a committed value
+immediately; what is smoothed is when it arrives at the audio.
 
-This is the one place a ramp would belong, and it is cheap here in a way it is not for concat: the
-scale/shift vectors are cached per control change, so they can be interpolated toward a destination
-with any time constant, decoupled from the receptive field. Deliberately left out of the first pass
-because it changes output semantics and would invalidate the parity fixtures.
+Without this, the control only updates at block boundaries, so the per-channel gain FiLM applies
+steps once per block — zipper noise, scaled by the signal level and by the block size (a 512-sample
+block gives steps 8x larger than a 64-sample one). Interpolating per sample makes that gain
+piecewise-linear instead, which removes the discontinuity outright; the ramp length then only
+bounds the slew rate.
+
+Ramping downstream of the encoder rather than on the control has three consequences:
+
+- **The 1x1 still runs once per control change, not per frame.** Each FiLM caches a current and a
+  target scale/shift column and interpolates between them; the per-sample cost is one extra add per
+  channel while a ramp is in flight, and nothing once it lands.
+- **Switches keep their exact one-hot.** The encoder is never fed a blended index — the blend
+  happens after it, between two gain vectors the model was trained at. `ConcatWaveNet` has to
+  exclude switches from its ramp (`ParamRamp`'s mask) for exactly the reason this avoids.
+- **The settled state is untouched.** Once the ramp lands, the code path is the one that existed
+  before smoothing, and the current column is snapped to the committed target rather than left on
+  the accumulated value, so no residual survives. This is why the Python-parity fixtures still
+  match byte-for-byte.
+
+10 ms is much shorter than `ConcatWaveNet`'s 200 ms, deliberately. Concat needs a long ramp to
+cross its receptive-field-long window of control patterns it was never trained on *slowly*;
+FiLMWaveNet has no such window, so every instant of the ramp is a configuration the model was
+trained at and the ramp only has to outrun the step. The value was picked from that reasoning, not
+by ear — no FiLMWaveNet has been trained on a real capture yet. Tune it with
+`FiLMWaveNet::SetParamRampSeconds()`; 0 disables smoothing entirely, which is how a stream restart
+settles and how the architecture tests isolate propagation from settling.
 
 ## 7. Status
 
