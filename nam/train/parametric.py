@@ -421,10 +421,36 @@ def _bucket_means(loss_dict: dict) -> dict[str, _torch.Tensor]:
     }
 
 
+def _silence_anchor_norm(y: _torch.Tensor) -> _torch.Tensor:
+    """Score an anchor's output against zero.
+
+    Mean absolute error, not mean squared. The quantity being driven out is small in
+    absolute terms -- a trained SD1 capture sits around 2.6e-3 -- and a squared term is
+    quadratic in exactly that regime: at |y| = 2.6e-3 it reads 7.7e-6, some 330x smaller
+    than the L1 value, and its gradient (2|y|) is ~170x weaker than L1's constant 1. It
+    goes quieter the closer the model gets to the target, which is the opposite of what
+    an anchor needs.
+
+    That also explains why raising the weight was not a fix: the weight multiplies the
+    term everywhere, so a weight large enough to bite at 1e-3 dominates early training
+    when the offset is still large, distorting the fit the anchor is supposed to leave
+    alone. L1 pulls with the same force at 1e-2 and at 1e-4, so a modest weight can hold
+    the anchor without ever competing with the capture data.
+
+    ``mean(|y|)`` rather than ``|mean(y)|``: at a held setting the residual is pure DC and
+    the two agree, but while a control moves the output is a transient whose mean can
+    cancel to nothing while the excursion stays audible.
+    """
+    return y.abs().mean()
+
+
 @_dataclass
 class _SilenceAnchorConfig:
     """
     Settings for the silence-in / silence-out anchor terms.
+
+    The anchor is scored with mean absolute error; see :func:`_silence_anchor_norm` for
+    why a squared term cannot do this job.
 
     ``ny`` is the number of scored output samples per anchor row. The net needs
     ``receptive_field - 1`` samples of history on top of that, and for the shipping
@@ -637,7 +663,7 @@ class _ParametricLightningModule(_LightningModule):
             config.batch_size,
             device=next(net.parameters()).device,
         )
-        return _anchor_output(net, params, config.ny).square().mean()
+        return _silence_anchor_norm(_anchor_output(net, params, config.ny))
 
     def _silence_anchor_ramp_loss(
         self, config: _SilenceAnchorRampConfig
@@ -660,7 +686,7 @@ class _ParametricLightningModule(_LightningModule):
             rail_probability=config.rail_probability,
             device=next(net.parameters()).device,
         )
-        return _anchor_output(net, params, config.ny).square().mean()
+        return _silence_anchor_norm(_anchor_output(net, params, config.ny))
 
     def _mel_mrstft_loss(
         self, preds: _torch.Tensor, targets: _torch.Tensor

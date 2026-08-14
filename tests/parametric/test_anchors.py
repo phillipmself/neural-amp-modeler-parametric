@@ -15,6 +15,7 @@ from nam.train.parametric import _SilenceAnchorConfig as _SilenceAnchorConfig
 from nam.train.parametric import (
     _SilenceAnchorRampConfig as _SilenceAnchorRampConfig,
 )
+from nam.train.parametric import _silence_anchor_norm as _silence_anchor_norm
 from tests.parametric.test_concat_wavenet import _concat_wavenet_config
 from tests.parametric.test_hyperwavenet import _hyperwavenet_config
 
@@ -144,6 +145,38 @@ def test_silence_anchor_skipped_during_validation():
     loss_dict = module._get_loss_dict(_torch.randn((2, 64)), _torch.randn((2, 64)))
 
     assert "Silence Anchor" not in loss_dict
+
+
+def test_silence_anchor_norm_does_not_go_quiet_as_the_offset_shrinks():
+    """
+    The whole job of the anchor is to keep pulling once the residual is already small, so
+    the term must stay first-order in the offset. A squared term halves its gradient every
+    time the offset halves, which is why it cannot finish the job.
+    """
+    offsets = [1e-1, 1e-2, 1e-3, 1e-4]
+    values = []
+    grads = []
+    for offset in offsets:
+        y = _torch.full((4, 64), offset, requires_grad=True)
+        loss = _silence_anchor_norm(y)
+        loss.backward()
+        values.append(loss.item())
+        grads.append(y.grad.abs().mean().item())
+
+    # Loss tracks the offset itself, not its square.
+    for offset, value in zip(offsets, values):
+        assert value == _pytest.approx(offset, rel=1e-5)
+    # And the pull per sample is the same at 1e-4 as at 1e-1.
+    assert grads[0] == _pytest.approx(grads[-1], rel=1e-5)
+
+
+def test_silence_anchor_norm_penalises_a_zero_mean_transient():
+    """``mean(|y|)``, not ``|mean(y)|``: a moving control produces an excursion whose mean
+    can cancel while the sound of it does not."""
+    zero_mean = _torch.cat([_torch.full((32,), 0.02), _torch.full((32,), -0.02)])[None]
+
+    assert zero_mean.mean().abs().item() == _pytest.approx(0.0, abs=1e-7)
+    assert _silence_anchor_norm(zero_mean).item() == _pytest.approx(0.02, rel=1e-5)
 
 
 def test_silence_anchor_config_parsing():
