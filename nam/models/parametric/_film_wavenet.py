@@ -296,6 +296,14 @@ class FiLMWaveNet(_ParametricNet):
         # Straight-line tensor work: encode the controls, then one inner forward.
         return True
 
+    @property
+    def supports_param_trajectory(self) -> bool:
+        # The controls are consumed by 1x1 convolutions, which have no time extent, so a
+        # control that moves within the window is just a condition that is not constant --
+        # no weight sees a tap pattern it was not trained on at any rate of change. This is
+        # also what the silence anchors need in order to score a knob being turned.
+        return True
+
     def _encode(self, p: _torch.Tensor) -> _torch.Tensor:
         """Encoded controls (B, encoded_param_dim) -> (B, film_condition_size)."""
         return p if self._param_encoder is None else self._param_encoder(p)
@@ -307,7 +315,34 @@ class FiLMWaveNet(_ParametricNet):
     def _compilable_step(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
         return self._wavenet(x[:, None, :], self._film_condition(p))
 
+    def _film_condition_sequence(self, p: _torch.Tensor) -> _torch.Tensor:
+        """Per-sample encoded controls (B, T, D) -> (B, film_condition_size, T)."""
+        batch, length, dim = p.shape
+        encoded = self._encode(p.reshape(batch * length, dim))
+        return encoded.reshape(batch, length, -1).permute(0, 2, 1)
+
     def _run_conditioned(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
+        if p.ndim == 3:
+            # A moving control. The condition is the only thing that changes; the inner
+            # forward is the same one the held-setting path runs, with a condition that has
+            # a real time axis instead of a broadcast one. Not routed through _run_step:
+            # the compiled step is shaped for the (B, D, 1) case that dominates training.
+            if p.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"Input batch size {x.shape[0]} must match encoded params batch size "
+                    f"{p.shape[0]}"
+                )
+            if p.shape[1] != x.shape[1]:
+                raise ValueError(
+                    f"Control trajectory length {p.shape[1]} must match the input's "
+                    f"{x.shape[1]} samples"
+                )
+            y = self._wavenet(x[:, None, :], self._film_condition_sequence(p))
+            if y.shape[1] != 1:
+                raise RuntimeError(
+                    f"Expected inner WaveNet to return one channel; got {tuple(y.shape)}"
+                )
+            return y[:, 0, :]
         if p.ndim == 1:
             p = p[None].expand(x.shape[0], -1)
         elif p.shape[0] != x.shape[0]:
@@ -331,16 +366,13 @@ class FiLMWaveNet(_ParametricNet):
         """
         Run with controls that move during the buffer -- what a knob turn looks like.
 
-        This is what the architecture exists for, so it is worth being able to evaluate:
-        because the controls are consumed by 1x1 convolutions, a per-sample control
-        sequence costs nothing extra and puts the network in a valid configuration at
-        every instant. It is also the shape training augmentation on knob moves would use.
+        A channels-first convenience wrapper over the ``(B, T, P)`` trajectory form of
+        :meth:`forward`, so this and the silence anchors drive exactly the same path.
 
         :param x: (L,) or (B, L) audio
         :param params: (P, L) or (B, P, L) raw controls, sample-aligned with ``x``
         :return: (L',) or (B, L') as in :meth:`forward`
         """
-        pad_start = self.pad_start_default if pad_start is None else pad_start
         scalar_input = x.ndim == 1
         if scalar_input:
             x = x[None]
@@ -350,33 +382,9 @@ class FiLMWaveNet(_ParametricNet):
             raise ValueError(
                 f"Expected params to have shape (P, L) or (B, P, L); got {tuple(params.shape)}"
             )
-        if params.shape[0] != x.shape[0]:
-            raise ValueError(
-                f"Input batch size {x.shape[0]} must match params batch size {params.shape[0]}"
-            )
-        if params.shape[2] != x.shape[1]:
-            raise ValueError(
-                f"Control sequence length {params.shape[2]} must match the input's "
-                f"{x.shape[1]} samples"
-            )
-        if pad_start:
-            pad = self.receptive_field - 1
-            x = _torch.cat((_torch.zeros((len(x), pad)).to(x.device), x), dim=1)
-            # Hold the initial setting across the pad so the warm-up runs at the control
-            # value the buffer starts on, matching a prewarmed runtime.
-            params = _torch.cat((params[:, :, :1].expand(-1, -1, pad), params), dim=2)
-        if x.shape[1] < self.receptive_field:
-            raise ValueError(
-                f"Input has {x.shape[1]} samples, which is too few for this model with "
-                f"receptive field {self.receptive_field}!"
-            )
-
-        batch, param_dim, length = params.shape
-        flat = params.permute(0, 2, 1).reshape(batch * length, param_dim)
-        encoded = self._encode(self._encode_params(flat))
-        encoded = encoded.reshape(batch, length, -1).permute(0, 2, 1)
-
-        y = self._wavenet(x[:, None, :], encoded)[:, 0, :]
+        # (B, P, L) -> the (B, T, P) trajectory `forward` takes; it owns the length and
+        # batch checks, the pad_start history, and holding the opening setting across it.
+        y = self(x, params.permute(0, 2, 1), pad_start=pad_start)
         return y[0] if scalar_input else y
 
     def _export_inner_config(self) -> dict[str, _Any]:

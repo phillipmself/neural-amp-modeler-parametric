@@ -2,6 +2,7 @@ import pytest as _pytest
 import torch as _torch
 
 from nam.models.parametric import ConcatWaveNet as _ConcatWaveNet
+from nam.models.parametric import FiLMWaveNet as _FiLMWaveNet
 from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
 from nam.models.parametric._anchors import (
@@ -17,6 +18,7 @@ from nam.train.parametric import (
 )
 from nam.train.parametric import _silence_anchor_norm as _silence_anchor_norm
 from tests.parametric.test_concat_wavenet import _concat_wavenet_config
+from tests.parametric.test_film_wavenet import _film_wavenet_config
 from tests.parametric.test_hyperwavenet import _hyperwavenet_config
 
 
@@ -218,6 +220,65 @@ def _trajectories(n=64, length=256, **kwargs):
         48_000.0,
         generator=_torch.Generator().manual_seed(0),
         **defaults,
+    )
+
+
+def _film_net() -> _FiLMWaveNet:
+    return _FiLMWaveNet.init_from_config(_film_wavenet_config(encoder=True))
+
+
+def test_film_wavenet_accepts_a_trajectory():
+    """FiLM reads the controls through 1x1 convolutions, which have no time extent, so a
+    control that moves within the window needs no special handling -- and the anchors need
+    that to be true in order to score a knob being turned."""
+    net = _film_net()
+    assert net.supports_param_trajectory
+
+
+def test_film_wavenet_constant_trajectory_matches_the_static_call():
+    """Same tie-down as the concat case: the moving-control route must reduce to the
+    established held-setting route when nothing actually moves."""
+    net = _film_net()
+    net.eval()
+    length = net.receptive_field + 32
+    x = _torch.randn((2, length))
+    params = _torch.tensor([[2.0, 0.0], [9.0, 2.0]])
+    trajectory = params[:, None, :].expand(-1, length, -1)
+
+    with _torch.no_grad():
+        assert _torch.allclose(
+            net(x, params, pad_start=False),
+            net(x, trajectory, pad_start=False),
+            atol=1e-6,
+        )
+
+
+@_pytest.mark.parametrize("moving", [False, True])
+def test_film_wavenet_anchors_run_and_carry_gradient(moving):
+    """The anchor is the whole point of the trajectory support for this net: silence in at
+    a control setting -- held or moving -- must produce a scored output that the model can
+    actually be trained against."""
+    net = _film_net()
+    net.train()
+    ny = 16
+    if moving:
+        params = _sample_param_trajectories(
+            net.param_specs,
+            2,
+            net.receptive_field - 1 + ny,
+            net.sample_rate,
+            min_ramp_seconds=0.05,
+            max_ramp_seconds=2.0,
+        )
+    else:
+        params = _sample_raw_params(net.param_specs, 2)
+
+    loss = _anchor_output(net, params, ny).abs().mean()
+    loss.backward()
+
+    assert loss.requires_grad
+    assert any(
+        p.grad is not None and _torch.any(p.grad != 0.0) for p in net.parameters()
     )
 
 

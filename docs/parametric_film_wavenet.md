@@ -192,7 +192,42 @@ by ear — no FiLMWaveNet has been trained on a real capture yet. Tune it with
 `FiLMWaveNet::SetParamRampSeconds()`; 0 disables smoothing entirely, which is how a stream restart
 settles and how the architecture tests isolate propagation from settling.
 
-## 7. Status
+## 7. The knob-move artifact that remains
+
+Measured on a trained SD1 capture (2 knobs, `_FILM_ENCODER_OUT_FEATURES = 8`), turning TONE at
+DRIVE=10 leaves an audible thump. It is *not* zippering, and the runtime ramp does not reach it.
+
+Feed the model digital silence and the output is a constant, not zero — std `4.7e-10`, so pure DC —
+and its level depends on the controls (`-0.00213` at TONE=0, `-0.00417` at TONE=10). Zeroing the
+model's 72 bias tensors makes that output **exactly** 0.000 at every setting, which locates the
+source: the conv biases manufacture a DC pedestal, and scale-only FiLM happily modulates it. Moving
+a control moves the pedestal, and it re-settles through the 132 ms receptive field, overshooting by
+~9x the endpoint difference at DRIVE=10 versus ~3x at DRIVE=0 — hence the drive dependence.
+
+For scale, the same measurement on the shipped ConcatWaveNet for the same pedal:
+
+| | 10 ms ramp | 50 ms | 200 ms |
+|---|---|---|---|
+| FiLMWaveNet | −34.8 dBFS | −45.8 | −47.1 |
+| ConcatWaveNet | −15.1 dBFS | −18.8 | −24.1 |
+
+FiLM is ~20 dB better and responds far more to ramping, because it has no invalid-configuration
+window for a ramp to cross slowly — only the DC re-settling. What does **not** work, all measured:
+
+- **A DC blocker.** 3.7 dB at a 10 ms ramp. Half the peak excursion is above 100 Hz — the energy is
+  at DC but the audible edge is not, and a 20 Hz high-pass is unity gain there.
+- **Subtracting the static `DC(knob)`.** Worse than leaving it alone: the subtraction is instant
+  while the model's DC lags a receptive field behind it.
+- **Subtracting a parallel instance fed silence.** Cancels perfectly in exact digital silence and is
+  8–13 dB *worse* with any signal present, even at −34 dBFS. Output DC is a function of the signal
+  as well as the controls, so the silent instance computes a different, uncorrelated artifact.
+
+What works is removing the pedestal in training: `loss.silence_anchor` scores the model's output on
+silence against zero, and `supports_param_trajectory` lets `silence_anchor_ramp` do the same while
+the controls move. The anchor is scored with mean absolute error, so its logged value is directly
+the artifact amplitude in linear units — on this model it starts around `2.6e-3`.
+
+## 8. Status
 
 Trainability confirmed on a synthetic gain task (`y = tanh(g(knob) x)`): FiLMWaveNet reached eval ESR
 0.0014 at 2,357 params against 0.0033 for a comparably sized ConcatWaveNet. That task maximally
