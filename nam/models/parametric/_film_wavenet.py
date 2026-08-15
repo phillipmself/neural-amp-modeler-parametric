@@ -313,7 +313,13 @@ class FiLMWaveNet(_ParametricNet):
         return self._encode(p)[:, :, None]
 
     def _compilable_step(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
-        return self._wavenet(x[:, None, :], self._film_condition(p))
+        # Both condition shapes go through here so both get compiled. Dynamo specializes
+        # on the rank, so this is two graphs built once each, not a branch re-traced per
+        # call -- and an uncompiled forward is expensive on a launch-bound model.
+        condition = (
+            self._film_condition_sequence(p) if p.ndim == 3 else self._film_condition(p)
+        )
+        return self._wavenet(x[:, None, :], condition)
 
     def _film_condition_sequence(self, p: _torch.Tensor) -> _torch.Tensor:
         """Per-sample encoded controls (B, T, D) -> (B, film_condition_size, T)."""
@@ -325,8 +331,7 @@ class FiLMWaveNet(_ParametricNet):
         if p.ndim == 3:
             # A moving control. The condition is the only thing that changes; the inner
             # forward is the same one the held-setting path runs, with a condition that has
-            # a real time axis instead of a broadcast one. Not routed through _run_step:
-            # the compiled step is shaped for the (B, D, 1) case that dominates training.
+            # a real time axis instead of a broadcast one.
             if p.shape[0] != x.shape[0]:
                 raise ValueError(
                     f"Input batch size {x.shape[0]} must match encoded params batch size "
@@ -337,7 +342,7 @@ class FiLMWaveNet(_ParametricNet):
                     f"Control trajectory length {p.shape[1]} must match the input's "
                     f"{x.shape[1]} samples"
                 )
-            y = self._wavenet(x[:, None, :], self._film_condition_sequence(p))
+            y = self._run_step(x, p)
             if y.shape[1] != 1:
                 raise RuntimeError(
                     f"Expected inner WaveNet to return one channel; got {tuple(y.shape)}"

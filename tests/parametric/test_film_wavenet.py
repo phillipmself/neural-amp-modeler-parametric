@@ -8,6 +8,9 @@ from nam.models import factory as _factory
 from nam.models.parametric import FiLMWaveNet as _FiLMWaveNet
 from nam.models.parametric import ParamSpec as _ParamSpec
 from nam.models.parametric import export_parametric as _export_parametric
+from nam.models.parametric._anchors import (
+    sample_param_trajectories as _sample_param_trajectories,
+)
 from nam.models.parametric._film_wavenet import _film_condition_size
 from nam.models.parametric._film_wavenet import _film_input_dim
 from nam.models.wavenet._film import FiLM as _FiLM
@@ -392,3 +395,34 @@ def test_inner_wavenet_rejects_a_film_condition_that_neither_broadcasts_nor_alig
     p = _torch.randn(1, model.film_condition_size, 3)
     with _pytest.raises(ValueError, match="FiLM condition length"):
         model._wavenet(x, p)
+
+
+def test_moving_control_runs_through_the_compiled_step():
+    """A moving control is the anchors' and the augmentation's hot path.
+
+    It used to bypass `_run_step`, which left it eager while every other forward was
+    compiled -- expensive on a model whose cost is dominated by kernel launches.
+    """
+    model = _init(_film_wavenet_config())
+    length = model.receptive_field + 8
+    x = _torch.randn(2, length)
+    trajectory = _sample_param_trajectories(
+        model.param_specs, 2, length, 48000.0,
+        min_ramp_seconds=0.01, max_ramp_seconds=0.1,
+    )
+
+    eager = model(x, trajectory, pad_start=False)
+    model.set_compiled(True, backend="eager")
+
+    calls = []
+    compiled = model._compiled_step
+
+    def _counting(*args, **kwargs):
+        calls.append(1)
+        return _cast(object, compiled)(*args, **kwargs)
+
+    model._compiled_step = _counting
+    out = model(x, trajectory, pad_start=False)
+
+    assert calls == [1]
+    assert _torch.allclose(out, eager, atol=1e-6)
