@@ -1,5 +1,6 @@
 import json as _json
 from dataclasses import dataclass as _dataclass
+from dataclasses import fields as _fields
 from pathlib import Path as _Path
 from time import time as _time
 from collections.abc import Sequence as _Sequence
@@ -38,6 +39,9 @@ from nam.models.parametric._anchors import (
     sample_param_trajectories as _sample_param_trajectories,
 )
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
+from nam.models.parametric._augment import (
+    sample_landed_trajectories as _sample_landed_trajectories,
+)
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
 from nam.models.parametric import export_parametric as _export_parametric
@@ -553,6 +557,67 @@ class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
 
 
 @_dataclass
+class _LandedMoveConfig:
+    """
+    Settings for the landed-move augmentation; see :mod:`nam.models.parametric._augment`.
+
+    ``probability`` is the share of each batch whose control is replaced with a landed
+    gesture. Below 1.0 the plain constant-control path keeps running on the rest of the
+    batch, which is the case the exported model is scored on.
+
+    The margin is the gap between a gesture landing and the first scored sample, drawn per
+    row over ``[min_margin_seconds, max_margin_seconds]``. Keep the low end well clear of
+    the hardware's own settling time: a margin of zero would be asking the model to be
+    settled instantaneously, which the pedal is not.
+    """
+
+    probability: float = 0.5
+    min_ramp_seconds: float = 0.05
+    max_ramp_seconds: float = 2.0
+    min_margin_seconds: float = 0.02
+    max_margin_seconds: float = 0.1
+    rail_probability: float = 0.25
+
+    @classmethod
+    def from_config(cls, config: _Optional[dict]) -> "_Optional[_LandedMoveConfig]":
+        if config is None:
+            return None
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"Landed-move config must be a mapping; got {type(config).__name__}"
+            )
+        known = {field.name for field in _fields(cls)}
+        unknown = sorted(set(config) - known)
+        if unknown:
+            raise ValueError(
+                "Landed-move config has unknown field(s): " + ", ".join(unknown)
+            )
+        parsed = cls(**{key: float(value) for key, value in config.items()})
+        if not 0.0 <= parsed.probability <= 1.0:
+            raise ValueError(
+                f"Landed-move probability must be within [0, 1]; got {parsed.probability}"
+            )
+        if not 0.0 < parsed.min_ramp_seconds <= parsed.max_ramp_seconds:
+            raise ValueError(
+                "Landed-move ramp durations must satisfy "
+                "0 < min_ramp_seconds <= max_ramp_seconds; got "
+                f"{parsed.min_ramp_seconds} and {parsed.max_ramp_seconds}"
+            )
+        if not 0.0 <= parsed.min_margin_seconds <= parsed.max_margin_seconds:
+            raise ValueError(
+                "Landed-move margins must satisfy "
+                "0 <= min_margin_seconds <= max_margin_seconds; got "
+                f"{parsed.min_margin_seconds} and {parsed.max_margin_seconds}"
+            )
+        if not 0.0 <= parsed.rail_probability <= 1.0:
+            raise ValueError(
+                "Landed-move rail_probability must be within [0, 1]; got "
+                f"{parsed.rail_probability}"
+            )
+        return parsed
+
+
+@_dataclass
 class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
     silence_anchor: _Optional[_SilenceAnchorConfig] = None
@@ -578,6 +643,7 @@ class _ParametricLightningModule(_LightningModule):
         optimizer_config=None,
         scheduler_config=None,
         loss_config=None,
+        landed_move_config=None,
     ):
         super().__init__(
             net,
@@ -588,15 +654,22 @@ class _ParametricLightningModule(_LightningModule):
             ),
         )
         self._mel_mrstft = None
-        if self._loss_config.silence_anchor_ramp is not None and not (
+        self._landed_move_config = landed_move_config
+        # Fail here rather than on the first training step: a net that conditions on the
+        # control vector as a whole has no meaning to give a control that moves within one
+        # forward, so the setting cannot be honoured at all.
+        takes_trajectory = (
             isinstance(net, _ParametricNet) and net.supports_param_trajectory
-        ):
-            # Fail here rather than on the first training step: a net that conditions on
-            # the control vector as a whole has no meaning to give a control that moves
-            # within one forward, so the setting cannot be honoured at all.
+        )
+        if self._loss_config.silence_anchor_ramp is not None and not takes_trajectory:
             raise ValueError(
                 "loss.silence_anchor_ramp requires a net that accepts a param "
                 f"trajectory; {type(net).__name__} does not"
+            )
+        if landed_move_config is not None and not takes_trajectory:
+            raise ValueError(
+                "landed_move requires a net that accepts a param trajectory; "
+                f"{type(net).__name__} does not"
             )
         # Set via `set_capture_batch_samplers` once the dataloaders exist (see `main`).
         # `None` means "capture identity unavailable" -- `_EpochMetrics` then falls back
@@ -610,7 +683,58 @@ class _ParametricLightningModule(_LightningModule):
         parsed["loss_config"] = _ParametricLossConfig.init_from_config(
             config.get("loss", {})
         )
+        parsed["landed_move_config"] = _LandedMoveConfig.from_config(
+            config.get("landed_move")
+        )
         return parsed
+
+    def _shared_step(self, batch):
+        # Training only: the augmentation is a regularizer on how the model treats control
+        # history, and validation must keep measuring the parked-control case the exported
+        # model is actually used in.
+        if self._landed_move_config is not None and self.training:
+            batch = (*self._landed_move_batch(*batch[:-1]), batch[-1])
+        return super()._shared_step(batch)
+
+    def _landed_move_batch(
+        self, x: _torch.Tensor, params: _torch.Tensor
+    ) -> _Tuple[_torch.Tensor, ...]:
+        """Swap the batch's held setting for a gesture that lands before the target does."""
+        config = self._landed_move_config
+        net = _get_parametric_net(self)
+        sample_rate = net.sample_rate
+        if sample_rate is None:
+            raise RuntimeError(
+                "landed_move needs the model sample rate to convert its ramp and margin "
+                "durations to samples"
+            )
+        # `_shared_step` runs with pad_start=False, so the receptive-field history is the
+        # head of the window and the first scored sample follows it.
+        land_by = net.receptive_field - 1
+        if config.min_margin_seconds * sample_rate >= land_by:
+            # Every gesture would land before the window even opens, leaving the control
+            # constant across it -- the augmentation would silently do nothing at all.
+            raise ValueError(
+                f"landed_move min_margin_seconds ({config.min_margin_seconds}) leaves no "
+                f"room in this model's {land_by / sample_rate:.3f} s of receptive-field "
+                "history for a gesture to land inside the window"
+            )
+        return (
+            x,
+            _sample_landed_trajectories(
+                net.param_specs,
+                params,
+                x.shape[1],
+                land_by,
+                sample_rate,
+                min_ramp_seconds=config.min_ramp_seconds,
+                max_ramp_seconds=config.max_ramp_seconds,
+                min_margin_seconds=config.min_margin_seconds,
+                max_margin_seconds=config.max_margin_seconds,
+                rail_probability=config.rail_probability,
+                probability=config.probability,
+            ),
+        )
 
     def set_capture_batch_samplers(
         self,

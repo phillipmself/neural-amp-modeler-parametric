@@ -179,17 +179,58 @@ def sample_param_trajectories(
     held.scatter_(1, moved_index, False)
     end = _torch.where(held, start, end)
 
-    # Log-uniform: a gesture's slope spans orders of magnitude, and sampling the duration
-    # uniformly would put almost every draw at the slow end.
-    log_min, log_max = _math.log(min_ramp_seconds), _math.log(max_ramp_seconds)
-    ramp = _torch.exp(log_min + (log_max - log_min) * rand(n, 1)) * sample_rate
-    ramp = ramp.clamp(min=1.0)
+    ramp = sample_ramp_samples(
+        n,
+        sample_rate,
+        min_ramp_seconds=min_ramp_seconds,
+        max_ramp_seconds=max_ramp_seconds,
+        device=device,
+        generator=generator,
+    )
     commit = -ramp + (ramp + length) * rand(n, 1)
+    return build_trajectory(param_specs, start, end, commit, ramp, length, device)
 
+
+def sample_ramp_samples(
+    n: int,
+    sample_rate: float,
+    *,
+    min_ramp_seconds: float,
+    max_ramp_seconds: float,
+    device: _Optional[_torch.device] = None,
+    generator: _Optional[_torch.Generator] = None,
+) -> _torch.Tensor:
+    """Draw ``n`` ramp durations in samples, shaped ``(n, 1)``.
+
+    Log-uniform: a gesture's slope spans orders of magnitude, and sampling the duration
+    uniformly would put almost every draw at the slow end.
+    """
+    log_min, log_max = _math.log(min_ramp_seconds), _math.log(max_ramp_seconds)
+    span = _torch.rand((n, 1), device=device, generator=generator)
+    return (_torch.exp(log_min + (log_max - log_min) * span) * sample_rate).clamp(min=1.0)
+
+
+def build_trajectory(
+    param_specs: _Sequence[_ParamSpec],
+    start: _torch.Tensor,
+    end: _torch.Tensor,
+    commit: _torch.Tensor,
+    ramp: _torch.Tensor,
+    length: int,
+    device: _Optional[_torch.device] = None,
+) -> _torch.Tensor:
+    """
+    One control gesture per row as ``(n, length, P)``, in raw units.
+
+    ``commit`` is the sample index at which the gesture begins and ``ramp`` its duration,
+    both ``(n, 1)`` and both free to fall outside ``[0, length)`` so that a gesture can
+    begin before the window opens or land after it closes. Continuous controls ramp
+    linearly over that span; switches step at the commit instant, because a blended
+    one-hot is a conditioning vector no model was trained on.
+    """
     t = _torch.arange(length, device=device, dtype=ramp.dtype)[None, :]
     fraction = ((t - commit) / ramp).clamp(0.0, 1.0)[:, :, None]
     stepped = (t >= commit)[:, :, None]
-
     is_switch = _torch.tensor(
         [spec.type == "switch" for spec in param_specs], device=device
     )[None, None, :]
