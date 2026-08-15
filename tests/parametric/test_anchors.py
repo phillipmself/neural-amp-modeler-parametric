@@ -149,6 +149,79 @@ def test_silence_anchor_skipped_during_validation():
     assert "Silence Anchor" not in loss_dict
 
 
+def _both_anchors(ny=16, ramp_ny=None, weight=0.5, ramp_weight=0.25):
+    return _ParametricLossConfig(
+        silence_anchor=_SilenceAnchorConfig(weight=weight, batch_size=2, ny=ny),
+        silence_anchor_ramp=_SilenceAnchorRampConfig(
+            weight=ramp_weight, batch_size=2, ny=ny if ramp_ny is None else ramp_ny
+        ),
+    )
+
+
+def test_merged_anchors_match_running_them_separately():
+    """The shared forward is an optimization, so it must not move either term.
+
+    Both anchors feed the same silence over the same window and differ only in the
+    control tensor, so concatenating them into one forward is exact. Seeding the two
+    routes identically makes them draw the same controls.
+    """
+    config = _both_anchors()
+    module = _ParametricLightningModule(_net(), loss_config=config)
+    module.train()
+
+    _torch.manual_seed(0)
+    merged = {key: item.value for key, item in module._silence_anchor_items().items()}
+    _torch.manual_seed(0)
+    separate = {
+        "Silence Anchor": module._silence_anchor_loss(config.silence_anchor),
+        "Silence Anchor Ramp": module._silence_anchor_ramp_loss(
+            config.silence_anchor_ramp
+        ),
+    }
+
+    assert set(merged) == set(separate)
+    for key, value in merged.items():
+        assert value == separate[key], key
+
+
+def test_merged_anchors_run_one_forward(mocker):
+    module = _ParametricLightningModule(_net(), loss_config=_both_anchors())
+    module.train()
+    spy = mocker.spy(module.net, "forward")
+
+    module._silence_anchor_items()
+
+    assert spy.call_count == 1
+
+
+def test_anchors_fall_back_to_separate_forwards_when_windows_differ(mocker):
+    """A shared forward needs a shared window; mismatched ny must still score both."""
+    module = _ParametricLightningModule(
+        _net(), loss_config=_both_anchors(ny=16, ramp_ny=24)
+    )
+    module.train()
+    spy = mocker.spy(module.net, "forward")
+
+    items = module._silence_anchor_items()
+
+    assert sorted(items) == ["Silence Anchor", "Silence Anchor Ramp"]
+    assert spy.call_count == 2
+
+
+def test_zero_weight_anchor_is_not_run(mocker):
+    """A zero weight cancels the term, so paying for its forward is pure waste."""
+    module = _ParametricLightningModule(
+        _net(), loss_config=_both_anchors(weight=0.0)
+    )
+    module.train()
+    spy = mocker.spy(module.net, "forward")
+
+    items = module._silence_anchor_items()
+
+    assert list(items) == ["Silence Anchor Ramp"]
+    assert spy.call_count == 1
+
+
 def test_silence_anchor_norm_does_not_go_quiet_as_the_offset_shrinks():
     """
     The whole job of the anchor is to keep pulling once the residual is already small, so

@@ -101,6 +101,23 @@ def anchor_output(
     return net(x, params, pad_start=False)
 
 
+def as_held_trajectory(params: _torch.Tensor, length: int) -> _torch.Tensor:
+    """
+    Present a held ``(B, P)`` setting as the constant ``(B, length, P)`` trajectory.
+
+    A control that never moves is a trajectory like any other, which is what lets a held
+    anchor share a forward with a moving one. The result is a stride-0 view, so the
+    expansion costs nothing until something materializes it.
+    """
+    if params.ndim != 2:
+        raise ValueError(
+            f"Expected a held setting of shape (B, P); got {tuple(params.shape)}"
+        )
+    if length < 1:
+        raise ValueError(f"length must be at least 1; got {length}")
+    return params[:, None, :].expand(-1, length, -1)
+
+
 def sample_param_trajectories(
     param_specs: _Sequence[_ParamSpec],
     n: int,

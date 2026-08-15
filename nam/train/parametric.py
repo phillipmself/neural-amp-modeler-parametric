@@ -5,6 +5,7 @@ from time import time as _time
 from collections.abc import Sequence as _Sequence
 from typing import Optional as _Optional
 from typing import ClassVar as _ClassVar
+from typing import Dict as _Dict
 from typing import Tuple as _Tuple
 from warnings import warn as _warn
 
@@ -30,6 +31,9 @@ from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric import ParametricDataset as _ParametricDataset
 from nam.models.parametric import ParametricNet as _ParametricNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import (
+    as_held_trajectory as _as_held_trajectory,
+)
 from nam.models.parametric._anchors import (
     sample_param_trajectories as _sample_param_trajectories,
 )
@@ -641,17 +645,76 @@ class _ParametricLightningModule(_LightningModule):
         # held-out data, and computing them under validation would cost a forward per
         # batch for a number that says nothing about the split.
         if self.training:
-            silence_anchor = self._loss_config.silence_anchor
-            if silence_anchor is not None:
-                loss_dict["Silence Anchor"] = _LossItem(
-                    silence_anchor.weight, self._silence_anchor_loss(silence_anchor)
-                )
-            ramp = self._loss_config.silence_anchor_ramp
-            if ramp is not None:
-                loss_dict["Silence Anchor Ramp"] = _LossItem(
-                    ramp.weight, self._silence_anchor_ramp_loss(ramp)
-                )
+            loss_dict.update(self._silence_anchor_items())
         return loss_dict
+
+    def _silence_anchor_items(self) -> _Dict[str, _LossItem]:
+        """The enabled silence anchors, in as few forwards as the net allows.
+
+        A zero weight contributes nothing to the total, so its forward is skipped rather
+        than run and multiplied away.
+
+        Both anchors feed the same digital silence over the same window and differ only in
+        the control tensor, so when their windows agree they are one forward over a
+        concatenated batch. These models are launch-bound rather than compute-bound, so
+        two forwards of B rows cost close to twice one forward of 2B however small the
+        rows are; halving the launches is worth more than any arithmetic it adds.
+        """
+        static = self._loss_config.silence_anchor
+        ramp = self._loss_config.silence_anchor_ramp
+        if static is not None and static.weight <= 0.0:
+            static = None
+        if ramp is not None and ramp.weight <= 0.0:
+            ramp = None
+        if static is None and ramp is None:
+            return {}
+
+        net = _get_parametric_net(self)
+        if (
+            static is not None
+            and ramp is not None
+            # Equal ny keeps the shared window identical to what each anchor would have
+            # run on its own, so merging cannot change either term's value.
+            and static.ny == ramp.ny
+            and net.supports_param_trajectory
+            and not net.requires_uniform_batch_params
+        ):
+            held, moving = self._merged_silence_anchor_losses(net, static, ramp)
+            return {
+                "Silence Anchor": _LossItem(static.weight, held),
+                "Silence Anchor Ramp": _LossItem(ramp.weight, moving),
+            }
+
+        items: _Dict[str, _LossItem] = {}
+        if static is not None:
+            items["Silence Anchor"] = _LossItem(
+                static.weight, self._silence_anchor_loss(static)
+            )
+        if ramp is not None:
+            items["Silence Anchor Ramp"] = _LossItem(
+                ramp.weight, self._silence_anchor_ramp_loss(ramp)
+            )
+        return items
+
+    def _merged_silence_anchor_losses(
+        self,
+        net: _ParametricNet,
+        static: _SilenceAnchorConfig,
+        ramp: _SilenceAnchorRampConfig,
+    ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
+        """Both silence anchors in one forward; returns (held, moving)."""
+        device = next(net.parameters()).device
+        length = net.receptive_field - 1 + static.ny
+        held = _as_held_trajectory(
+            _sample_raw_params(net.param_specs, static.batch_size, device=device),
+            length,
+        )
+        moving = self._sample_ramp_trajectories(net, ramp, length)
+        y = _anchor_output(net, _torch.cat([held, moving], dim=0), static.ny)
+        return (
+            _silence_anchor_norm(y[: static.batch_size]),
+            _silence_anchor_norm(y[static.batch_size :]),
+        )
 
     def _silence_anchor_loss(
         self, config: _SilenceAnchorConfig
@@ -670,23 +733,31 @@ class _ParametricLightningModule(_LightningModule):
     ) -> _torch.Tensor:
         """Silence in, the controls travelling across the window, silence out."""
         net = _get_parametric_net(self)
+        params = self._sample_ramp_trajectories(
+            net, config, net.receptive_field - 1 + config.ny
+        )
+        return _silence_anchor_norm(_anchor_output(net, params, config.ny))
+
+    @staticmethod
+    def _sample_ramp_trajectories(
+        net: _ParametricNet, config: _SilenceAnchorRampConfig, length: int
+    ) -> _torch.Tensor:
         sample_rate = net.sample_rate
         if sample_rate is None:
             raise RuntimeError(
                 "silence_anchor_ramp needs the model sample rate to convert its ramp "
                 "durations to samples"
             )
-        params = _sample_param_trajectories(
+        return _sample_param_trajectories(
             net.param_specs,
             config.batch_size,
-            net.receptive_field - 1 + config.ny,
+            length,
             sample_rate,
             min_ramp_seconds=config.min_ramp_seconds,
             max_ramp_seconds=config.max_ramp_seconds,
             rail_probability=config.rail_probability,
             device=next(net.parameters()).device,
         )
-        return _silence_anchor_norm(_anchor_output(net, params, config.ny))
 
     def _mel_mrstft_loss(
         self, preds: _torch.Tensor, targets: _torch.Tensor
