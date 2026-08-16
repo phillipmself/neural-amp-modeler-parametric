@@ -56,6 +56,15 @@ def quasi_static_reference(
     Runs under ``no_grad``: this is the target the moving render is scored against, and the
     gradient belongs to the moving side alone.
     """
+    if not net.receptive_field_bounds_memory:
+        # Each block is evaluated from a cold start, which for a recurrent net discards
+        # the state the moving render carried in. The residual would then be dominated by
+        # that state discontinuity rather than by control motion, and driving it down
+        # would teach the model to ignore its own memory.
+        raise ValueError(
+            f"The quasi-static anchor needs a net whose receptive field bounds its "
+            f"memory; {type(net).__name__} is recurrent"
+        )
     if x.ndim != 2:
         raise ValueError(f"Expected a batched (B, L) input; got {tuple(x.shape)}")
     if ny < 1:

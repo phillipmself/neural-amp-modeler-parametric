@@ -71,6 +71,24 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         return False
 
     @property
+    def receptive_field_bounds_memory(self) -> bool:
+        """Whether ``receptive_field`` is a true bound on how far back the output depends.
+
+        True for the finite-impulse-response nets, where an output sample is a function of
+        exactly the preceding ``receptive_field`` inputs and nothing earlier. False for a
+        recurrent net, whose hidden state carries information with no fixed horizon --
+        ``ConcatLSTM`` reports a receptive field of 1, which describes its per-step
+        arithmetic rather than its memory.
+
+        Training terms that cut a window into independently-evaluated pieces (the
+        quasi-static anchor) or that treat the receptive-field prefix as the only history
+        (landed-move augmentation) are only meaningful when this holds. Default False so a
+        net that has not thought about it fails loudly rather than training on a
+        silently-wrong residual.
+        """
+        return False
+
+    @property
     def requires_uniform_batch_params(self) -> bool:
         """Whether a batched ``params`` must hold one setting repeated down the batch.
 
