@@ -304,6 +304,12 @@ class FiLMWaveNet(_ParametricNet):
         # also what the silence anchors need in order to score a knob being turned.
         return True
 
+    @property
+    def receptive_field_bounds_memory(self) -> bool:
+        # Dilated convolutions and 1x1 conditioning, nothing recurrent, so the receptive
+        # field is exact.
+        return True
+
     def _encode(self, p: _torch.Tensor) -> _torch.Tensor:
         """Encoded controls (B, encoded_param_dim) -> (B, film_condition_size)."""
         return p if self._param_encoder is None else self._param_encoder(p)
