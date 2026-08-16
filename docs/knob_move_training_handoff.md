@@ -58,12 +58,13 @@ ConcatLSTM (from `SD1_lstm`; 2x2, because silence anchors have never run on it):
 
 ### Running them
 
-`tools/run_knob_move_arms.sh <gpu>` runs one GPU's half — two FiLM arms, then two LSTM arms.
-Launch one per GPU. `DATA_DIR` / `OUT_DIR` override the defaults.
+`training/SD1/run_arms.sh <gpu>` (lives with the configs, not in this repo) runs one GPU's
+half — two FiLM arms, then two LSTM arms. Launch one per GPU. It resolves configs from its own
+directory; `DATA_DIR` / `OUT_DIR` / `REPO_DIR` override the defaults.
 
 ```bash
-./tools/run_knob_move_arms.sh 0 &
-./tools/run_knob_move_arms.sh 1 &
+./run_arms.sh 0 &
+./run_arms.sh 1 &
 ```
 
 Arms are paired so each GPU takes one cheap and one expensive run of each architecture, since
