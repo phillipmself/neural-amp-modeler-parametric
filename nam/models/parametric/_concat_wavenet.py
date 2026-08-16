@@ -132,6 +132,11 @@ class ConcatWaveNet(_ParametricNet):
         # the window is just a channel that is not constant.
         return True
 
+    @property
+    def receptive_field_bounds_memory(self) -> bool:
+        # Dilated convolutions and nothing recurrent, so the receptive field is exact.
+        return True
+
     def _compilable_step(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
         """Lay the encoded params out across time, concatenate, run the inner WaveNet."""
         p_t = (

@@ -728,6 +728,20 @@ class _ParametricLightningModule(_LightningModule):
                 "loss.quasi_static_anchor requires a net that accepts a param "
                 f"trajectory; {type(net).__name__} does not"
             )
+        # Both of these treat the receptive field as the whole of the model's history --
+        # landed-move lands its gesture inside that prefix, and the quasi-static reference
+        # evaluates each block from a cold start. Neither is meaningful for a recurrent
+        # net, so refuse rather than train on a residual that measures the wrong thing.
+        bounded = takes_trajectory and net.receptive_field_bounds_memory
+        for setting, enabled in (
+            ("landed_move", landed_move_config is not None),
+            ("loss.quasi_static_anchor", self._loss_config.quasi_static_anchor is not None),
+        ):
+            if enabled and takes_trajectory and not bounded:
+                raise ValueError(
+                    f"{setting} requires a net whose receptive field bounds its memory; "
+                    f"{type(net).__name__} is recurrent"
+                )
         # The quasi-static anchor scores a moving control against a frozen one over real
         # audio, so it needs the batch's input; `_get_loss_dict` only sees predictions.
         self._batch_input: _Optional[_torch.Tensor] = None
