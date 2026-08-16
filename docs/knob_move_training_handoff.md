@@ -56,6 +56,64 @@ FiLM (from `sd1_film_silence`; silence anchors on in all four):
 ConcatLSTM (from `SD1_lstm`; 2x2, because silence anchors have never run on it):
 `model_lstm_a_baseline` · `model_lstm_b_silence` · `model_lstm_c_landed` · `model_lstm_d_both`
 
+### Running them
+
+`tools/run_knob_move_arms.sh <gpu>` runs one GPU's half — two FiLM arms, then two LSTM arms.
+Launch one per GPU. `DATA_DIR` / `OUT_DIR` override the defaults.
+
+```bash
+./tools/run_knob_move_arms.sh 0 &
+./tools/run_knob_move_arms.sh 1 &
+```
+
+Arms are paired so each GPU takes one cheap and one expensive run of each architecture, since
+the quasi-static anchor adds two forwards per step on FiLM and the silence anchors add ~25% on
+the LSTM:
+
+```
+GPU 0   film a_baseline → film d_both → lstm a_baseline → lstm d_both
+GPU 1   film b_landed   → film c_quasi → lstm c_landed   → lstm b_silence
+```
+
+## ConcatLSTM speed settings
+
+The `SD1_lstm` run took 2x the FiLM run. An LSTM's cost is sequential cell evaluations per
+epoch, which works out to `total_samples / batch_size` — **independent of `ny`**, so batch size
+is the only real lever. At `batch_size: 8` a 4090 is idle: 4 layers x 32 hidden is ~140k MACs
+per timestep. Applied:
+
+```
+learning_lstm.json    train batch_size 8 -> 32      233 -> 58 steps/epoch, 7.6M -> 1.9M
+                      val   batch_size 2 -> 6       validation was 3 sequential passes, now 1
+                      benchmark false -> true
+model_lstm_*.json     train_truncate  null -> 8192  bounds BPTT depth and memory
+                      train_burn_in   null -> 8192  no backward through the masked prefix
+                      lr 0.01 -> 0.02               sqrt scaling for 4x fewer optimizer steps
+                      lr_scheduler.frequency 100 -> 25   decay is per-step; keeps the same
+                                                          per-epoch schedule (~10% of initial
+                                                          by epoch 200, not ~56%)
+```
+
+Expect ~4-5x faster epochs. **Reasoned from the code and the arithmetic above, not measured on
+a GPU.**
+
+Things worth knowing here:
+
+- **Truncation does not reduce how much is trained.** Verified: forward output is bit-identical
+  (0.000e+00), same 24576 scored samples, same 30369/30369 parameters receiving gradient. Only
+  the backward *reach* is capped at 8192 samples (170 ms) — far beyond the pedal's physical
+  memory, and the AL work found the long chain was what amplified gradients ~3e17x.
+- **Truncation does not cost the cuDNN fast path** in normal training. The
+  `_g_opt_cuda_train_mode_safe` caveat lives only in `active_learning.py` (the g-opt member of
+  `find_disagreement_settings`). In `_run_conditioned` a set truncate is just several
+  `nn.LSTM` calls instead of one, and `_L` subclasses `nn.LSTM`, so each chunk is still fused.
+- **`train_burn_in` is silently ignored unless `train_truncate` is set** — see the
+  `if not self.training or self._train_truncate is None:` branch in `_concat_lstm.py`.
+- Batch size is the one change that genuinely trades something: 4x fewer weight updates per
+  epoch. That is what the `lr` and scheduler changes compensate for. If training ESR is worse
+  than the old run at matched epochs, drop `lr` to 0.015; a collapse (train ESR toward 1.0) is
+  the documented AL failure mode and `lr` is the first thing to pull.
+
 ## Weights — calibrate on gradient norm, not loss value
 
 Both anchors are L1, whose gradient magnitude is independent of its own value, so comparing
