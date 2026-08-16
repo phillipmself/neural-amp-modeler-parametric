@@ -42,6 +42,9 @@ from nam.models.parametric._anchors import sample_raw_params as _sample_raw_para
 from nam.models.parametric._augment import (
     sample_landed_trajectories as _sample_landed_trajectories,
 )
+from nam.models.parametric._quasi_static import (
+    quasi_static_loss as _quasi_static_loss,
+)
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
 from nam.models.parametric import export_parametric as _export_parametric
@@ -557,6 +560,51 @@ class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
 
 
 @_dataclass
+class _QuasiStaticAnchorConfig(_SilenceAnchorRampConfig):
+    """
+    Settings for the quasi-static consistency anchor; see
+    :mod:`nam.models.parametric._quasi_static`.
+
+    Inherits the gesture sampler's settings from the ramp anchor -- the gesture model is
+    the same, only the audio and the target change.
+
+    ``block`` is how many output samples share one frozen-control reference. It sets both
+    the cost (the reference is one forward of ``batch_size * ny / block`` rows) and the
+    floor the loss can drive the artifact down to, at roughly 6 dB per doubling. It must
+    divide ``ny``.
+    """
+
+    block: int = 32
+
+    _EXTRA_FIELDS: _ClassVar[_Tuple[str, ...]] = (
+        *_SilenceAnchorRampConfig._EXTRA_FIELDS,
+        "block",
+    )
+
+    @classmethod
+    def _parse_extra(cls, config: dict) -> dict:
+        parsed = super()._parse_extra(config)
+        parsed["block"] = int(config.get("block", cls.block))
+        if parsed["block"] < 1:
+            raise ValueError(
+                f"Quasi-static anchor block must be >= 1; got {parsed['block']}"
+            )
+        return parsed
+
+    @classmethod
+    def from_config(
+        cls, config: _Optional[dict]
+    ) -> "_Optional[_QuasiStaticAnchorConfig]":
+        parsed = super().from_config(config)
+        if parsed is not None and parsed.ny % parsed.block:
+            raise ValueError(
+                f"Quasi-static anchor block ({parsed.block}) must divide ny "
+                f"({parsed.ny})"
+            )
+        return parsed
+
+
+@_dataclass
 class _LandedMoveConfig:
     """
     Settings for the landed-move augmentation; see :mod:`nam.models.parametric._augment`.
@@ -622,6 +670,7 @@ class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
     silence_anchor: _Optional[_SilenceAnchorConfig] = None
     silence_anchor_ramp: _Optional[_SilenceAnchorRampConfig] = None
+    quasi_static_anchor: _Optional[_QuasiStaticAnchorConfig] = None
 
     @classmethod
     def parse_config(cls, config):
@@ -632,6 +681,9 @@ class _ParametricLossConfig(_LossConfig):
         )
         parsed["silence_anchor_ramp"] = _SilenceAnchorRampConfig.from_config(
             config.get("silence_anchor_ramp")
+        )
+        parsed["quasi_static_anchor"] = _QuasiStaticAnchorConfig.from_config(
+            config.get("quasi_static_anchor")
         )
         return parsed
 
@@ -671,6 +723,14 @@ class _ParametricLightningModule(_LightningModule):
                 "landed_move requires a net that accepts a param trajectory; "
                 f"{type(net).__name__} does not"
             )
+        if self._loss_config.quasi_static_anchor is not None and not takes_trajectory:
+            raise ValueError(
+                "loss.quasi_static_anchor requires a net that accepts a param "
+                f"trajectory; {type(net).__name__} does not"
+            )
+        # The quasi-static anchor scores a moving control against a frozen one over real
+        # audio, so it needs the batch's input; `_get_loss_dict` only sees predictions.
+        self._batch_input: _Optional[_torch.Tensor] = None
         # Set via `set_capture_batch_samplers` once the dataloaders exist (see `main`).
         # `None` means "capture identity unavailable" -- `_EpochMetrics` then falls back
         # to single-level pooling over the whole split instead of a wrong two-level split.
@@ -694,7 +754,11 @@ class _ParametricLightningModule(_LightningModule):
         # model is actually used in.
         if self._landed_move_config is not None and self.training:
             batch = (*self._landed_move_batch(*batch[:-1]), batch[-1])
-        return super()._shared_step(batch)
+        self._batch_input = batch[0]
+        try:
+            return super()._shared_step(batch)
+        finally:
+            self._batch_input = None
 
     def _landed_move_batch(
         self, x: _torch.Tensor, params: _torch.Tensor
@@ -770,7 +834,39 @@ class _ParametricLightningModule(_LightningModule):
         # batch for a number that says nothing about the split.
         if self.training:
             loss_dict.update(self._silence_anchor_items())
+            quasi_static = self._loss_config.quasi_static_anchor
+            if quasi_static is not None and quasi_static.weight > 0.0:
+                loss_dict["Quasi-Static Anchor"] = _LossItem(
+                    quasi_static.weight, self._quasi_static_anchor_loss(quasi_static)
+                )
         return loss_dict
+
+    def _quasi_static_anchor_loss(
+        self, config: _QuasiStaticAnchorConfig
+    ) -> _torch.Tensor:
+        """Score a moving control against the model's own frozen-control render."""
+        net = _get_parametric_net(self)
+        x = self._batch_input
+        if x is None:
+            raise RuntimeError(
+                "quasi_static_anchor needs the batch's input audio; it can only be "
+                "computed from within _shared_step"
+            )
+        length = net.receptive_field - 1 + config.ny
+        if x.shape[0] < config.batch_size or x.shape[1] < length:
+            raise ValueError(
+                f"quasi_static_anchor wants {config.batch_size} rows of {length} samples, "
+                f"but the training batch is {x.shape[0]}x{x.shape[1]}; lower its "
+                "batch_size or ny"
+            )
+        # A random offset so the anchor sees the whole clip across steps rather than only
+        # its opening samples.
+        offset = int(
+            _torch.randint(x.shape[1] - length + 1, (1,), device="cpu").item()
+        )
+        window = x[: config.batch_size, offset : offset + length]
+        trajectory = self._sample_ramp_trajectories(net, config, length)
+        return _quasi_static_loss(net, window, trajectory, config.ny, config.block)
 
     def _silence_anchor_items(self) -> _Dict[str, _LossItem]:
         """The enabled silence anchors, in as few forwards as the net allows.
