@@ -1,12 +1,15 @@
 import pytest as _pytest
 import torch as _torch
 
+from nam.models.parametric import ConcatLSTM as ConcatLSTM
+from nam.models.parametric import ParamSpec as _ParamSpec
 from nam.models.parametric import ConcatWaveNet as _ConcatWaveNet
 from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric._augment import (
     sample_landed_trajectories as _sample_landed_trajectories,
 )
 from nam.train.parametric import _LandedMoveConfig as _LandedMoveConfig
+from nam.train.parametric import _ParametricLossConfig as _ParametricLossConfig
 from nam.train.parametric import _ParametricLightningModule as _ParametricLightningModule
 from tests.parametric.test_concat_wavenet import _concat_wavenet_config
 from tests.parametric.test_hyperwavenet import _hyperwavenet_config
@@ -162,7 +165,7 @@ def test_margin_that_cannot_fit_the_history_is_rejected():
     module = _module(min_margin_seconds=0.5)
     module.train()
 
-    with _pytest.raises(ValueError, match="receptive-field history"):
+    with _pytest.raises(ValueError, match="ahead of this model's first"):
         module._shared_step(_batch(module.net))
 
 
@@ -190,3 +193,61 @@ def test_config_rejects_invalid(config):
 
 def test_config_absent_by_default():
     assert _LandedMoveConfig.from_config(None) is None
+
+
+def test_land_by_counts_the_loss_mask_as_room():
+    """A masked prefix is unscored, so a gesture may land in it.
+
+    This is the only room a recurrent net has -- its receptive field describes per-step
+    arithmetic, not memory -- and it must be added to the convolutional prefix rather than
+    replacing it.
+    """
+    net = _net()
+    # Big enough that the whole configured margin range fits inside the mask alone -- the
+    # toy net's receptive field contributes only a handful of samples.
+    mask = 8192
+    module = _ParametricLightningModule(
+        _net(),
+        loss_config=_ParametricLossConfig(mask_first=mask),
+        landed_move_config=_LandedMoveConfig(probability=1.0),
+    )
+    module.train()
+    scored = 64
+    length = net.receptive_field - 1 + scored + mask
+    destination = _torch.tensor([[7.5, 2.0]]).expand(8, -1).contiguous()
+
+    _, trajectory = module._landed_move_batch(
+        _torch.randn(8, length), destination, scored + mask
+    )
+
+    # Nothing may still be moving once the scored region opens.
+    opens = length - scored
+    still = trajectory[:, opens:, :]
+    assert _torch.allclose(still, destination[:, None, :].expand_as(still), atol=1e-5)
+
+
+def test_a_recurrent_net_can_land_a_move_in_its_mask():
+    """Landed-move needs no frozen reference, so recurrence is no obstacle -- unlike the
+    quasi-static anchor, which cannot build a clean reference on a recurrent net."""
+    specs = [
+        _ParamSpec(name="a", min=0.0, max=10.0, default=5.0, type="continuous"),
+        _ParamSpec(name="b", min=0.0, max=10.0, default=5.0, type="continuous"),
+    ]
+    net = ConcatLSTM(param_specs=specs, hidden_size=4, num_layers=1)
+    net.sample_rate = _SAMPLE_RATE
+    mask = 8192
+    module = _ParametricLightningModule(
+        net,
+        loss_config=_ParametricLossConfig(mask_first=mask),
+        landed_move_config=_LandedMoveConfig(probability=1.0),
+    )
+    module.train()
+    length = mask + 512
+    destination = _torch.tensor([[4.0, 4.5]]).expand(4, -1).contiguous()
+
+    _, trajectory = module._landed_move_batch(
+        _torch.randn(4, length), destination, length
+    )
+
+    still = trajectory[:, mask:, :]
+    assert _torch.allclose(still, destination[:, None, :].expand_as(still), atol=1e-5)
