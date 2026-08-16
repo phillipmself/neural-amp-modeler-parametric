@@ -728,20 +728,24 @@ class _ParametricLightningModule(_LightningModule):
                 "loss.quasi_static_anchor requires a net that accepts a param "
                 f"trajectory; {type(net).__name__} does not"
             )
-        # Both of these treat the receptive field as the whole of the model's history --
-        # landed-move lands its gesture inside that prefix, and the quasi-static reference
-        # evaluates each block from a cold start. Neither is meaningful for a recurrent
-        # net, so refuse rather than train on a residual that measures the wrong thing.
-        bounded = takes_trajectory and net.receptive_field_bounds_memory
-        for setting, enabled in (
-            ("landed_move", landed_move_config is not None),
-            ("loss.quasi_static_anchor", self._loss_config.quasi_static_anchor is not None),
+        # The quasi-static reference evaluates each block from a cold start, which for a
+        # recurrent net throws away the state the moving render carried in. Measured on the
+        # trained SD1 ConcatLSTM, that lead-in error is only -25 dB at 50 ms of warm-up and
+        # -37 dB at 200 ms, decaying ~5 dB per doubling -- at or above the -34 to -49 dB
+        # artifact the term exists to measure. A reference no better than what it measures
+        # is the same trap the capture crossfade fell into, so refuse rather than pretend.
+        # Landed-move needs no reference at all, only room ahead of the first scored
+        # sample, so it stays available to every architecture.
+        if (
+            self._loss_config.quasi_static_anchor is not None
+            and takes_trajectory
+            and not net.receptive_field_bounds_memory
         ):
-            if enabled and takes_trajectory and not bounded:
-                raise ValueError(
-                    f"{setting} requires a net whose receptive field bounds its memory; "
-                    f"{type(net).__name__} is recurrent"
-                )
+            raise ValueError(
+                "loss.quasi_static_anchor requires a net whose receptive field bounds its "
+                f"memory; {type(net).__name__} is recurrent, so its frozen-control "
+                "reference cannot be made accurate enough to score against"
+            )
         # The quasi-static anchor scores a moving control against a frozen one over real
         # audio, so it needs the batch's input; `_get_loss_dict` only sees predictions.
         self._batch_input: _Optional[_torch.Tensor] = None
@@ -767,7 +771,7 @@ class _ParametricLightningModule(_LightningModule):
         # history, and validation must keep measuring the parked-control case the exported
         # model is actually used in.
         if self._landed_move_config is not None and self.training:
-            batch = (*self._landed_move_batch(*batch[:-1]), batch[-1])
+            batch = (*self._landed_move_batch(*batch[:-1], batch[-1].shape[-1]), batch[-1])
         self._batch_input = batch[0]
         try:
             return super()._shared_step(batch)
@@ -775,7 +779,7 @@ class _ParametricLightningModule(_LightningModule):
             self._batch_input = None
 
     def _landed_move_batch(
-        self, x: _torch.Tensor, params: _torch.Tensor
+        self, x: _torch.Tensor, params: _torch.Tensor, scored: int
     ) -> _Tuple[_torch.Tensor, ...]:
         """Swap the batch's held setting for a gesture that lands before the target does."""
         config = self._landed_move_config
@@ -786,16 +790,21 @@ class _ParametricLightningModule(_LightningModule):
                 "landed_move needs the model sample rate to convert its ramp and margin "
                 "durations to samples"
             )
-        # `_shared_step` runs with pad_start=False, so the receptive-field history is the
-        # head of the window and the first scored sample follows it.
-        land_by = net.receptive_field - 1
+        # Everything ahead of the first scored sample is room a gesture can land in. That
+        # is the receptive-field history a convolutional net consumes before it emits
+        # anything (`_shared_step` runs with pad_start=False, so it sits at the head of the
+        # window), plus whatever the loss masks off the front. A recurrent net contributes
+        # nothing to the first term -- its receptive field describes per-step arithmetic
+        # rather than memory -- and leans entirely on the mask.
+        land_by = (x.shape[1] - scored) + self._loss_config.mask_first
         if config.min_margin_seconds * sample_rate >= land_by:
             # Every gesture would land before the window even opens, leaving the control
             # constant across it -- the augmentation would silently do nothing at all.
             raise ValueError(
                 f"landed_move min_margin_seconds ({config.min_margin_seconds}) leaves no "
-                f"room in this model's {land_by / sample_rate:.3f} s of receptive-field "
-                "history for a gesture to land inside the window"
+                f"room in the {land_by / sample_rate:.3f} s ahead of this model's first "
+                "scored sample for a gesture to land in; widen loss.mask_first or shorten "
+                "the margin"
             )
         return (
             x,
