@@ -76,6 +76,32 @@ def test_export_weights_round_trip():
     assert _torch.allclose(second._initial_cell, expected_cell[:, 0, :])
 
 
+def test_import_weights_nonzero_offset():
+    # ParametricNet.import_weights(weights, i) must be able to read a weight blob starting
+    # at an arbitrary offset (the contract that lets a caller pack several submodels' weights
+    # into one buffer) and return the offset just past what it consumed. Prepend a stand-in
+    # prefix for "another submodel's weights" and import starting after it.
+    _torch.manual_seed(0)
+    first = _init(_concat_lstm_config())
+    second = _init(_concat_lstm_config())
+    first.eval()
+    second.eval()
+
+    prefix = _np.array([123.456, -7.0, 42.0])
+    weights = first._export_weights()
+    packed = _np.concatenate([prefix, weights])
+
+    end = second.import_weights(packed, i=len(prefix))
+    assert end == len(packed)
+
+    x = _torch.randn(1, 40, first._core.input_size)
+    h0 = _torch.randn(first._core.num_layers, 1, first._core.hidden_size)
+    c0 = _torch.randn(first._core.num_layers, 1, first._core.hidden_size)
+    y1, _ = first._process_in_blocks(x, (h0, c0))
+    y2, _ = second._process_in_blocks(x, (h0.clone(), c0.clone()))
+    assert _torch.allclose(first._apply_head(y1), second._apply_head(y2), atol=1e-6)
+
+
 def test_full_export_round_trip_through_factory():
     _torch.manual_seed(0)
     first = _init(_concat_lstm_config())
