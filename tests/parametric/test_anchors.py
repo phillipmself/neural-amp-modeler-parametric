@@ -1,3 +1,5 @@
+import math as _math
+
 import pytest as _pytest
 import torch as _torch
 
@@ -5,10 +7,15 @@ from nam.models.parametric import ConcatLSTM as _ConcatLSTM
 from nam.models.parametric import ConcatWaveNet as _ConcatWaveNet
 from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import anchor_window as _anchor_window
+from nam.models.parametric._anchors import (
+    sample_param_trajectories as _sample_param_trajectories,
+)
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
 from nam.train.parametric import _ParametricLightningModule as _ParametricLightningModule
 from nam.train.parametric import _ParametricLossConfig as _ParametricLossConfig
 from nam.train.parametric import _SilenceAnchorConfig as _SilenceAnchorConfig
+from nam.train.parametric import _SilenceAnchorRampConfig as _SilenceAnchorRampConfig
 from nam.train.parametric import _silence_anchor_norm as _silence_anchor_norm
 from tests.parametric.test_concat_lstm import _concat_lstm_config
 from tests.parametric.test_concat_wavenet import _concat_wavenet_config
@@ -265,3 +272,258 @@ def test_silence_anchor_config_parsing():
 def test_silence_anchor_config_rejects_invalid(config):
     with _pytest.raises(ValueError):
         _SilenceAnchorConfig.from_config(config)
+
+
+# The shipped defaults, so the sampler tests exercise the regime training runs in.
+_DEFAULT_TRAVEL = {
+    "min_window_travel": _SilenceAnchorRampConfig.min_window_travel,
+    "max_window_travel": _SilenceAnchorRampConfig.max_window_travel,
+}
+
+
+def _travel_fraction(trajectories, param_specs, window):
+    """Per row, the largest fraction of any control's full range that the row traverses
+    where the loss can see it.
+
+    Measured over the scored tail, not the whole window: a gesture that resolved during
+    a recurrent net's burn-in traverses its range where nothing is scored, and counting
+    that would report a healthy sampler on the rows that prove it is not. The tail is
+    also what gesture speed is drawn against, so a row's travel here is the number the
+    sampler was asked for, less whatever the window's edges cut off.
+
+    Continuous controls only: a switch either steps or does not, so including it would
+    report a full traversal for a row whose knobs never budged.
+    """
+    columns = [i for i, spec in enumerate(param_specs) if spec.type != "switch"]
+    ranges = _torch.tensor([param_specs[i].max - param_specs[i].min for i in columns])
+    scored = trajectories[:, -window.ny :, columns]
+    return ((scored.amax(dim=1) - scored.amin(dim=1)) / ranges).amax(dim=1)
+
+
+@_pytest.mark.parametrize("training", [False, True])
+@_pytest.mark.parametrize("net", _concat_nets())
+def test_a_constant_trajectory_matches_the_held_setting(net, training):
+    """
+    A control that never moves is a trajectory like any other. If the two paths disagree
+    the trajectory plumbing is laying the controls out wrong -- transposed, misaligned in
+    time, or broadcast where it should be strict -- and the moving anchor would then be
+    scoring a window the net never really saw.
+
+    Run in both modes: training is where a recurrent net takes its truncated-BPTT block
+    loop, which is the path that could misalign a trajectory across block boundaries.
+    """
+    net.train(training)
+    params = _sample_raw_params(net.param_specs, 3)
+    window = _anchor_window(net, 16)
+    held = params[:, None, :].expand(-1, window.length, -1)
+
+    assert _torch.allclose(
+        _anchor_output(net, held, ny=16), _anchor_output(net, params, ny=16), atol=1e-6
+    )
+
+
+def test_hyperwavenet_refuses_a_trajectory():
+    """This net generates its weights from the control vector as a whole, so a value that
+    moves within one forward has no meaning to give it."""
+    net = _HyperWaveNet.init_from_config(_hyperwavenet_config())
+    assert not net.supports_param_trajectory
+    length = net.receptive_field - 1 + 8
+
+    with _pytest.raises(NotImplementedError):
+        net(_torch.zeros((2, length)), _torch.zeros((2, length, net.param_dim)))
+
+
+def test_silence_anchor_ramp_refused_at_construction_on_such_a_net():
+    """Fail while the config is being read, not on the first training step, since the
+    setting cannot be honoured at all."""
+    with _pytest.raises(ValueError):
+        _ParametricLightningModule(
+            _HyperWaveNet.init_from_config(_hyperwavenet_config()),
+            loss_config=_ParametricLossConfig(
+                silence_anchor_ramp=_SilenceAnchorRampConfig(weight=1.0)
+            ),
+        )
+
+
+def test_sampled_trajectories_are_valid_control_values():
+    """Every frame is encoded on its way into the net, so an out-of-range value or a
+    fractional switch index would fail there rather than here."""
+    net = _net()
+    window = _anchor_window(net, 32)
+    trajectories = _sample_param_trajectories(
+        net.param_specs, 64, window, **_DEFAULT_TRAVEL
+    )
+
+    assert trajectories.shape == (64, window.length, net.param_dim)
+    for i, spec in enumerate(net.param_specs):
+        values = trajectories[..., i]
+        assert (values >= spec.min).all() and (values <= spec.max).all()
+        if spec.type == "switch":
+            # Switches step between indices rather than blending: a fractional index is
+            # a conditioning vector no model was ever trained on.
+            assert (values == values.round()).all()
+    net._encode_params(trajectories)
+
+
+def test_every_sampled_trajectory_moves_a_control_unless_it_is_a_hold():
+    """A row that does not move must be one that was chosen not to, not an accident.
+
+    ``hold_probability`` rows are deliberately still -- they are what pins the
+    DC-vs-control map. Any other still row is the term paying for a trajectory forward
+    and scoring a setting the static anchor already covers.
+    """
+    net = _net()
+    window = _anchor_window(net, 4096)
+    trajectories = _sample_param_trajectories(
+        net.param_specs,
+        4096,
+        window,
+        min_window_travel=8.0,
+        max_window_travel=8.0,
+        hold_probability=0.25,
+        generator=_torch.Generator().manual_seed(0),
+    )
+
+    def still_fraction(rows):
+        return (rows[:, 0, :] == rows[:, -1, :]).all(dim=1).float().mean().item()
+
+    assert still_fraction(trajectories) == _pytest.approx(0.25, abs=0.03)
+
+    no_holds = _sample_param_trajectories(
+        net.param_specs,
+        4096,
+        window,
+        min_window_travel=8.0,
+        max_window_travel=8.0,
+        hold_probability=0.0,
+        generator=_torch.Generator().manual_seed(0),
+    )
+    # Not exactly zero: a gesture may commit past the last sample of the window, which
+    # is a still row arrived at honestly. It has to stay rare enough that the hold rate
+    # is what sets how much of the batch holds still.
+    assert still_fraction(no_holds) < 0.01
+
+
+def test_gesture_speed_is_the_same_for_every_architecture_and_window():
+    """
+    One config has to mean one gesture, whatever net it is training and however wide its
+    window. Speed is drawn against the scored tail, which is ``ny`` samples for every
+    architecture; drawing it against the whole influencing span instead would hand a
+    convolutional net ``receptive_field - 1 + ny`` where a recurrent net gets ``ny``, and
+    the same numbers would train the two on gestures an order of magnitude apart.
+
+    Without a common yardstick the term cannot be compared between architectures at all:
+    a run that reduced knob noise would be reporting how fast its net's gestures happened
+    to be as much as how well it learned them.
+    """
+    medians = {}
+    for name, factory in (("wavenet", _net), ("recurrent", _burn_in_lstm)):
+        net = factory()
+        net.train()
+        for ny in (512, 8192):
+            window = _anchor_window(net, ny)
+            trajectories = _sample_param_trajectories(
+                net.param_specs,
+                2048,
+                window,
+                hold_probability=0.0,
+                generator=_torch.Generator().manual_seed(0),
+                **_DEFAULT_TRAVEL,
+            )
+            moved = _travel_fraction(trajectories, net.param_specs, window)
+            # Rows whose continuous controls were all held still are the `held` mask and
+            # the switch-only gestures doing their job, not slow gestures. Speed is only
+            # a question where something is actually moving.
+            medians[(name, ny)] = moved[moved > 0.0].median().item()
+
+    reference = medians[("wavenet", 512)]
+    for key, median in medians.items():
+        assert median == _pytest.approx(reference, rel=0.1), key
+
+    # Floors, so "the same everywhere" cannot be satisfied by moving nothing. Both are
+    # derived from the configured bounds rather than fixed, so they track the defaults.
+    # The median lands below the drawn geometric mean because a commit instant near the
+    # window's edge leaves part of its gesture outside the tail.
+    geometric_mean = _math.sqrt(
+        _DEFAULT_TRAVEL["min_window_travel"] * _DEFAULT_TRAVEL["max_window_travel"]
+    )
+    assert geometric_mean / 10.0 < reference < geometric_mean
+
+
+def test_silence_anchor_ramp_in_training_loss_dict_and_epoch_metrics():
+    from nam.train.parametric import _BUCKET_MEAN_METRICS, _bucket_means
+
+    assert "Silence Anchor Ramp" in _BUCKET_MEAN_METRICS
+    module = _ParametricLightningModule(
+        _net(),
+        loss_config=_ParametricLossConfig(
+            silence_anchor_ramp=_SilenceAnchorRampConfig(
+                weight=0.25, batch_size=2, ny=16
+            )
+        ),
+    )
+    module.train()
+
+    loss_dict = module._get_loss_dict(_torch.randn((2, 64)), _torch.randn((2, 64)))
+
+    item = loss_dict["Silence Anchor Ramp"]
+    assert item.weight == _pytest.approx(0.25)
+    assert item.value.ndim == 0 and item.value >= 0.0
+    assert "Silence Anchor Ramp" in _bucket_means(loss_dict)
+
+
+@_pytest.mark.parametrize("training", [False, True])
+def test_silence_anchor_ramp_skipped_when_it_should_be(training):
+    """Validation and zero weight, the two ways the term must cost nothing."""
+    module = _ParametricLightningModule(
+        _net(),
+        loss_config=_ParametricLossConfig(
+            silence_anchor_ramp=_SilenceAnchorRampConfig(
+                weight=0.0 if training else 1.0, batch_size=2, ny=16
+            )
+        ),
+    )
+    module.train(training)
+
+    loss_dict = module._get_loss_dict(_torch.randn((2, 64)), _torch.randn((2, 64)))
+
+    assert "Silence Anchor Ramp" not in loss_dict
+
+
+def test_silence_anchor_ramp_config_parsing():
+    parsed = _ParametricLossConfig.parse_config(
+        {
+            "silence_anchor_ramp": {
+                "weight": 1.5,
+                "ny": 64,
+                "min_window_travel": 0.01,
+                "max_window_travel": 0.5,
+                "hold_probability": 0.5,
+                "rail_probability": 0.5,
+            }
+        }
+    )
+    ramp = parsed["silence_anchor_ramp"]
+    assert ramp.weight == _pytest.approx(1.5)
+    assert ramp.ny == 64
+    assert ramp.min_window_travel == _pytest.approx(0.01)
+    assert ramp.max_window_travel == _pytest.approx(0.5)
+    assert ramp.hold_probability == _pytest.approx(0.5)
+    assert ramp.rail_probability == _pytest.approx(0.5)
+    # Absent by default, so an existing project trains exactly as it did before.
+    assert _ParametricLossConfig.parse_config({})["silence_anchor_ramp"] is None
+
+
+@_pytest.mark.parametrize(
+    "config",
+    [
+        {"weight": 1.0, "min_window_travel": 0.0},
+        {"weight": 1.0, "min_window_travel": 1.0, "max_window_travel": 0.5},
+        {"weight": 1.0, "hold_probability": 1.5},
+        {"weight": 1.0, "rail_probability": 1.5},
+        {"weight": 1.0, "typo": 3},
+    ],
+)
+def test_silence_anchor_ramp_config_rejects_invalid(config):
+    with _pytest.raises(ValueError):
+        _SilenceAnchorRampConfig.from_config(config)

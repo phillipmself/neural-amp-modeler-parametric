@@ -1,9 +1,11 @@
 import json as _json
 from dataclasses import dataclass as _dataclass
+from dataclasses import fields as _fields
 from pathlib import Path as _Path
 from time import time as _time
 from collections.abc import Sequence as _Sequence
 from typing import Optional as _Optional
+from typing import Tuple as _Tuple
 from warnings import warn as _warn
 
 import librosa as _librosa
@@ -28,6 +30,10 @@ from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric import ParametricDataset as _ParametricDataset
 from nam.models.parametric import ParametricNet as _ParametricNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import anchor_window as _anchor_window
+from nam.models.parametric._anchors import (
+    sample_param_trajectories as _sample_param_trajectories,
+)
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
@@ -75,7 +81,7 @@ _TRAIN_BUCKET = "seen_audio_seen_params"
 _VALIDATION_BUCKET = "unseen_audio_unseen_params"
 # Means reduced as sample-weighted averages across the epoch. ESR is handled
 # separately because it is a ratio of energies, not a mean.
-_BUCKET_MEAN_METRICS = ("MSE", "MRSTFT", "Silence Anchor")
+_BUCKET_MEAN_METRICS = ("MSE", "MRSTFT", "Silence Anchor", "Silence Anchor Ramp")
 
 
 class _MelSpectrogram(_torch.nn.Module):
@@ -267,12 +273,14 @@ def _enable_training_fast_paths(
         )
     compile_config = dict(compile_config)
     net.set_compiled(bool(compile_config.pop("enabled", False)), **compile_config)
+    net.set_validate_params(False)
 
 
 def _release_training_fast_paths(net: _ParametricNet) -> None:
     if isinstance(net, _HyperWaveNet):
         net.set_uniform_batch_params(False)
     net.set_compiled(False)
+    net.set_validate_params(True)
 
 
 def _get_parametric_net(model: _LightningModule) -> _ParametricNet:
@@ -444,11 +452,45 @@ class _SilenceAnchorConfig:
     batch is not. That trade reverses on a net that requires uniform batch params
     (HyperWaveNet), where each row is a separate forward with its own generated weights,
     so ``batch_size`` multiplies the whole cost.
+
+    ``silence_anchor_ramp`` covers everything this term does and more on a net that
+    accepts a param trajectory, so this one is what remains for the nets that cannot take
+    one (HyperWaveNet).
     """
 
     weight: float
     batch_size: int = 8
     ny: int = 512
+    rail_probability: float = 0.25
+
+    def __post_init__(self):
+        # Validated here rather than in `from_config` so a config built in code gets the
+        # same guarantees as one read from JSON.
+        if self.weight < 0.0:
+            raise ValueError(f"Silence anchor weight must be >= 0; got {self.weight}")
+        if self.batch_size < 1:
+            raise ValueError(
+                f"Silence anchor batch_size must be >= 1; got {self.batch_size}"
+            )
+        if self.ny < 1:
+            raise ValueError(f"Silence anchor ny must be >= 1; got {self.ny}")
+        if not 0.0 <= self.rail_probability <= 1.0:
+            raise ValueError(
+                "Silence anchor rail_probability must be within [0, 1]; got "
+                f"{self.rail_probability}"
+            )
+
+    def sample_params(self, net: _ParametricNet) -> _torch.Tensor:
+        """The control settings to run one anchor batch at, as ``(batch_size, P)``."""
+        return _sample_raw_params(
+            net.param_specs,
+            self.batch_size,
+            rail_probability=self.rail_probability,
+            device=next(net.parameters()).device,
+        )
+
+    def check_net(self, net: _ParametricNet) -> None:
+        """Raise if this anchor cannot be run against ``net``, called at construction."""
 
     @classmethod
     def from_config(cls, config: _Optional[dict]) -> "_Optional[_SilenceAnchorConfig]":
@@ -458,33 +500,87 @@ class _SilenceAnchorConfig:
             raise ValueError(
                 f"Silence anchor config must be a mapping; got {type(config).__name__}"
             )
-        unknown = sorted(set(config) - {"weight", "batch_size", "ny"})
+        # Both the accepted keys and their coercion come off the dataclass, so adding or
+        # dropping a field is a one-line edit with nothing else to keep in step. This
+        # holds only while every field is annotated with a plain callable type: an
+        # `Optional[...]` annotation, or deferred annotations (`from __future__ import
+        # annotations`), leave `field.type` a non-callable and break every parse.
+        coerce = {field.name: field.type for field in _fields(cls)}
+        unknown = sorted(set(config) - set(coerce))
         if unknown:
             raise ValueError(
                 "Silence anchor config has unknown field(s): " + ", ".join(unknown)
             )
         if "weight" not in config:
             raise ValueError("Silence anchor config must define weight")
-        parsed = cls(
-            weight=float(config["weight"]),
-            batch_size=int(config.get("batch_size", cls.batch_size)),
-            ny=int(config.get("ny", cls.ny)),
-        )
-        if parsed.weight < 0.0:
-            raise ValueError(f"Silence anchor weight must be >= 0; got {parsed.weight}")
-        if parsed.batch_size < 1:
+        return cls(**{name: coerce[name](value) for name, value in config.items()})
+
+
+@_dataclass
+class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
+    """
+    Settings for the moving-control silence anchor.
+
+    Gesture speed is drawn as window travel rather than in seconds; see
+    :func:`sample_param_trajectories` for why the scored tail rather than the wall clock
+    is the right yardstick. Travel above 1 is a gesture that resolves inside the tail, so
+    its settling tail is scored.
+
+    The default range brackets the runtime's own 200 ms smoothing ramp, which at the
+    shipping ``ny`` of 512 is a travel of about 0.05 -- the range's log-midpoint. It
+    reaches an order of magnitude either side of that: a slow two-second sweep, and a
+    move faster than the smoothing can produce, which is what an automation jump or a
+    preset recall looks like.
+
+    ``hold_probability`` of the rows hold still, which is what the static anchor does. A
+    net that accepts a trajectory therefore needs only this term; ``silence_anchor`` is
+    for the nets that cannot take one.
+    """
+
+    min_window_travel: float = 0.005
+    max_window_travel: float = 0.5
+    hold_probability: float = 0.25
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0.0 < self.min_window_travel <= self.max_window_travel:
             raise ValueError(
-                f"Silence anchor batch_size must be >= 1; got {parsed.batch_size}"
+                "Silence anchor window travel must satisfy "
+                "0 < min_window_travel <= max_window_travel; got "
+                f"{self.min_window_travel} and {self.max_window_travel}"
             )
-        if parsed.ny < 1:
-            raise ValueError(f"Silence anchor ny must be >= 1; got {parsed.ny}")
-        return parsed
+        if not 0.0 <= self.hold_probability <= 1.0:
+            raise ValueError(
+                "Silence anchor hold_probability must be within [0, 1]; got "
+                f"{self.hold_probability}"
+            )
+
+    def sample_params(self, net: _ParametricNet) -> _torch.Tensor:
+        """One control gesture per row, as ``(batch_size, window length, P)``."""
+        return _sample_param_trajectories(
+            net.param_specs,
+            self.batch_size,
+            _anchor_window(net, self.ny),
+            min_window_travel=self.min_window_travel,
+            max_window_travel=self.max_window_travel,
+            rail_probability=self.rail_probability,
+            hold_probability=self.hold_probability,
+            device=next(net.parameters()).device,
+        )
+
+    def check_net(self, net: _ParametricNet) -> None:
+        if not (isinstance(net, _ParametricNet) and net.supports_param_trajectory):
+            raise ValueError(
+                "loss.silence_anchor_ramp requires a net that accepts a param "
+                f"trajectory; {type(net).__name__} does not"
+            )
 
 
 @_dataclass
 class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
     silence_anchor: _Optional[_SilenceAnchorConfig] = None
+    silence_anchor_ramp: _Optional[_SilenceAnchorRampConfig] = None
 
     @classmethod
     def parse_config(cls, config):
@@ -492,6 +588,9 @@ class _ParametricLossConfig(_LossConfig):
         parsed["mel_weight"] = config.get("mel_weight")
         parsed["silence_anchor"] = _SilenceAnchorConfig.from_config(
             config.get("silence_anchor")
+        )
+        parsed["silence_anchor_ramp"] = _SilenceAnchorRampConfig.from_config(
+            config.get("silence_anchor_ramp")
         )
         return parsed
 
@@ -513,6 +612,11 @@ class _ParametricLightningModule(_LightningModule):
             ),
         )
         self._mel_mrstft = None
+        # Fail here rather than on the first training step: a net that conditions on the
+        # control vector as a whole has no meaning to give a control that moves within
+        # one forward, so the setting cannot be honoured at all.
+        for _, anchor in self._silence_anchors():
+            anchor.check_net(net)
         # Set via `set_capture_batch_samplers` once the dataloaders exist (see `main`).
         # `None` means "capture identity unavailable" -- `_EpochMetrics` then falls back
         # to single-level pooling over the whole split instead of a wrong two-level split.
@@ -556,23 +660,34 @@ class _ParametricLightningModule(_LightningModule):
                 self._loss_config.mel_weight,
                 self._mel_mrstft_loss(preds, targets),
             )
-        silence_anchor = self._loss_config.silence_anchor
-        # Training-only: the anchor is a regularizer on the model, not a measurement of
-        # held-out data, and computing it under validation would cost a forward per batch
-        # for a number that says nothing about the split.
-        if silence_anchor is not None and silence_anchor.weight > 0.0 and self.training:
-            loss_dict["Silence Anchor"] = _LossItem(
-                silence_anchor.weight, self._silence_anchor_loss(silence_anchor)
-            )
+        # Training-only: the anchors are regularizers on the model, not measurements of
+        # held-out data, and computing them under validation would cost a forward per
+        # batch for a number that says nothing about the split.
+        if self.training:
+            for name, anchor in self._silence_anchors():
+                if anchor.weight > 0.0:
+                    loss_dict[name] = _LossItem(
+                        anchor.weight, self._silence_anchor_loss(anchor)
+                    )
         return loss_dict
 
+    def _silence_anchors(self) -> _Sequence[_Tuple[str, _SilenceAnchorConfig]]:
+        """The configured anchors, each with the name it reports under."""
+        return [
+            (name, anchor)
+            for name, anchor in (
+                ("Silence Anchor", self._loss_config.silence_anchor),
+                ("Silence Anchor Ramp", self._loss_config.silence_anchor_ramp),
+            )
+            if anchor is not None
+        ]
+
     def _silence_anchor_loss(self, config: _SilenceAnchorConfig) -> _torch.Tensor:
-        """Silence in, a random control setting held across the window, silence out."""
+        """Silence in, the controls wherever the anchor puts them, silence out."""
         net = _get_parametric_net(self)
-        params = _sample_raw_params(
-            net.param_specs, config.batch_size, device=next(net.parameters()).device
+        return _silence_anchor_norm(
+            _anchor_output(net, config.sample_params(net), config.ny)
         )
-        return _silence_anchor_norm(_anchor_output(net, params, config.ny))
 
     def _mel_mrstft_loss(
         self, preds: _torch.Tensor, targets: _torch.Tensor

@@ -185,7 +185,14 @@ def test_encode_params_rejects_bad_shapes():
         model._encode_params(_torch.zeros(3))  # trailing dim 3 != param_dim 2
 
     with _pytest.raises(ValueError):
-        model._encode_params(_torch.zeros(1, 1, 2))  # 3-D not allowed
+        model._encode_params(_torch.zeros(1, 1, 1, 2))  # 4-D not allowed
+
+    # (B, T, P) is a per-sample control trajectory and does encode.
+    assert model._encode_params(_torch.zeros(2, 4, 2)).shape == (
+        2,
+        4,
+        model.encoded_param_dim,
+    )
 
 
 def test_encode_params_rejects_out_of_range_switch():
