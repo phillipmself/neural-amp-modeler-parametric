@@ -9,6 +9,9 @@ from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
 from nam.models.parametric._anchors import anchor_window as _anchor_window
 from nam.models.parametric._anchors import (
+    as_held_trajectory as _as_held_trajectory,
+)
+from nam.models.parametric._anchors import (
     sample_param_trajectories as _sample_param_trajectories,
 )
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
@@ -527,3 +530,69 @@ def test_silence_anchor_ramp_config_parsing():
 def test_silence_anchor_ramp_config_rejects_invalid(config):
     with _pytest.raises(ValueError):
         _SilenceAnchorRampConfig.from_config(config)
+
+
+@_pytest.mark.parametrize("net", _concat_nets())
+def test_stacking_anchor_batches_does_not_change_a_row(net):
+    """
+    Sharing a forward is only sound if a row's output does not depend on its neighbours.
+    That holds for both concat architectures -- neither convolution nor recurrence mixes
+    across the batch -- and it is what lets the two anchors be scored from one pass.
+    """
+    net.eval()
+    window = _anchor_window(net, 16)
+    held = _as_held_trajectory(_sample_raw_params(net.param_specs, 3), window.length)
+    moving = _sample_param_trajectories(
+        net.param_specs, 2, window, **_DEFAULT_TRAVEL
+    )
+
+    stacked = _anchor_output(net, _torch.cat([held, moving], dim=0), window.ny)
+
+    assert _torch.equal(stacked[:3], _anchor_output(net, held, window.ny))
+    assert _torch.equal(stacked[3:], _anchor_output(net, moving, window.ny))
+
+
+def _both_anchors(ramp_ny: int = 16) -> _ParametricLossConfig:
+    return _ParametricLossConfig(
+        silence_anchor=_SilenceAnchorConfig(weight=1.0, batch_size=3, ny=16),
+        silence_anchor_ramp=_SilenceAnchorRampConfig(
+            weight=1.0, batch_size=2, ny=ramp_ny
+        ),
+    )
+
+
+@_pytest.mark.parametrize(
+    "ramp_ny, forwards", [(16, 1), (32, 2)], ids=["merged", "windows differ"]
+)
+def test_both_anchors_share_one_forward_when_their_windows_agree(
+    mocker, ramp_ny, forwards
+):
+    """The point of the merge is the launch it saves, so the forward count is the thing
+    to assert. Anchors whose windows differ cannot stack and fall back to one each."""
+    net = _net()
+    module = _ParametricLightningModule(net, loss_config=_both_anchors(ramp_ny))
+    module.train()
+    spy = mocker.spy(net, "forward")
+
+    loss_dict = module._get_loss_dict(_torch.randn((2, 64)), _torch.randn((2, 64)))
+
+    assert spy.call_count == forwards
+    for name in ("Silence Anchor", "Silence Anchor Ramp"):
+        assert loss_dict[name].value.ndim == 0
+
+
+def test_a_zero_weight_anchor_costs_no_forward(mocker):
+    """Weight zero is how a config disables one of two terms; the other must still run,
+    and must not be dragged into a stacked forward with it."""
+    net = _net()
+    loss_config = _both_anchors()
+    loss_config.silence_anchor.weight = 0.0
+    module = _ParametricLightningModule(net, loss_config=loss_config)
+    module.train()
+    spy = mocker.spy(net, "forward")
+
+    loss_dict = module._get_loss_dict(_torch.randn((2, 64)), _torch.randn((2, 64)))
+
+    assert spy.call_count == 1
+    assert "Silence Anchor" not in loss_dict
+    assert spy.call_args.args[0].shape[0] == 2  # The ramp's rows only.

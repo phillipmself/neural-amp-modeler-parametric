@@ -30,7 +30,11 @@ from nam.models.parametric import HyperWaveNet as _HyperWaveNet
 from nam.models.parametric import ParametricDataset as _ParametricDataset
 from nam.models.parametric import ParametricNet as _ParametricNet
 from nam.models.parametric._anchors import anchor_output as _anchor_output
+from nam.models.parametric._anchors import AnchorWindow as _AnchorWindow
 from nam.models.parametric._anchors import anchor_window as _anchor_window
+from nam.models.parametric._anchors import (
+    as_held_trajectory as _as_held_trajectory,
+)
 from nam.models.parametric._anchors import (
     sample_param_trajectories as _sample_param_trajectories,
 )
@@ -480,7 +484,7 @@ class _SilenceAnchorConfig:
                 f"{self.rail_probability}"
             )
 
-    def sample_params(self, net: _ParametricNet) -> _torch.Tensor:
+    def sample_params(self, net: _ParametricNet, window: _AnchorWindow) -> _torch.Tensor:
         """The control settings to run one anchor batch at, as ``(batch_size, P)``."""
         return _sample_raw_params(
             net.param_specs,
@@ -488,6 +492,16 @@ class _SilenceAnchorConfig:
             rail_probability=self.rail_probability,
             device=next(net.parameters()).device,
         )
+
+    def as_trajectory(
+        self, net: _ParametricNet, window: _AnchorWindow
+    ) -> _torch.Tensor:
+        """This anchor's batch as ``(batch_size, window length, P)``.
+
+        The shape anchors have in common, which is what lets two of them share one
+        forward. A held setting is a trajectory whose value never changes.
+        """
+        return _as_held_trajectory(self.sample_params(net, window), window.length)
 
     def check_net(self, net: _ParametricNet) -> None:
         """Raise if this anchor cannot be run against ``net``, called at construction."""
@@ -555,18 +569,23 @@ class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
                 f"{self.hold_probability}"
             )
 
-    def sample_params(self, net: _ParametricNet) -> _torch.Tensor:
+    def sample_params(self, net: _ParametricNet, window: _AnchorWindow) -> _torch.Tensor:
         """One control gesture per row, as ``(batch_size, window length, P)``."""
         return _sample_param_trajectories(
             net.param_specs,
             self.batch_size,
-            _anchor_window(net, self.ny),
+            window,
             min_window_travel=self.min_window_travel,
             max_window_travel=self.max_window_travel,
             rail_probability=self.rail_probability,
             hold_probability=self.hold_probability,
             device=next(net.parameters()).device,
         )
+
+    def as_trajectory(
+        self, net: _ParametricNet, window: _AnchorWindow
+    ) -> _torch.Tensor:
+        return self.sample_params(net, window)
 
     def check_net(self, net: _ParametricNet) -> None:
         if not (isinstance(net, _ParametricNet) and net.supports_param_trajectory):
@@ -664,12 +683,66 @@ class _ParametricLightningModule(_LightningModule):
         # held-out data, and computing them under validation would cost a forward per
         # batch for a number that says nothing about the split.
         if self.training:
-            for name, anchor in self._silence_anchors():
-                if anchor.weight > 0.0:
-                    loss_dict[name] = _LossItem(
-                        anchor.weight, self._silence_anchor_loss(anchor)
-                    )
+            loss_dict.update(self._silence_anchor_items())
         return loss_dict
+
+    def _silence_anchor_items(self) -> dict[str, _LossItem]:
+        """The enabled anchors, in as few forwards as the net allows.
+
+        Anchors differ only in the control tensor they feed the same silent window, so
+        when their windows agree they are one forward over a stacked batch rather than
+        one each. Worth doing because these models are launch-bound rather than
+        compute-bound: two forwards of B rows cost close to twice one forward of 2B
+        however small the rows are, so halving the launches is worth more than the
+        arithmetic the stack adds.
+        """
+        anchors = [
+            (name, anchor)
+            for name, anchor in self._silence_anchors()
+            # A zero weight contributes nothing to the total, so its forward is skipped
+            # rather than run and multiplied away.
+            if anchor.weight > 0.0
+        ]
+        if not anchors:
+            return {}
+        net = _get_parametric_net(self)
+        if (
+            len(anchors) > 1
+            # Equal ny keeps the shared window identical to what each anchor would have
+            # run alone, so stacking cannot change either term's value.
+            and len({anchor.ny for _, anchor in anchors}) == 1
+            and net.supports_param_trajectory
+            # This net evaluates a batch row by row, so a stacked batch would buy
+            # nothing.
+            and not net.requires_uniform_batch_params
+        ):
+            return self._merged_silence_anchor_items(net, anchors)
+        return {
+            name: _LossItem(anchor.weight, self._silence_anchor_loss(anchor))
+            for name, anchor in anchors
+        }
+
+    def _merged_silence_anchor_items(
+        self,
+        net: _ParametricNet,
+        anchors: _Sequence[_Tuple[str, _SilenceAnchorConfig]],
+    ) -> dict[str, _LossItem]:
+        """Every anchor in one forward, each still scored over its own rows."""
+        window = _anchor_window(net, anchors[0][1].ny)
+        y = _anchor_output(
+            net,
+            _torch.cat(
+                [anchor.as_trajectory(net, window) for _, anchor in anchors], dim=0
+            ),
+            window.ny,
+        )
+        items = {}
+        start = 0
+        for name, anchor in anchors:
+            rows = y[start : start + anchor.batch_size]
+            items[name] = _LossItem(anchor.weight, _silence_anchor_norm(rows))
+            start += anchor.batch_size
+        return items
 
     def _silence_anchors(self) -> _Sequence[_Tuple[str, _SilenceAnchorConfig]]:
         """The configured anchors, each with the name it reports under."""
@@ -685,8 +758,9 @@ class _ParametricLightningModule(_LightningModule):
     def _silence_anchor_loss(self, config: _SilenceAnchorConfig) -> _torch.Tensor:
         """Silence in, the controls wherever the anchor puts them, silence out."""
         net = _get_parametric_net(self)
+        window = _anchor_window(net, config.ny)
         return _silence_anchor_norm(
-            _anchor_output(net, config.sample_params(net), config.ny)
+            _anchor_output(net, config.sample_params(net, window), window.ny)
         )
 
     def _mel_mrstft_loss(

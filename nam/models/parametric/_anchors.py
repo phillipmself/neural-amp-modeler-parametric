@@ -32,7 +32,10 @@ from ._base import ParametricNet as _ParametricNet
 from ._spec import ParamSpec as _ParamSpec
 
 
-class _AnchorWindow(_NamedTuple):
+class AnchorWindow(_NamedTuple):
+    """The silent window one anchor batch is run on; see :func:`anchor_window`."""
+
+
     #: Samples the net is run on, history and warmup included.
     length: int
     #: Earliest sample whose value can reach the scored tail.
@@ -97,7 +100,7 @@ def sample_raw_params(
     return _torch.cat(columns, dim=1)
 
 
-def anchor_window(net: _ParametricNet, ny: int) -> _AnchorWindow:
+def anchor_window(net: _ParametricNet, ny: int) -> AnchorWindow:
     """
     The silent window a net has to run to get ``ny`` scored output samples out of it.
 
@@ -115,7 +118,7 @@ def anchor_window(net: _ParametricNet, ny: int) -> _AnchorWindow:
     if ny < 1:
         raise ValueError(f"ny must be at least 1; got {ny}")
     warmup = net.training_warmup
-    return _AnchorWindow(
+    return AnchorWindow(
         length=net.receptive_field - 1 + warmup + ny, first_influencing=warmup, ny=ny
     )
 
@@ -178,10 +181,27 @@ def anchor_output(
     return y[..., -ny:]
 
 
+def as_held_trajectory(params: _torch.Tensor, length: int) -> _torch.Tensor:
+    """
+    Present a held ``(B, P)`` setting as the constant ``(B, length, P)`` trajectory.
+
+    A control that never moves is a trajectory like any other, which is what lets a held
+    anchor share a forward with a moving one. The result is a stride-0 view, so the
+    expansion costs nothing until something materializes it.
+    """
+    if params.ndim != 2:
+        raise ValueError(
+            f"Expected a held setting of shape (B, P); got {tuple(params.shape)}"
+        )
+    if length < 1:
+        raise ValueError(f"length must be at least 1; got {length}")
+    return params[:, None, :].expand(-1, length, -1)
+
+
 def sample_param_trajectories(
     param_specs: _Sequence[_ParamSpec],
     n: int,
-    window: _AnchorWindow,
+    window: AnchorWindow,
     *,
     min_window_travel: float,
     max_window_travel: float,
