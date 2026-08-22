@@ -61,6 +61,27 @@ class ParametricNet(_BaseNet, _ImportsWeights):
         self._warned_uncompilable_device = False
 
     @property
+    def requires_uniform_batch_params(self) -> bool:
+        """Whether a batched ``params`` must hold one setting repeated down the batch.
+
+        True only while a net is running under a promise that lets it apply one row's
+        setting to the whole batch. Callers that want a batch of *distinct* settings
+        (the silence anchor) must then evaluate the rows one at a time.
+        """
+        return False
+
+    @property
+    def training_warmup(self) -> int:
+        """Leading samples of a training window whose outputs carry no gradient.
+
+        Nets that warm an internal state up before scoring (``ConcatLSTM``'s detached
+        burn-in) report it here so callers that build their own windows can budget for
+        it. ``receptive_field`` does not cover this: a recurrent net's history lives in
+        hidden state rather than in the input window.
+        """
+        return 0
+
+    @property
     def supports_compiled_step(self) -> bool:
         """Whether ``set_compiled`` has an inner forward it can hand to ``torch.compile``.
 

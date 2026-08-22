@@ -105,6 +105,14 @@ class ConcatLSTM(_ParametricNet):
     def receptive_field(self) -> int:
         return 1
 
+    @property
+    def training_warmup(self) -> int:
+        # The burn-in is only taken on the truncated-BPTT path; without a truncation
+        # length the whole window is scored and nothing is detached.
+        if self._train_truncate is None or self._train_burn_in is None:
+            return 0
+        return self._train_burn_in
+
     def _run_conditioned(self, x: _torch.Tensor, p: _torch.Tensor) -> _torch.Tensor:
         if p.ndim == 1:
             p = p[None].expand(x.shape[0], -1)
