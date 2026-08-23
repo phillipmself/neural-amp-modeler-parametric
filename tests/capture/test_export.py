@@ -150,7 +150,8 @@ def test_build_model_config_shape_and_params_order(builder, name):
     assert isinstance(net_config["sample_rate"], float)
 
     assert net_config["head_scale"] == 0.01
-    assert config["loss"] == {"val_loss": "esr", "mrstft_weight": 0.0005}
+    assert config["loss"]["val_loss"] == "esr"
+    assert config["loss"]["mrstft_weight"] == 0.0005
     assert config["optimizer"]["weight_decay"] == 3.17e-07
     assert config["lr_scheduler"] == {
         "class": "ExponentialLR",
@@ -227,6 +228,30 @@ def test_build_model_config_is_loadable_by_its_net():
         )
         is not None
     )
+
+
+def test_concat_model_config_silence_anchors_build_a_module():
+    from nam.models.parametric import ConcatWaveNet as _ConcatWaveNet
+    from nam.train.parametric import (
+        _ParametricLightningModule as _Module,
+    )
+    from nam.train.parametric import _ParametricLossConfig as _LossConfig
+
+    config = _build_concat_model_config(_project())
+
+    loss_config = _LossConfig.init_from_config(config["loss"])
+    assert loss_config.silence_anchor is not None
+    assert loss_config.silence_anchor_ramp is not None
+
+    net = _ConcatWaveNet.init_from_config(config["net"]["config"])
+    # The ramp anchor rejects a net that cannot take a param trajectory at construction,
+    # so this also pins that the generated pair is legal for the net it ships with.
+    assert _Module(net, loss_config=loss_config) is not None
+
+
+def test_hyper_model_config_has_no_ramp_anchor():
+    # HyperWaveNet cannot be handed a param trajectory, so the ramp anchor would raise.
+    assert "silence_anchor_ramp" not in _build_hyper_model_config(_project())["loss"]
 
 
 @_pytest.mark.parametrize(

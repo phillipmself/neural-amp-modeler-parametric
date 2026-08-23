@@ -17,7 +17,10 @@
         "is no PANAMA-style 'conditioning_dim' key; the params block MUST match the production parametric",
         "model you intend to capture for (here: the Gain/Tone/Boost example).",
         "Physical batches are GPU-sized and gradient-accumulated to the effective batch of 37",
-        "(see nam_full_configs/active_learning/learning.json), smaller than PANAMA's 512."
+        "(see nam_full_configs/active_learning/learning.json), smaller than PANAMA's 512.",
+        "val_loss picks the checkpoint to keep; it is not the training objective, which stays PANAMA's",
+        "MSE + log-mel. Stated explicitly because omitting it silently selects on MSE, and every other",
+        "parametric config here selects on ESR -- MSE weights the loud corner of the control space."
     ],
     "net": {
         "name": "ConcatLSTM",
@@ -56,7 +59,8 @@
         }
     },
     "loss": {
-        "mel_weight": 0.000062
+        "mel_weight": 0.000062,
+        "val_loss": "esr"
     },
     "optimizer": {
         "lr": 0.008,

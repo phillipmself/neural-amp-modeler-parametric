@@ -226,7 +226,14 @@ def build_concat_model_config(project: CaptureProject) -> dict[str, _Any]:
         config["sample_rate"] = float(project.sample_rate)
     return {
         "net": {"name": "ConcatWaveNet", "config": config},
-        "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
+        "loss": {
+            "val_loss": "esr",
+            "mrstft_weight": 0.0005,
+            # Both anchors together: the held one wins parked-param silence outright, and the
+            # moving one is what keeps a knob turn from clicking.
+            "silence_anchor": {"weight": 1.0, "batch_size": 8, "ny": 512},
+            "silence_anchor_ramp": {"weight": 1.0, "batch_size": 8, "ny": 512},
+        },
         "optimizer": {"lr": 0.003, "weight_decay": 3.17e-07},
         "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.994}},
     }
