@@ -547,9 +547,18 @@ def test_stacking_anchor_batches_does_not_change_a_row(net):
     )
 
     stacked = _anchor_output(net, _torch.cat([held, moving], dim=0), window.ny)
+    held_out = _anchor_output(net, held, window.ny)
+    moving_out = _anchor_output(net, moving, window.ny)
 
-    assert _torch.equal(stacked[:3], _anchor_output(net, held, window.ny))
-    assert _torch.equal(stacked[3:], _anchor_output(net, moving, window.ny))
+    # Recurrence's matmuls aren't bit-exact across batch sizes on every torch build --
+    # exercised across the Python-version matrix, so an ULP-level allclose is the
+    # meaningful bar here. Convolution stays bit-exact, so hold it to that.
+    if isinstance(net, _ConcatLSTM):
+        assert _torch.allclose(stacked[:3], held_out, atol=1e-6)
+        assert _torch.allclose(stacked[3:], moving_out, atol=1e-6)
+    else:
+        assert _torch.equal(stacked[:3], held_out)
+        assert _torch.equal(stacked[3:], moving_out)
 
 
 def _both_anchors(ramp_ny: int = 16) -> _ParametricLossConfig:
