@@ -467,6 +467,12 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
             self._validate_preceding_silence(
                 x, start, require_input_pre_silence, self.sample_rate
             )
+        # Resolved before the trim, because a negative `start` counts from the end of
+        # the untrimmed array. `_apply_delay_int` drops from the front of x only when
+        # the delay is negative.
+        self._input_start = (
+            0 if start is None else (start if start >= 0 else start + len(x))
+        ) + max(0, -int(delay or 0))
         x, y = [z[start:stop] for z in (x, y)]
         if delay is not None and delay != 0:
             x, y = self._apply_delay(x, y, delay)
@@ -502,6 +508,17 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         # If ny were 1
         single_pairs = n - self._nx + 1
         return single_pairs // self._ny
+
+    @property
+    def input_start(self) -> int:
+        """
+        Index in the source input file of ``self.x[0]``.
+
+        `start`/`stop`/`delay` are applied at construction, so a local index alone does
+        not say what time it is. Data sets that share an input file are only comparable
+        through this offset.
+        """
+        return self._input_start
 
     @property
     def nx(self) -> int:

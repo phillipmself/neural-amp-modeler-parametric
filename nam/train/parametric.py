@@ -39,6 +39,10 @@ from nam.models.parametric._anchors import (
     sample_param_trajectories as _sample_param_trajectories,
 )
 from nam.models.parametric._anchors import sample_raw_params as _sample_raw_params
+from nam.models.parametric._splice import SpliceSource as _SpliceSource
+from nam.models.parametric._splice import SpliceWindow as _SpliceWindow
+from nam.models.parametric._splice import splice_output as _splice_output
+from nam.models.parametric._splice import splice_window as _splice_window
 from nam.models.parametric import bake as _bake
 from nam.models.parametric import data_config_from_model as _data_config_from_model
 from nam.models.parametric import export_parametric as _export_parametric
@@ -85,7 +89,13 @@ _TRAIN_BUCKET = "seen_audio_seen_params"
 _VALIDATION_BUCKET = "unseen_audio_unseen_params"
 # Means reduced as sample-weighted averages across the epoch. ESR is handled
 # separately because it is a ratio of energies, not a mean.
-_BUCKET_MEAN_METRICS = ("MSE", "MRSTFT", "Silence Anchor", "Silence Anchor Ramp")
+_BUCKET_MEAN_METRICS = (
+    "MSE",
+    "MRSTFT",
+    "Silence Anchor",
+    "Silence Anchor Ramp",
+    "Param Step",
+)
 
 
 class _MelSpectrogram(_torch.nn.Module):
@@ -223,6 +233,25 @@ class _CaptureBatchSampler(_Sampler):
     def capture_for_batch(self, batch_idx: int) -> int:
         """Which capture the ``batch_idx``-th batch of the current iteration came from."""
         return self.last_batch_captures[batch_idx]
+
+
+def _iter_parametric_datasets(dataset) -> tuple[_ParametricDataset, ...]:
+    """The captures a split is made of, each still carrying its control setting.
+
+    `_iter_inner_datasets` unwraps one layer further and drops the params, which the
+    splice source needs.
+    """
+    if isinstance(dataset, _ParametricDataset):
+        return (dataset,)
+    if isinstance(dataset, _ConcatDataset):
+        found: list[_ParametricDataset] = []
+        for child in dataset.datasets:
+            found.extend(_iter_parametric_datasets(child))
+        return tuple(found)
+    raise ValueError(
+        "Expected a ParametricDataset or ConcatDataset of ParametricDataset; "
+        f"got {type(dataset).__name__}"
+    )
 
 
 def _capture_lengths(dataset) -> tuple[int, ...]:
@@ -428,6 +457,28 @@ def _bucket_means(loss_dict: dict) -> dict[str, _torch.Tensor]:
     }
 
 
+def _loss_term_from_config(cls, config: _Optional[dict], label: str):
+    """Build a loss-term dataclass from its JSON block, or ``None`` when it is absent.
+
+    Both the accepted keys and their coercion come off the dataclass, so adding or
+    dropping a field is a one-line edit with nothing else to keep in step. This holds
+    only while every field is annotated with a plain callable type: an ``Optional[...]``
+    annotation, or deferred annotations (``from __future__ import annotations``), leave
+    ``field.type`` a non-callable and break every parse.
+    """
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError(f"{label} config must be a mapping; got {type(config).__name__}")
+    coerce = {field.name: field.type for field in _fields(cls)}
+    unknown = sorted(set(config) - set(coerce))
+    if unknown:
+        raise ValueError(f"{label} config has unknown field(s): " + ", ".join(unknown))
+    if "weight" not in config:
+        raise ValueError(f"{label} config must define weight")
+    return cls(**{name: coerce[name](value) for name, value in config.items()})
+
+
 def _silence_anchor_norm(y: _torch.Tensor) -> _torch.Tensor:
     """Score an anchor's output against zero with mean absolute error.
 
@@ -508,26 +559,7 @@ class _SilenceAnchorConfig:
 
     @classmethod
     def from_config(cls, config: _Optional[dict]) -> "_Optional[_SilenceAnchorConfig]":
-        if config is None:
-            return None
-        if not isinstance(config, dict):
-            raise ValueError(
-                f"Silence anchor config must be a mapping; got {type(config).__name__}"
-            )
-        # Both the accepted keys and their coercion come off the dataclass, so adding or
-        # dropping a field is a one-line edit with nothing else to keep in step. This
-        # holds only while every field is annotated with a plain callable type: an
-        # `Optional[...]` annotation, or deferred annotations (`from __future__ import
-        # annotations`), leave `field.type` a non-callable and break every parse.
-        coerce = {field.name: field.type for field in _fields(cls)}
-        unknown = sorted(set(config) - set(coerce))
-        if unknown:
-            raise ValueError(
-                "Silence anchor config has unknown field(s): " + ", ".join(unknown)
-            )
-        if "weight" not in config:
-            raise ValueError("Silence anchor config must define weight")
-        return cls(**{name: coerce[name](value) for name, value in config.items()})
+        return _loss_term_from_config(cls, config, "Silence anchor")
 
 
 @_dataclass
@@ -595,11 +627,147 @@ class _SilenceAnchorRampConfig(_SilenceAnchorConfig):
             )
 
 
+def _splice_norm(
+    preds: _torch.Tensor, targets: _torch.Tensor, energy_floor: float
+) -> _torch.Tensor:
+    """Score a splice batch as the mean of the rows' error-to-signal ratios.
+
+    The artifact this term exists to remove is a click, and a click under a quiet passage
+    is far more audible than the same absolute error under a loud chord. A plain squared
+    error weights every row by its own loudness, so the loud windows own the gradient and
+    the audible clicks are never punished; normalizing per row takes that back out.
+    Rows are reduced as a mean of ratios rather than as pooled energies for the same
+    reason -- pooling would reintroduce the loud-row dominance the ratio just removed.
+
+    ``energy_floor`` is a per-sample squared amplitude, taken relative to the captures'
+    own level so it survives output normalization. Without it a window landing in a
+    near-silent stretch divides by nearly nothing and takes the step with it; below the
+    floor the term degrades to an absolute measure, which is the right behaviour there
+    because the silence anchors already own true silence.
+    """
+    error = (preds - targets).square().sum(dim=-1)
+    energy = targets.square().sum(dim=-1)
+    return (error / energy.clamp(min=energy_floor * targets.shape[-1])).mean()
+
+
+@_dataclass
+class _ParamStepSpliceConfig:
+    """
+    Settings for the param-step splice term.
+
+    Captures made through one input file are the same device answering the same audio at
+    different settings, so a target assembled from several of them at matching source
+    times is supervised ground truth for a control that just changed -- the destination's
+    steady state, arriving at once. That is the behaviour being asked for: the model owes
+    the setting's response as if it had always been there, not the analog settling of the
+    real part, which is deliberately not modeled. See :mod:`nam.models.parametric._splice`.
+
+    The window is derived from the net rather than configured, so one block is correct for
+    both a convolutional and a recurrent net. ``min_tail`` sets the scored tail for a net
+    with no receptive field to bound it, and ``settle`` how much pre-step history the model
+    gets; on the shipping ConcatWaveNet the receptive field already exceeds both, so
+    neither costs it anything. ``batch_size`` 4 there and 8 on ConcatLSTM each put the
+    extra forward at roughly a fifth of a training step -- which stacks with whatever the
+    silence anchors are already spending.
+
+    ``steps`` above 1 walks a chain of settings through the window. It is an experiment
+    rather than the default: with a plateau shorter than the model's memory the
+    per-segment target stops being reachable, and with two captures a chain is only a
+    flick back and forth.
+
+    ``weight`` 0 skips the training forward but still reports the validation metric, which
+    is how an existing checkpoint's knob-move penalty gets measured before anything is
+    trained on it.
+    """
+
+    weight: float
+    batch_size: int = 4
+    steps: int = 1
+    spacing: int = 1024
+    min_tail: int = 4096
+    settle: int = 4096
+    neighbors: int = 3
+    neighbor_probability: float = 0.75
+    esr_floor_fraction: float = 1e-3
+    validation_windows: int = 64
+    dc_report_db: float = -60.0
+    lag_tolerance: int = 2
+
+    def __post_init__(self):
+        # Validated here rather than in `from_config` so a config built in code gets the
+        # same guarantees as one read from JSON.
+        if self.weight < 0.0:
+            raise ValueError(f"Param step splice weight must be >= 0; got {self.weight}")
+        if self.batch_size < 1:
+            raise ValueError(
+                f"Param step splice batch_size must be >= 1; got {self.batch_size}"
+            )
+        if self.validation_windows < 0:
+            raise ValueError(
+                "Param step splice validation_windows must be >= 0; got "
+                f"{self.validation_windows}"
+            )
+        if self.neighbors < 1:
+            raise ValueError(
+                f"Param step splice neighbors must be >= 1; got {self.neighbors}"
+            )
+        if not 0.0 <= self.neighbor_probability <= 1.0:
+            raise ValueError(
+                "Param step splice neighbor_probability must be within [0, 1]; got "
+                f"{self.neighbor_probability}"
+            )
+        if self.esr_floor_fraction <= 0.0:
+            raise ValueError(
+                "Param step splice esr_floor_fraction must be > 0; got "
+                f"{self.esr_floor_fraction}"
+            )
+        if self.lag_tolerance < 1:
+            raise ValueError(
+                f"Param step splice lag_tolerance must be >= 1; got {self.lag_tolerance}"
+            )
+        # steps/spacing/min_tail/settle are window shapes; `splice_window` owns their
+        # bounds, and `check_net` calls it at construction so a bad one fails here too.
+
+    def window(self, net: _ParametricNet) -> _SpliceWindow:
+        return _splice_window(
+            net,
+            steps=self.steps,
+            spacing=self.spacing,
+            min_tail=self.min_tail,
+            settle=self.settle,
+        )
+
+    def source(
+        self, datasets: _Sequence[_ParametricDataset], net: _ParametricNet
+    ) -> _SpliceSource:
+        return _SpliceSource.from_datasets(
+            datasets,
+            net,
+            dc_report_db=self.dc_report_db,
+            lag_tolerance=self.lag_tolerance,
+        )
+
+    def check_net(self, net: _ParametricNet) -> None:
+        """Raise if this term cannot be run against ``net``, called at construction."""
+        if not (isinstance(net, _ParametricNet) and net.supports_param_trajectory):
+            raise ValueError(
+                "loss.param_step_splice requires a net that accepts a param trajectory; "
+                f"{type(net).__name__} does not"
+            )
+        # Surfaces a bad window here rather than on the first step.
+        self.window(net)
+
+    @classmethod
+    def from_config(cls, config: _Optional[dict]) -> "_Optional[_ParamStepSpliceConfig]":
+        return _loss_term_from_config(cls, config, "Param step splice")
+
+
 @_dataclass
 class _ParametricLossConfig(_LossConfig):
     mel_weight: _Optional[float] = None
     silence_anchor: _Optional[_SilenceAnchorConfig] = None
     silence_anchor_ramp: _Optional[_SilenceAnchorRampConfig] = None
+    param_step_splice: _Optional[_ParamStepSpliceConfig] = None
 
     @classmethod
     def parse_config(cls, config):
@@ -610,6 +778,9 @@ class _ParametricLossConfig(_LossConfig):
         )
         parsed["silence_anchor_ramp"] = _SilenceAnchorRampConfig.from_config(
             config.get("silence_anchor_ramp")
+        )
+        parsed["param_step_splice"] = _ParamStepSpliceConfig.from_config(
+            config.get("param_step_splice")
         )
         return parsed
 
@@ -636,6 +807,11 @@ class _ParametricLightningModule(_LightningModule):
         # one forward, so the setting cannot be honoured at all.
         for _, anchor in self._silence_anchors():
             anchor.check_net(net)
+        if self._loss_config.param_step_splice is not None:
+            self._loss_config.param_step_splice.check_net(net)
+        # Set via `set_splice_sources` once the datasets exist (see `main`).
+        self._train_splice_source: _Optional[_SpliceSource] = None
+        self._val_splice_source: _Optional[_SpliceSource] = None
         # Set via `set_capture_batch_samplers` once the dataloaders exist (see `main`).
         # `None` means "capture identity unavailable" -- `_EpochMetrics` then falls back
         # to single-level pooling over the whole split instead of a wrong two-level split.
@@ -664,6 +840,34 @@ class _ParametricLightningModule(_LightningModule):
         self._train_capture_sampler = train_sampler
         self._val_capture_sampler = val_sampler
 
+    def set_splice_sources(
+        self,
+        train: _Optional[_Sequence[_ParametricDataset]] = None,
+        validation: _Optional[_Sequence[_ParametricDataset]] = None,
+    ) -> None:
+        """Give the module the captures the param-step splice term builds its windows
+        from. A no-op when the term is not configured, so a run that does not ask for it
+        pays none of the setup -- the shared-input, DC and alignment checks included.
+        """
+        config = self._loss_config.param_step_splice
+        if config is None:
+            return
+        net = _get_parametric_net(self)
+        self._train_splice_source = None if train is None else config.source(train, net)
+        if validation is None:
+            self._val_splice_source = None
+        elif len(validation) < 2:
+            # The metric is a reading, not the thing that was asked for, so a split with
+            # nothing to step between costs the run its number rather than the run.
+            _warn(
+                "loss.param_step_splice reports no validation metric: the validation "
+                f"split has {len(validation)} capture(s) and a step needs two. Hold out "
+                "a second setting to measure what a control change costs."
+            )
+            self._val_splice_source = None
+        else:
+            self._val_splice_source = config.source(validation, net)
+
     @staticmethod
     def _capture_index(
         sampler: _Optional[_Sampler], batch_idx: int
@@ -684,7 +888,62 @@ class _ParametricLightningModule(_LightningModule):
         # batch for a number that says nothing about the split.
         if self.training:
             loss_dict.update(self._silence_anchor_items())
+            loss_dict.update(self._param_step_splice_items())
         return loss_dict
+
+    def _param_step_splice_items(self) -> dict[str, _LossItem]:
+        config = self._loss_config.param_step_splice
+        # A zero weight contributes nothing to the total, so its forward is skipped
+        # rather than run and multiplied away. The validation metric still runs, which is
+        # how a checkpoint's knob-move penalty is measured before it is trained on.
+        if config is None or config.weight <= 0.0:
+            return {}
+        source = self._train_splice_source
+        if source is None:
+            # Silently training without a term that was asked for is worse than not
+            # starting: the run looks normal and the model comes out unchanged.
+            raise RuntimeError(
+                "loss.param_step_splice is enabled but the training captures were never "
+                "handed to the module; set_splice_sources must be called before fit"
+            )
+        net = _get_parametric_net(self)
+        window = config.window(net)
+        cases = source.sample_cases(
+            config.batch_size,
+            window,
+            neighbors=config.neighbors,
+            neighbor_probability=config.neighbor_probability,
+        )
+        preds, targets = self._splice_predictions(net, source, cases, window)
+        return {
+            "Param Step": _LossItem(
+                config.weight,
+                _splice_norm(
+                    preds, targets, config.esr_floor_fraction * source.mean_square
+                ),
+            )
+        }
+
+    def _splice_predictions(
+        self,
+        net: _ParametricNet,
+        source: _SpliceSource,
+        cases,
+        window: _SpliceWindow,
+        static: bool = False,
+    ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
+        """One splice batch, run and paired with its target.
+
+        The captures stay on the host: a batch is a couple of hundred kilobytes against a
+        forward of tens of thousands of samples, and keeping them there leaves tens of
+        megabytes per capture off the accelerator.
+        """
+        x, params, targets = source.build(cases, window, static=static)
+        device = next(net.parameters()).device
+        x = x.to(device, non_blocking=True)
+        params = params.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        return _splice_output(net, x, params, window), targets
 
     def _silence_anchor_items(self) -> dict[str, _LossItem]:
         """The enabled anchors, in as few forwards as the net allows.
@@ -887,6 +1146,46 @@ class _ParametricLightningModule(_LightningModule):
         monitored = dict(metrics)
         monitored["val_loss"] = metrics[val_loss_key]
         self.log_dict(monitored)
+        self._log_bucket(self._param_step_splice_metrics(), _VALIDATION_BUCKET)
+
+    def _param_step_splice_metrics(self) -> dict[str, float]:
+        """Knob-move error on held-out captures, against the same windows held still.
+
+        The held-out captures share an input too, so a spliced target over them is a
+        measurement rather than a regularizer -- the one number here that says what a
+        control change costs. Raw spliced error would conflate that with how well the
+        model fits those settings at all, so the same windows are rendered again with the
+        control parked at the destination and the ratio is what gets read.
+
+        Logged on its own rather than through the epoch metrics: it must not reach
+        ``val_loss`` or the checkpoint monitor. The term has a floor no model can go
+        below -- a recurrent net's state cannot hold the destination's history one sample
+        after the step -- so selecting on it would trade away static fidelity.
+        """
+        config = self._loss_config.param_step_splice
+        source = self._val_splice_source
+        if config is None or source is None or config.validation_windows < 1:
+            return {}
+        net = _get_parametric_net(self)
+        window = config.window(net)
+        cases = source.enumerate_cases(config.validation_windows, window)
+        floor = config.esr_floor_fraction * source.mean_square
+        with _torch.no_grad():
+            stepped = _splice_norm(
+                *self._splice_predictions(net, source, cases, window), floor
+            )
+            held = _splice_norm(
+                *self._splice_predictions(net, source, cases, window, static=True), floor
+            )
+        metrics = {
+            "Param Step ESR": float(stepped),
+            "Param Step Static ESR": float(held),
+        }
+        if metrics["Param Step Static ESR"] > 0.0:
+            metrics["Param Step Penalty"] = (
+                metrics["Param Step ESR"] / metrics["Param Step Static ESR"]
+            )
+        return metrics
 
     def _val_loss_key(self) -> str:
         val_loss_type = self._loss_config.val_loss
@@ -1137,6 +1436,12 @@ def main(
     model.set_capture_batch_samplers(
         train_sampler=train_dataloader.batch_sampler,
         val_sampler=val_dataloader.batch_sampler,
+    )
+    # After the joint hooks, which rescale y in place: the splice source measures the
+    # captures' DC and level, and would report the pre-scaling ones.
+    model.set_splice_sources(
+        train=_iter_parametric_datasets(dataset_train),
+        validation=_iter_parametric_datasets(dataset_validation),
     )
     _enable_training_fast_paths(
         net,

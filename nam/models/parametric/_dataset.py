@@ -177,6 +177,10 @@ class ParametricDataset(_AbstractDataset, _InitializableFromConfig):
         return self._params
 
     @property
+    def input_start(self) -> int:
+        return self._dataset.input_start
+
+    @property
     def nx(self) -> int:
         return self._dataset.nx
 
